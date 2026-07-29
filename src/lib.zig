@@ -15,12 +15,12 @@ export fn CreateInterface(name: [*c]const c_char, return_code: [*c]c_int) callco
 
 /// This is the "entry point" of Zorcerer.
 fn startInterlop() void {
-    std.debug.print("Interlop success!", .{});
+
 }
 
 /// Source SDK root folder
 const GameRoot = struct {
-    /// Generates path to server_serv.so DLL
+    /// Generates path to server_serv DLL
     inline fn generateDllPath() []const u8 {
         comptime {
             const target = builtin.target;
