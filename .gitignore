@@ -1,0 +1,12 @@
+.DS_Store
+.idea
+*.log
+tmp/
+
+# Emacs
+.projectile
+*.org
+
+# Zig
+zig-out/
+.zig-cache/
