@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 pub var is_loaded = false;
 
 pub const File = struct {
-    /// Generates relative path to server_serv DLL, like this: "tf/bin/sever_srv.(dll|so)"
+    /// Generates relative path to server_serv DLL, like this: "tf/bin/(your_os)/server_srv.(dll|so)"
     pub const relative_path: []const u8 = switch (builtin.target.os.tag) {
         .windows => "tf/bin/win32/server_srv.dll",
         .linux => "tf/bin/linux64/server_srv.so",
