@@ -8,29 +8,19 @@ const Allocator = std.mem.Allocator;
 pub var is_loaded = false;
 
 pub const File = struct {
-    /// Generates path to server_serv DLL
-    inline fn getRelativePath() []const u8 {
-        comptime {
-            const target = builtin.target;
-            const target_os = target.os.tag;
+    /// Generates relative path to server_serv DLL, like this: "tf/bin/sever_srv.(dll|so)"
+    pub const relative_path: []const u8 = switch (builtin.target.os.tag) {
+        .windows => "tf/bin/win32/server_srv.dll",
+        .linux => "tf/bin/linux64/server_srv.so",
+        else => @compileError("This OS is not supported")
+    };
 
-            const dll_format: []const u8 = switch (target_os) {
-                .windows => "dll",
-                .linux => "so",
-                else => @compileError("This OS is not supported"),
-            };
-
-            const path = std.fmt.comptimePrint("tf/bin/server_srv.{s}", .{dll_format}).*;
-            return path[0..(@sizeOf(@TypeOf(path)) - 1)];
-        }
-    }
-
+    /// Generates absolute path to server_serv DLL
     pub fn getAbsolutePath(io: Io, allocator: Allocator, root: Dir) ![]const u8 {
-        const server_dll_path = getRelativePath();
 
         var buffer: [256]u8 = undefined;
         const root_path_len = try root.realPath(io, &buffer);
-        const path: []const u8 = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ buffer[0..root_path_len], server_dll_path });
+        const path: []const u8 = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ buffer[0..root_path_len], relative_path });
 
         return path;
     }
