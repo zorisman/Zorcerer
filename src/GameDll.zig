@@ -15,13 +15,16 @@ pub const File = struct {
         else => @compileError("This OS is not supported")
     };
 
+    var absolute_path: []const u8 = undefined;
+
     /// Generates absolute path to server_serv DLL
     pub fn getAbsolutePath(io: Io, allocator: Allocator, root: Dir) ![]const u8 {
+        if (absolute_path == undefined) {
+            var buffer: [256]u8 = undefined;
+            const root_path_len = try root.realPath(io, &buffer);
+            absolute_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ buffer[0..root_path_len], relative_path });
+        }
 
-        var buffer: [256]u8 = undefined;
-        const root_path_len = try root.realPath(io, &buffer);
-        const path: []const u8 = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ buffer[0..root_path_len], relative_path });
-
-        return path;
+        return absolute_path;
     }
 };
