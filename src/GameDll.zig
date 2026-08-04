@@ -5,12 +5,10 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 
-pub var is_loaded = false;
-
 pub const DllFile = struct {
     const relative_path: []const u8 = switch (builtin.target.os.tag) {
-        .windows => "tf/bin/server_srv.dll",
-        .linux => "tf/bin/server_srv.so",
+        .windows => "tf/bin/win32/server_srv.dll",
+        .linux => "tf/bin/linux64/server_srv.so",
         else => @compileError("This OS is not supported")
     };
     var absolute_path: []const u8 = undefined;
