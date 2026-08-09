@@ -11,7 +11,8 @@ const char relative_path[] = "tf/bin/linux64/server_srv.so";
 
 typedef void *(create_interface_t)(const char *pName, int *pReturnCode);
 
-/// This is the fake CreateInterface, which SDK tries to call
+/// @brief The fake CreateInterface, which SDK tries to call
+/// @note Do not close the dll, or it will cause a segfault
 void *CreateInterface(const char *pName, int *pReturnCode) {
   void *dll = dlopen(relative_path, RTLD_NOW);
   create_interface_t *func = (create_interface_t*)dlsym(dll, "CreateInterface");
