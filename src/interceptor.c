@@ -18,3 +18,14 @@ void *CreateInterface(const char *pName, int *pReturnCode) {
   create_interface_t *func = (create_interface_t*)dlsym(dll, "CreateInterface");
   return func(pName, pReturnCode);
 }
+
+/// As we (or I) currently focus on TF2 branch, here's what SDK wants from CreateInterface:
+/*
+  ServerGameDLL012
+  ServerGameEnts001
+  ServerGameClients005
+  HLTVDirector001
+  ServerGameTags001
+  PluginHelpersCheck001
+  ServerReplay001
+ */
