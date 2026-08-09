@@ -8,12 +8,16 @@ pub fn build(b: *std.Build) void {
         .name = "server",
         .linkage = .dynamic,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lib.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true
         }),
     });
 
+    lib.root_module.addCSourceFile(.{
+        .file = b.path("src/interceptor.c"),
+        .language = .c
+    });
     lib.out_filename = "server.so";
 
     b.installArtifact(lib);
