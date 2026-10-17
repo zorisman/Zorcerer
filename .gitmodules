@@ -1,0 +1,6 @@
+[submodule "extern/zig-hooks"]
+	path = extern/zig-hooks
+	url = https://codeberg.org/sojralkaktus123/zig-hooks.git
+[submodule "extern/source/source-sdk-2013"]
+	path = extern/source/source-sdk-2013
+	url = https://github.com/ValveSoftware/source-sdk-2013.git
