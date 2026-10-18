@@ -47,6 +47,7 @@
 
 const std = @import("std");
 const PluginManifest = @import("PluginManifest.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 const RTLD_NOW: c_int = 2;
 extern fn dlopen(path: ?[*:0]const u8, flags: c_int) ?*anyopaque;
@@ -254,7 +255,7 @@ pub fn listPluginFiles(
     dir_path: []const u8,
     suffix: []const u8,
 ) ![]const [:0]const u8 {
-    var dir = try std.Io.Dir.openDirAbsolute(dir_path, .{ .iterate = true });
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     defer dir.close();
 
     var paths: std.ArrayList([:0]const u8) = .empty;
@@ -268,7 +269,7 @@ pub fn listPluginFiles(
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
 
-        const full_path = try std.fs.path.joinZ(allocator, &.{ dir_path, entry.name });
+        const full_path = try std.Io.Dir.path.joinZ(allocator, &.{ dir_path, entry.name });
         try paths.append(allocator, full_path);
     }
 
