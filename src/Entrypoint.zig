@@ -76,6 +76,7 @@ const VTableHooks = @import("hooks").VTableHook;
 const TF2EngineDemo = @import("TF2EngineDemo.zig");
 const EngineVersions = @import("analyzers/EngineVersions.zig");
 const Indexes = @import("codegen_generated/engine_indexes.zig");
+const ZorcererCommand = @import("ZorcererCommand.zig");
 
 const iface_ok: c_int = 0;
 const iface_failed: c_int = 1;
@@ -186,6 +187,12 @@ fn load(
         return false;
     };
 
+    ZorcererCommand.install(interface_factory, detection.engine) catch |err| {
+        TF2EngineDemo.uninstall();
+        logLine("[MyLoader] failed to register zorcerer command: {s}\n", .{@errorName(err)});
+        return false;
+    };
+
     logLine("[MyLoader] demo hooks installed.\n", .{});
     return true;
 }
@@ -193,6 +200,7 @@ fn load(
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
     logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
+    ZorcererCommand.uninstall();
     TF2EngineDemo.uninstall();
     engine = null;
     log_print = null;
