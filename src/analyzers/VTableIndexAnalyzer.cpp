@@ -16,13 +16,21 @@
 //
 // Usage:
 //   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] [--write-into <file.toml>] -- <compiler args...>
-//   vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, {<header.h> <ClassName> <method...>}}' [--write-into <file.toml>] -- <compiler args...>
+//   vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, {<header.h> const! <macro|*>}}' [--write-into <file.toml>] -- <compiler args...>
+//   Use const! instead of a class name to inspect object-like #define constants.
 //
 // Example, for TF2's hl2sdk-tf2 checkout:
 //   vtable-index-analyzer hl2sdk-tf2/public/eiface.h IVEngineServer \
 //       LogPrint ServerCommand -- \
 //       -I hl2sdk-tf2/public -I hl2sdk-tf2/public/engine -I hl2sdk-tf2/public/tier1 \
 //       -DCOMPILER_GCC -DPOSIX -D_LINUX -DGNUC -std=gnu++14 -m32
+//
+// Constants defined directly in the requested header:
+//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h const! \
+//       INTERFACEVERSION_VENGINESERVER INTERFACEVERSION_VENGINESERVER_INT -- \
+//       -I hl2sdk-tf2/public -I hl2sdk-tf2/public/engine -I hl2sdk-tf2/public/tier1 \
+//       -DCOMPILER_GCC -DPOSIX -D_LINUX -DGNUC -std=gnu++14 -m32
+//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h const! '*' -- <compiler args...>
 //
 // *** The compiler args after `--` carry the exact same risk engine_adapter.cpp
 // already flagged ***: eiface.h pulls in a real dependency tree
@@ -61,6 +69,10 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/VTableBuilder.h"
+#include "clang/Basic/TokenKinds.h"
+#include "clang/Lex/MacroInfo.h"
+#include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/Token.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -200,6 +212,44 @@ public:
         return true;
     }
 
+    bool processMacros(Preprocessor &PP, const SourceManager &SM) {
+        const bool AllMacros = Q.methodNames.size() == 1 && Q.methodNames.front() == "*";
+        std::vector<std::string> FoundNames;
+
+        for (const auto &Entry : PP.macros(false)) {
+            const IdentifierInfo *Identifier = Entry.first;
+            const MacroInfo *MI = PP.getMacroInfo(Identifier);
+            if (MI == nullptr || MI->isFunctionLike() || MI->isBuiltinMacro() ||
+                MI->tokens_empty() ||
+                !definitionIsInHeader(SM, MI->getDefinitionLoc(), Q.headerPath))
+                continue;
+
+            const std::string Name = Identifier->getName().str();
+            if (!AllMacros && std::find(Q.methodNames.begin(), Q.methodNames.end(), Name) ==
+                                  Q.methodNames.end())
+                continue;
+
+            const std::string Value = macroValueAsToml(PP, *MI);
+            writeTomlEntryValue(Name, Value, true, std::to_string(FoundNames.size()));
+            llvm::outs() << Q.headerPath << "::" << Name << " = " << Value << '\n';
+            FoundNames.push_back(Name);
+        }
+
+        if (!AllMacros) {
+            for (const std::string &Requested : Q.methodNames) {
+                if (std::find(FoundNames.begin(), FoundNames.end(), Requested) == FoundNames.end()) {
+                    llvm::errs() << "error: no object-like macro named '" << Requested
+                                 << "' defined in " << Q.headerPath << "\n";
+                    return false;
+                }
+            }
+        } else if (FoundNames.empty()) {
+            llvm::errs() << "error: no object-like macros found in " << Q.headerPath << "\n";
+            return false;
+        }
+        return true;
+    }
+
     bool found = false;
     bool fatal_error = false;
 
@@ -232,28 +282,104 @@ private:
             writeTomlBasicString(Out, Key);
     }
 
+    static bool definitionIsInHeader(const SourceManager &SM, SourceLocation Loc,
+                                     const std::string &HeaderPath) {
+        const std::string DefinitionPath = SM.getFilename(Loc).str();
+        if (DefinitionPath == HeaderPath)
+            return true;
+        // Clang may report a resolved path while argv contains a relative path.
+        if (DefinitionPath.size() > HeaderPath.size() &&
+            DefinitionPath.compare(DefinitionPath.size() - HeaderPath.size(),
+                                   HeaderPath.size(), HeaderPath) == 0) {
+            const char Separator = DefinitionPath[DefinitionPath.size() - HeaderPath.size() - 1];
+            if (Separator == '/' || Separator == '\\')
+                return true;
+        }
+        return false;
+    }
+
+    static std::string macroValueAsToml(const Preprocessor &PP, const MacroInfo &MI,
+                                        unsigned Depth = 0) {
+        std::string Raw;
+        for (unsigned I = 0; I < MI.getNumTokens(); ++I) {
+            if (I != 0)
+                Raw += ' ';
+            Raw += PP.getSpelling(MI.getReplacementToken(I));
+        }
+
+        if (MI.getNumTokens() == 1) {
+            const Token &TokenValue = MI.getReplacementToken(0);
+            const std::string Spelling = PP.getSpelling(TokenValue);
+            if (TokenValue.is(tok::identifier) && Depth < 16) {
+                if (const MacroInfo *Alias = PP.getMacroInfo(TokenValue.getIdentifierInfo())) {
+                    if (Alias != &MI && !Alias->isFunctionLike() && !Alias->tokens_empty())
+                        return macroValueAsToml(PP, *Alias, Depth + 1);
+                }
+            }
+            if (TokenValue.is(tok::string_literal) && Spelling.size() >= 2 &&
+                Spelling.front() == '"' && Spelling.back() == '"')
+                return Spelling;
+            if (TokenValue.is(tok::numeric_constant)) {
+                std::string Number = Spelling;
+                while (!Number.empty() &&
+                       (Number.back() == 'u' || Number.back() == 'U' ||
+                        Number.back() == 'l' || Number.back() == 'L'))
+                    Number.pop_back();
+                bool Decimal = !Number.empty();
+                for (const char C : Number)
+                    Decimal = Decimal && C >= '0' && C <= '9';
+                const bool HexPrefix = Number.size() > 2 && Number[0] == '0' &&
+                                       (Number[1] == 'x' || Number[1] == 'X');
+                bool HexDigits = HexPrefix;
+                if (HexPrefix) {
+                    for (std::size_t I = 2; I < Number.size(); ++I) {
+                        const char C = Number[I];
+                        HexDigits = HexDigits &&
+                            ((C >= '0' && C <= '9') || (C >= 'a' && C <= 'f') ||
+                             (C >= 'A' && C <= 'F'));
+                    }
+                }
+                if ((Decimal && (Number.size() == 1 || Number[0] != '0')) ||
+                    HexDigits || Number == "0")
+                    return Number;
+            }
+            if (Spelling == "true" || Spelling == "false")
+                return Spelling;
+        }
+
+        // Preserve complex replacement lists as strings rather than invalid TOML syntax.
+        std::ostringstream Out;
+        writeTomlBasicString(Out, Raw);
+        return Out.str();
+    }
+
     void writeTomlEntry(const std::string &MethodName, uint64_t Index,
                         bool EnsureUniqueKey) {
+        writeTomlEntryValue(MethodName, std::to_string(Index), EnsureUniqueKey,
+                            std::to_string(Index));
+    }
+
+    void writeTomlEntryValue(const std::string &Name, const std::string &Value,
+                             bool EnsureUniqueKey, const std::string &DuplicateSuffix) {
         if (Output == nullptr)
             return;
 
-        std::string Key = MethodName;
+        std::string Key = Name;
         if (EnsureUniqueKey &&
-            std::find(WrittenKeys.begin(), WrittenKeys.end(), Key) != WrittenKeys.end()) {
-            Key += "@" + std::to_string(Index);
-        }
+            std::find(WrittenKeys.begin(), WrittenKeys.end(), Key) != WrittenKeys.end())
+            Key += "@" + DuplicateSuffix;
         WrittenKeys.push_back(Key);
 
         if (!OutputHeaderWritten) {
-            // A quoted table key is required because ':' is not allowed in a TOML bare key.
             *Output << "[";
-            writeTomlBasicString(*Output, "class::" + Q.className);
+            writeTomlBasicString(*Output, Q.className == "const!"
+                ? "const::" + Q.headerPath : "class::" + Q.className);
             *Output << "]\n";
             OutputHeaderWritten = true;
         }
 
         writeTomlKey(*Output, Key);
-        *Output << " = " << Index << '\n';
+        *Output << " = " << Value << '\n';
         if (!*Output) {
             llvm::errs() << "error: failed writing TOML output\n";
             fatal_error = true;
@@ -632,6 +758,18 @@ int main(int argc, char **argv) {
 
         IndexVisitor Visitor(AST->getASTContext(), Q,
                              WriteIntoPath.empty() ? nullptr : &TomlBuffer);
+        if (Q.className == "const!") {
+            if (!Visitor.processMacros(AST->getPreprocessor(), AST->getSourceManager()))
+                return 1;
+            if (Visitor.fatal_error)
+                return 1;
+            if (!WriteIntoPath.empty() && !TomlBuffer.str().empty()) {
+                const int WriteResult = updateTomlFile(WriteIntoPath, TomlBuffer.str());
+                if (WriteResult != 0)
+                    return WriteResult;
+            }
+            continue;
+        }
         Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
 
         if (!Visitor.found) {
