@@ -15,7 +15,7 @@
 // string) as a new row there.
 //
 // Usage:
-//   vtable-index-analyzer <header.h> <ClassName> <method1> [method2 ...] -- <compiler args...>
+//   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] -- <compiler args...>
 //
 // Example, for TF2's hl2sdk-tf2 checkout:
 //   vtable-index-analyzer hl2sdk-tf2/public/eiface.h IVEngineServer \
@@ -63,6 +63,7 @@
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -113,43 +114,87 @@ public:
 
         ItaniumVTableContext VTContext(Context);
 
-        for (const auto &methodName : Q.methodNames) {
+        // A single "*" requests all callable method slots in the selected
+        // class's primary vtable, including inherited methods and destructor
+        // variants. VTableLayout indices are relative to the address point,
+        // matching getMethodVTableIndex()'s index convention.
+        if (Q.methodNames.size() == 1 && Q.methodNames.front() == "*") {
+            const VTableLayout &Layout = VTContext.getVTableLayout(RD);
+            const auto AddressPoint =
+                Layout.getAddressPoint(BaseSubobject(RD, CharUnits::Zero()));
+            const auto Components = Layout.vtable_components();
+            const std::size_t VTableStart =
+                Layout.getVTableOffset(AddressPoint.VTableIndex);
+            const std::size_t VTableEnd =
+                VTableStart + Layout.getVTableSize(AddressPoint.VTableIndex);
+
+            if (AddressPoint.AddressPointIndex < VTableStart ||
+                AddressPoint.AddressPointIndex >= VTableEnd) {
+                llvm::errs() << "error: invalid vtable address point for "
+                             << Q.className << "\n";
+                fatal_error = true;
+                return true;
+            }
+
+            for (std::size_t componentIndex = AddressPoint.AddressPointIndex;
+                 componentIndex < VTableEnd; ++componentIndex) {
+                const VTableComponent &Component = Components[componentIndex];
+                // Exclude ABI metadata (including RTTI) and unused slots.
+                if (!Component.isUsedFunctionPointerKind())
+                    continue;
+
+                const CXXMethodDecl *Method = Component.getFunctionDecl();
+                const uint64_t SlotIndex =
+                    componentIndex - AddressPoint.AddressPointIndex;
+                llvm::outs() << Q.className << "::" << Method->getNameAsString()
+                             << " = " << SlotIndex;
+                if (Component.getKind() == VTableComponent::CK_CompleteDtorPointer) {
+                    llvm::outs() << "  (complete destructor)";
+                } else if (Component.getKind() == VTableComponent::CK_DeletingDtorPointer) {
+                    llvm::outs() << "  (deleting destructor)";
+                }
+                llvm::outs() << "\n";
+            }
+        } else {
+          for (const auto &methodName : Q.methodNames) {
             const CXXMethodDecl *target = findVirtualMethod(RD, methodName);
             if (!target) {
-                llvm::errs() << "error: no virtual method named '" << methodName
-                             << "' found on or inherited into " << Q.className << "\n";
-                continue;
+              llvm::errs() << "error: no virtual method named '" << methodName
+                << "' found on or inherited into " << Q.className << "\n";
+              continue;
             }
 
             GlobalDecl GD;
             bool isDtor = false;
             if (const auto *dtor = dyn_cast<CXXDestructorDecl>(target)) {
-                // Dtor_Complete (D1) is the first of the pair; the
-                // deleting destructor (D0) occupies the slot right after
-                // it in a standard Itanium layout - see the warning
-                // printed below. If your SDK build somehow disagrees
-                // with that adjacency assumption, query Dtor_Deleting
-                // explicitly instead of assuming "+1".
-                GD = GlobalDecl(dtor, Dtor_Complete);
-                isDtor = true;
+              // Dtor_Complete (D1) is the first of the pair; the
+              // deleting destructor (D0) occupies the slot right after
+              // it in a standard Itanium layout - see the warning
+              // printed below. If your SDK build somehow disagrees
+              // with that adjacency assumption, query Dtor_Deleting
+              // explicitly instead of assuming "+1".
+              GD = GlobalDecl(dtor, Dtor_Complete);
+              isDtor = true;
             } else {
-                GD = GlobalDecl(target);
+              GD = GlobalDecl(target);
             }
 
             uint64_t index = VTContext.getMethodVTableIndex(GD);
             llvm::outs() << Q.className << "::" << methodName << " = " << index;
             if (isDtor) {
-                llvm::outs() << "  (virtual destructor: also reserves the next "
-                                "slot, "
-                             << (index + 1) << ", for the deleting-destructor variant)";
+              llvm::outs() << "  (virtual destructor: also reserves the next "
+                "slot, "
+                << (index + 1) << ", for the deleting-destructor variant)";
             }
             llvm::outs() << "\n";
+          }
         }
 
         return true;
     }
 
     bool found = false;
+    bool fatal_error = false;
 
 private:
     ASTContext &Context;
@@ -166,7 +211,7 @@ int main(int argc, char **argv) {
     // more than the lower-level pieces this tool actually depends on.
     if (argc < 4) {
         llvm::errs() << "usage: vtable-index-analyzer <header.h> <ClassName> "
-                         "<method1> [method2 ...] -- <compiler args...>\n";
+                         "<method1|*> [method2 ...] -- <compiler args...>\n";
         return 2;
     }
 
@@ -189,6 +234,12 @@ int main(int argc, char **argv) {
 
     if (Q.methodNames.empty()) {
         llvm::errs() << "error: no method names given\n";
+        return 2;
+    }
+    const bool hasWildcard =
+        std::find(Q.methodNames.begin(), Q.methodNames.end(), "*") != Q.methodNames.end();
+    if (hasWildcard && Q.methodNames.size() != 1) {
+        llvm::errs() << "error: '*' must be the only method selector\n";
         return 2;
     }
 
@@ -222,6 +273,8 @@ int main(int argc, char **argv) {
                         "parsing this header and its includes\n";
         return 1;
     }
+    if (Visitor.fatal_error)
+        return 1;
 
     return 0;
 }
