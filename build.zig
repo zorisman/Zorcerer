@@ -1,5 +1,6 @@
 const std = @import("std");
 const index_analyzer = @import("src/zig_build_utils/build_index_analyzer.zig");
+const codegen = @import("src/zig_build_utils/EngineIndexesGenerator.zig");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{
@@ -12,6 +13,13 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     index_analyzer.addIndexAnalyzer(b);
+
+    const toml = @embedFile("./engine.toml");
+    const engine_indexes_generated = try codegen.generate(b.allocator, toml);
+    try std.Io.Dir.writeFile(std.Io.Dir.cwd(), b.graph.io, .{
+        .sub_path = "src/codegen_generated/engine_indexes.zig",
+        .data = engine_indexes_generated,
+    });
 
     const hooks = b.createModule(.{
         .root_source_file = b.path("extern/zig-hooks/src/root.zig"),

@@ -10,3 +10,6 @@ tmp/
 # Zig
 zig-out/
 .zig-cache/
+
+# Codegen
+src/codegen_generated/
