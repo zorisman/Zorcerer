@@ -2,54 +2,43 @@
 //! prove the interception actually fires against a live TF2 dedicated
 //! server.
 //!
-//! *** VERIFY THE INDICES BELOW BEFORE RUNNING THIS *** 
-//! `log_print_index`/`server_command_index` were counted by hand from the
-//! full, in-order IVEngineServer declaration published on the Valve
-//! Developer Wiki (https://developer.valvesoftware.com/wiki/IVEngineServer),
-//! which matches the long-standing layout most Source games - TF2
-//! included - still share for *this specific* interface. IVEngineServer
-//! has historically been one of the more stable interfaces (unlike
-//! IServerGameDLL, whose INTERFACEVERSION_SERVERGAMEDLL string has bumped
-//! repeatedly over TF2's life - 004, up through at least 011 as of a 2022
-//! update, and possibly further since), which is why both demo hooks
-//! below target IVEngineServer rather than IServerGameDLL. "Historically
-//! stable" is not "guaranteed for your exact build", though. Before
-//! relying on this:
-//!   1. Open your own copy of hl2sdk-tf2/public/eiface.h
-//!      (https://github.com/alliedmodders/hl2sdk-tf2) for the branch your
-//!      server actually runs.
-//!   2. Recount LogPrint's and ServerCommand's position in the class
-//!      (0-based, counting every `virtual` declared above each one,
-//!      including anything behind game-specific #ifdefs your build
-//!      enables).
-//!   3. Update the two constants below if your count differs.
-//! Getting an index wrong doesn't corrupt anything by itself - the
-//! mprotect and the pointer swap both still succeed - but you'll
-//! overwrite the *wrong* method's slot. The next time the engine actually
-//! calls that slot, it'll jump into a detour expecting different
-//! arguments: likely a crash, not a clean failure. Test on a listen
-//! server or an empty dedicated server first, not one with players on it.
+//! Changes in this revision: `install` now takes an
+//! `EngineVersions.KnownBuild` (the result of `EngineVersions.detect`,
+//! called in Entrypoint.zig's `load`) instead of computing
+//! `log_print_index`/`server_command_index` itself. Those indices come
+//! from a maintained, calibrated table now (see EngineVersions.zig),
+//! because different engine builds genuinely have different values for
+//! them - a single hard-coded (or even single compiled-in,
+//! engine_adapter.cpp-derived) index is only ever correct for the one
+//! build it was derived against.
 //!
-//! Getting `engine: *anyopaque` (an IVEngineServer*) depends on your
-//! loader. If it's a Valve Server Plugin (engine/iserverplugin.h,
-//! IServerPluginCallbacks), the engine hands your plugin an
-//! `engineFactory` function in `Load()`; call
-//! `engineFactory(INTERFACEVERSION_VENGINESERVER, null)` to get it, then
-//! pass the result straight into `install` below.
+//! `install` still guards against being called twice without an
+//! intervening `uninstall` (the `installed` flag) - this is the fix for
+//! the crash we diagnosed from crash_20261015214353_2.dmp: a second,
+//! unguarded install() captured the first install's own detour as "the
+//! original function", so the next real LogPrint call recursed into
+//! itself until the stack was exhausted.
+//!
+//! Note the detours still call through `log_print_hook.original_fn` /
+//! `server_command_hook.original_fn` as raw function pointers, *not*
+//! through anything that does a fresh virtual dispatch. Whatever's
+//! *currently* in the vtable slot, once a hook is installed, is our own
+//! detour - routing "call the original" through a fresh virtual call
+//! would recreate the exact same infinite-recursion crash, just via a
+//! different-looking call. `original_fn` is the one value guaranteed to
+//! be the pre-hook implementation, captured once at install time - that
+//! has to be what's used to call through.
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
-
-/// From hl2sdk public/eiface.h - confirm both against your own checkout
-/// before relying on them (see the module doc-comment above).
-const log_print_index = 76; // IVEngineServer::LogPrint
-const server_command_index = 36; // IVEngineServer::ServerCommand
+const EngineVersions = @import("EngineVersions.zig");
 
 const LogPrintFn = *const fn (engine: *anyopaque, msg: [*:0]const u8) callconv(.c) void;
 const ServerCommandFn = *const fn (engine: *anyopaque, str: [*:0]const u8) callconv(.c) void;
 
 var log_print_hook: VTableHooks.VtableHook = undefined;
 var server_command_hook: VTableHooks.VtableHook = undefined;
+var installed = false;
 
 /// Hook 1: every line the engine logs also gets a "[MyLoader]"-tagged
 /// echo printed right alongside it - the most visible possible proof the
@@ -94,31 +83,38 @@ fn detourServerCommand(engine: *anyopaque, str: [*:0]const u8) callconv(.c) void
     original(engine, str);
 }
 
-/// `engine` is an IVEngineServer* (see the module doc-comment for how to
-/// obtain one). Installs both demo hooks; on failure, anything already
-/// installed is rolled back before the error is returned.
-pub fn install(engine: *anyopaque) VTableHooks.HookError!void {
+/// `engine` is an IVEngineServer* (see Entrypoint.zig for how one is
+/// obtained). `build` is the calibrated-table entry EngineVersions.detect
+/// matched against the running engine - its indices, not a guess, are
+/// what gets hooked. Installs both demo hooks; on failure, anything
+/// already installed is rolled back before the error is returned. A
+/// second call while already installed is a harmless no-op.
+pub fn install(engine: *anyopaque, build: EngineVersions.KnownBuild) VTableHooks.HookError!void {
+    if (installed) return;
+
     const vtable = VTableHooks.vtableOf(engine);
 
     log_print_hook = try VTableHooks.VtableHook.install(
         vtable,
-        log_print_index,
+        build.log_print_index,
         @ptrCast(&detourLogPrint),
     );
     errdefer log_print_hook.uninstall() catch {};
 
     server_command_hook = try VTableHooks.VtableHook.install(
         vtable,
-        server_command_index,
+        build.server_command_index,
         @ptrCast(&detourServerCommand),
     );
+
+    installed = true;
 }
 
 /// Restores both original vtable entries. Call this from your plugin's
-/// unload path - leaving a hook installed into a vtable that's about to
-/// be unloaded (or that outlives your detour functions' module) is a
-/// guaranteed crash.
+/// unload path. A call while not installed is a harmless no-op.
 pub fn uninstall() void {
+    if (!installed) return;
     server_command_hook.uninstall() catch {};
     log_print_hook.uninstall() catch {};
+    installed = false;
 }

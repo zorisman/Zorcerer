@@ -3,19 +3,29 @@
 //! Metamod:Source itself uses to get loaded, rather than substituting or
 //! LD_PRELOAD-wrapping server.so/engine.so.
 //!
+//! Changes in this revision: `engine_interface_version` and
+//! `log_print_index` are no longer hard-coded. Different engine builds
+//! have genuinely different values for both (that's exactly why the
+//! original hard-coded numbers were dangerous - correct for one branch,
+//! silently wrong on another) - see EngineVersions.zig for the detector
+//! and the maintained table of calibrated values it looks them up from.
+//! If the running engine doesn't match anything in that table, `load`
+//! refuses cleanly (logged nowhere, since we don't have a verified
+//! LogPrint index to log *through* yet - that's the one case where this
+//! can't report its own failure) rather than guessing.
+//!
 //! *** VERIFY BEFORE USE ***
-//! The method list below follows IServerPluginCallbacks as documented on
-//! the Valve Developer Wiki
-//! (https://developer.valvesoftware.com/wiki/IServerPluginCallbacks) and
-//! the historical public/engine/iserverplugin.h header. The first nine
-//! methods (Load through LevelShutdown) have been stable across every
-//! version of this interface I could find and are implemented for real.
-//! Everything after that - the client/command callbacks added in later
-//! interface versions (ClientConnect, ClientCommand, NetworkIDValidated,
-//! OnQueryCvarValueFinished, OnEdictAllocated/Freed, ...) - is backed by
-//! `genericStub`, a placeholder that safely ignores whatever arguments
-//! it's called with and returns 0 (== false == PLUGIN_CONTINUE == null,
-//! a safe default for all of them).
+//! The IServerPluginCallbacks method list below follows the Valve
+//! Developer Wiki (https://developer.valvesoftware.com/wiki/IServerPluginCallbacks)
+//! and the historical public/engine/iserverplugin.h header. The first
+//! nine methods (Load through LevelShutdown) have been stable across
+//! every version of this interface I could find and are implemented for
+//! real. Everything after that - the client/command callbacks added in
+//! later interface versions (ClientConnect, ClientCommand,
+//! NetworkIDValidated, OnQueryCvarValueFinished, OnEdictAllocated/Freed,
+//! ...) - is backed by `genericStub`, a placeholder that safely ignores
+//! whatever arguments it's called with and returns 0 (== false ==
+//! PLUGIN_CONTINUE == null, a safe default for all of them).
 //!
 //! This padding exists so that if your exact TF2 build's interface has a
 //! few more trailing methods than the nine implemented here, the engine
@@ -28,35 +38,35 @@
 //! called), but too *small* for your build's real interface means a call
 //! past the end of the array - a crash. When in doubt, raise it.
 //!
-//! Also unverified: `engine_interface_version` ("VEngineServer022") and
-//! the vtable index (76) used to grab IVEngineServer::LogPrint for our
-//! own startup messages - same numbers TF2EngineDemo.zig already uses
-//! and flags; see that file's doc-comment for how to re-derive them.
-//! `plugin_interface_versions` is a list, not a single guess: a wrong
-//! *plugin* version string just means CreateInterface returns null for
-//! it and the engine tries the next one in its own list, or logs an
-//! error and moves on - it does not crash anything, unlike a wrong
-//! vtable index.
+//! `plugin_interface_versions` - the versions of *our own*
+//! IServerPluginCallbacks *we* claim to implement - is a separate concern
+//! from engine-side detection: it's a list, not a single guess, because
+//! a wrong entry there just means CreateInterface returns null for it
+//! and the engine tries the next one (or logs an error and moves on) -
+//! it can't crash anything the way a wrong engine-side vtable index can,
+//! so it doesn't need the same calibrated-table treatment.
 //!
 //! I could not compile-check this file myself (no Zig 0.16 toolchain,
 //! and obviously no TF2 dedicated server, available in this environment)
 //! - please build and load it on a listen/test server first, not
 //! production.
 //!
-//! Build as a shared library for x86_64-linux. Drop the result at
-//! `<mod>/addons/<name>.so` alongside the matching myplugin.vdf (see the
-//! sibling file), e.g. `tf/addons/myloader.so` + `tf/addons/myloader.vdf`.
-//! For fast iteration without restarting the server, the engine also
-//! supports loading/unloading a VSP interactively from the server
-//! console: `plugin_load addons/myloader` / `plugin_unload <index>`
-//! (index shown by `plugin_print`) - no .vdf needed while testing.
+//! Build as a shared library for x86-linux (32-bit - confirmed from the
+//! crash dump analyzed earlier). Drop the result at `<mod>/addons/<name>.so`
+//! alongside the matching myplugin.vdf, e.g. `tf/addons/zorcerer.so` +
+//! `tf/addons/zorcerer.vdf`. For fast iteration without restarting the
+//! server, the engine also supports loading/unloading a VSP interactively
+//! from the server console: `plugin_load addons/zorcerer` /
+//! `plugin_unload <index>` (index shown by `plugin_print`) - no .vdf
+//! needed while testing. Note `plugin_load` only works before a map is
+//! running (see the console-command discussion earlier) - the .vdf route
+//! is what actually loads this on a live server.
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
 const TF2EngineDemo = @import("TF2EngineDemo.zig");
+const EngineVersions = @import("EngineVersions.zig");
 
-/// From public/tier1/interface.h.
-const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
 const iface_ok: c_int = 0;
 const iface_failed: c_int = 1;
 
@@ -67,10 +77,6 @@ const plugin_interface_versions = [_][:0]const u8{
     "ISERVERPLUGINCALLBACKS002",
     "ISERVERPLUGINCALLBACKS001",
 };
-
-/// From hl2sdk public/eiface.h - same values TF2EngineDemo.zig uses.
-const engine_interface_version = "VEngineServer022";
-const log_print_index = 76;
 
 const Slot = ?*const anyopaque;
 
@@ -102,36 +108,67 @@ fn logLine(comptime fmt: []const u8, args: anytype) void {
     print(e, line.ptr);
 }
 
+var load_calls: usize = 0;
+var unload_calls: usize = 0;
+
 fn load(
     this: *anyopaque,
-    interface_factory: CreateInterfaceFn,
-    game_server_factory: CreateInterfaceFn,
+    interface_factory: EngineVersions.CreateInterfaceFn,
+    game_server_factory: EngineVersions.CreateInterfaceFn,
 ) callconv(.c) bool {
-    _ = this;
-    _ = game_server_factory;
+    // _ = this;
+    // _ = game_server_factory;
 
-    const engine_ptr = interface_factory(engine_interface_version, null) orelse return false;
-    engine = engine_ptr;
+    // Refuses cleanly (just `return false`) on an unrecognized build -
+    // we deliberately do NOT fall back to a guessed index here. See the
+    // module doc-comment and EngineVersions.zig for why.
+    const detection = EngineVersions.detect(interface_factory) catch {
+        return false;
+    };
 
-    const engine_vtable = VTableHooks.vtableOf(engine_ptr);
-    log_print = @ptrCast(engine_vtable[log_print_index]);
-    logLine("[MyLoader] Load() reached, IVEngineServer acquired.\n", .{});
+    engine = detection.engine;
+    const engine_vtable = VTableHooks.vtableOf(detection.engine);
+    log_print = @ptrCast(engine_vtable[detection.build.log_print_index]);
+    std.debug.print("{d}", .{@intFromPtr(engine_vtable[detection.build.log_print_index])});
+    logLine("[MyLoader] Load() reached, recognized engine build: {s}\n", .{detection.build.engine_version});
 
-    TF2EngineDemo.install(engine_ptr) catch |err| {
+    TF2EngineDemo.install(detection.engine, detection.build) catch |err| {
         logLine("[MyLoader] failed to install demo hooks: {s}\n", .{@errorName(err)});
         return false;
     };
 
     logLine("[MyLoader] demo hooks installed.\n", .{});
+
+    load_calls += 1;
+
+    std.debug.print(
+        "[Zorcerer] Load #{d}: this=0x{x}, engine_factory=0x{x}, game_factory=0x{x}\n",
+        .{
+            load_calls,
+            @intFromPtr(this),
+            @intFromPtr(interface_factory),
+            @intFromPtr(game_server_factory),
+        },
+    );
     return true;
 }
 
 fn unload(this: *anyopaque) callconv(.c) void {
-    _ = this;
+    // _ = this;
     logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
     TF2EngineDemo.uninstall();
     engine = null;
     log_print = null;
+
+    unload_calls += 1;
+
+    std.debug.print(
+        "[Zorcerer] Unload #{d}: this=0x{x}\n",
+        .{
+            unload_calls,
+            @intFromPtr(this),
+        },
+    );
 }
 
 fn pause(this: *anyopaque) callconv(.c) void {
@@ -174,12 +211,12 @@ fn levelShutdown(this: *anyopaque) callconv(.c) void {
 }
 
 /// Placeholder for every method this foundation doesn't implement yet.
-/// Declared with zero parameters on purpose: the x86-64 SysV calling
-/// convention doesn't validate argument count on entry, so this safely
-/// ignores whatever registers/stack the real call set up and returns 0 in
-/// rax - false / PLUGIN_CONTINUE / null, whichever the real signature
-/// expected. Replace the corresponding slot below once you actually need
-/// that callback to do something.
+/// Declared with zero parameters on purpose: the calling convention
+/// doesn't validate argument count on entry, so this safely ignores
+/// whatever registers/stack the real call set up and returns 0 in the
+/// return register - false / PLUGIN_CONTINUE / null, whichever the real
+/// signature expected. Replace the corresponding slot below once you
+/// actually need that callback to do something.
 fn genericStub() callconv(.c) usize {
     return 0;
 }
