@@ -2,15 +2,22 @@
 //! prove the interception actually fires against a live TF2 dedicated
 //! server.
 //!
-//! Changes in this revision: `install` now takes an
-//! `EngineVersions.KnownBuild` (the result of `EngineVersions.detect`,
-//! called in Entrypoint.zig's `load`) instead of computing
-//! `log_print_index`/`server_command_index` itself. Those indices come
-//! from a maintained, calibrated table now (see EngineVersions.zig),
-//! because different engine builds genuinely have different values for
-//! them - a single hard-coded (or even single compiled-in,
-//! engine_adapter.cpp-derived) index is only ever correct for the one
-//! build it was derived against.
+//! Changes in this revision: `log_print_index`/`server_command_index`
+//! are no longer passed in from an `EngineVersions.KnownBuild` (that
+//! type is gone - see EngineVersions.zig). `install` reads
+//! `Indexes.IVEngineServer.log_print`/`.server_command` directly from
+//! codegen_generated/engine_indexes.zig instead - the single source of
+//! truth for every index in this project now, produced at build time by
+//! EngineIndexesGenerator.zig (which drives VTableIndexAnalyzer.cpp's
+//! Clang-AST analysis) rather than hand-maintained anywhere in Zig.
+//! `install` no longer needs an engine-build parameter at all: it's not
+//! choosing between calibrated values for different builds any more,
+//! it's using the one set of indices the codegen produced, full stop.
+//! Entrypoint.zig is responsible for confirming (via EngineVersions.detect)
+//! that the running engine actually matches the version those indices
+//! were generated for *before* calling this - this file doesn't re-check
+//! that itself, so don't call `install` with an engine pointer that
+//! hasn't been through that check.
 //!
 //! `install` still guards against being called twice without an
 //! intervening `uninstall` (the `installed` flag) - this is the fix for
@@ -31,7 +38,6 @@
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
-const EngineVersions = @import("analyzers/EngineVersions.zig");
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 
 const LogPrintFn = *const fn (engine: *anyopaque, msg: [*:0]const u8) callconv(.c) void;
@@ -84,12 +90,12 @@ fn detourServerCommand(engine: *anyopaque, str: [*:0]const u8) callconv(.c) void
     original(engine, str);
 }
 
-/// `engine` is an IVEngineServer* (see Entrypoint.zig for how one is
-/// obtained). `build` is the calibrated-table entry EngineVersions.detect
-/// matched against the running engine - its indices, not a guess, are
-/// what gets hooked. Installs both demo hooks; on failure, anything
-/// already installed is rolled back before the error is returned. A
-/// second call while already installed is a harmless no-op.
+/// `engine` is an IVEngineServer* that Entrypoint.zig has already
+/// confirmed (via EngineVersions.detect) matches the engine version
+/// `Indexes.IVEngineServer`'s indices were generated for. Installs both
+/// demo hooks; on failure, anything already installed is rolled back
+/// before the error is returned. A second call while already installed
+/// is a harmless no-op.
 pub fn install(engine: *anyopaque) VTableHooks.HookError!void {
     if (installed) return;
 

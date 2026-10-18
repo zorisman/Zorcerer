@@ -3,16 +3,24 @@
 //! Metamod:Source itself uses to get loaded, rather than substituting or
 //! LD_PRELOAD-wrapping server.so/engine.so.
 //!
-//! Changes in this revision: `engine_interface_version` and
-//! `log_print_index` are no longer hard-coded. Different engine builds
-//! have genuinely different values for both (that's exactly why the
-//! original hard-coded numbers were dangerous - correct for one branch,
-//! silently wrong on another) - see EngineVersions.zig for the detector
-//! and the maintained table of calibrated values it looks them up from.
-//! If the running engine doesn't match anything in that table, `load`
-//! refuses cleanly (logged nowhere, since we don't have a verified
-//! LogPrint index to log *through* yet - that's the one case where this
-//! can't report its own failure) rather than guessing.
+//! Changes in this revision: every engine-side index and version string
+//! now comes from exactly one place - codegen_generated/engine_indexes.zig,
+//! produced at build time by EngineIndexesGenerator.zig. Nothing in this
+//! file (or TF2EngineDemo.zig, or EngineVersions.zig) hand-maintains an
+//! index or a version string of its own any more. `load` also now makes
+//! the version check explicit: it compares the engine version the
+//! codegen's indices were generated for against the version that
+//! actually answered CreateInterface, and logs the result either way,
+//! rather than only ever implicitly relying on EngineVersions.detect
+//! having already enforced that by construction.
+//!
+//! Also cleaned up here: the load_calls/unload_calls counters and the
+//! raw std.debug.print pointer dumps from the "LogPrint isn't firing"
+//! troubleshooting session are gone - that was diagnostic scaffolding for
+//! one specific investigation, not something to ship. The one piece of
+//! that session worth keeping permanently is the early, pre-LogPrint
+//! failure path being visible at all (see `debugWriteStderr` below) -
+//! everything else was temporary.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -40,11 +48,12 @@
 //!
 //! `plugin_interface_versions` - the versions of *our own*
 //! IServerPluginCallbacks *we* claim to implement - is a separate concern
-//! from engine-side detection: it's a list, not a single guess, because
-//! a wrong entry there just means CreateInterface returns null for it
-//! and the engine tries the next one (or logs an error and moves on) -
-//! it can't crash anything the way a wrong engine-side vtable index can,
-//! so it doesn't need the same calibrated-table treatment.
+//! from engine-side detection: a wrong entry there just means
+//! CreateInterface returns null for it and the engine tries the next one
+//! (or logs an error and moves on) - it can't crash anything the way a
+//! wrong engine-side vtable index can, so it doesn't need the same
+//! verified-match treatment, even though it now comes from the codegen
+//! too (consistency, not safety).
 //!
 //! I could not compile-check this file myself (no Zig 0.16 toolchain,
 //! and obviously no TF2 dedicated server, available in this environment)
@@ -109,29 +118,68 @@ fn logLine(comptime fmt: []const u8, args: anytype) void {
     print(e, line.ptr);
 }
 
-var load_calls: usize = 0;
-var unload_calls: usize = 0;
+/// Writes straight to the process's own stderr via a raw syscall, no
+/// engine involved. The *only* place this project reaches for this
+/// instead of `logLine`: the one early failure path in `load` where, by
+/// definition, we don't have a verified LogPrint pointer to log through
+/// yet - which is also exactly the failure mode that produced total
+/// silence during the earlier "LogPrint isn't firing" investigation.
+/// Writing here means a detection failure is now visible in the server's
+/// own console/log instead of vanishing.
+fn debugWriteStderr(msg: []const u8) void {
+    _ = std.os.linux.write(2, msg.ptr, msg.len);
+}
 
 fn load(
     this: *anyopaque,
     interface_factory: EngineVersions.CreateInterfaceFn,
     game_server_factory: EngineVersions.CreateInterfaceFn,
 ) callconv(.c) bool {
-    // _ = this;
-    // _ = game_server_factory;
+    _ = this;
+    _ = game_server_factory;
 
-    // Refuses cleanly (just `return false`) on an unrecognized build -
-    // we deliberately do NOT fall back to a guessed index here. See the
-    // module doc-comment and EngineVersions.zig for why.
     const detection = EngineVersions.detect(interface_factory) catch {
+        // EngineVersions.detectOlderVersion is diagnostic-only - it does
+        // NOT give us indices to fall back on (see EngineVersions.zig).
+        // Finding a name here only changes *what gets logged*, never
+        // whether we proceed: we still refuse either way.
+        if (EngineVersions.detectOlderVersion(interface_factory)) |older| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "[MyLoader] engine answered as {s}, but indices were generated for {s} - refusing to load\n",
+                .{ older, Indexes.interfaceversion_vengineserver },
+            ) catch "[MyLoader] engine is an older, recognized build, but indices don't match it - refusing to load\n";
+            debugWriteStderr(msg);
+        } else {
+            debugWriteStderr("[MyLoader] unrecognized engine build - refusing to load\n");
+        }
         return false;
     };
 
     engine = detection.engine;
-    const engine_vtable = VTableHooks.vtableOf(detection.engine);
-    log_print = @ptrCast(engine_vtable[Indexes.IVEngineServer.log_print]);
-    std.debug.print("{d}", .{@intFromPtr(engine_vtable[Indexes.IVEngineServer.log_print])});
-    logLine("[MyLoader] Load() reached, recognized engine build: {s}\n", .{detection.build.engine_version});
+    log_print = @ptrCast(VTableHooks.vtableOf(detection.engine)[Indexes.IVEngineServer.log_print]);
+
+    // The check this revision specifically adds: compare the engine
+    // version the codegen's indices were generated for against the
+    // version that actually answered CreateInterface, and say so in the
+    // log either way - rather than only ever relying on
+    // EngineVersions.detect having already enforced that match
+    // internally. Given detect()'s current (deliberately strict) design,
+    // `detection.engine_version` can only ever already equal
+    // `Indexes.interfaceversion_vengineserver` here - this can't actually
+    // fire today. It's still worth doing: it turns an invariant enforced
+    // by code elsewhere into something visible in the server's own log,
+    // and it's the one spot that would need to start doing real work if
+    // `detect` is ever loosened to accept more than one version string.
+    if (!std.mem.eql(u8, detection.engine_version, Indexes.interfaceversion_vengineserver)) {
+        logLine(
+            "[MyLoader] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
+            .{ Indexes.interfaceversion_vengineserver, detection.engine_version },
+        );
+        return false;
+    }
+    logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
 
     TF2EngineDemo.install(detection.engine) catch |err| {
         logLine("[MyLoader] failed to install demo hooks: {s}\n", .{@errorName(err)});
@@ -139,38 +187,15 @@ fn load(
     };
 
     logLine("[MyLoader] demo hooks installed.\n", .{});
-
-    load_calls += 1;
-
-    std.debug.print(
-        "[Zorcerer] Load #{d}: this=0x{x}, engine_factory=0x{x}, game_factory=0x{x}\n Also, here's my index: {d}\n",
-        .{
-            load_calls,
-            @intFromPtr(this),
-            @intFromPtr(interface_factory),
-            @intFromPtr(game_server_factory),
-            Indexes.IVEngineServer.log_print,
-        },
-    );
     return true;
 }
 
 fn unload(this: *anyopaque) callconv(.c) void {
-    // _ = this;
+    _ = this;
     logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
     TF2EngineDemo.uninstall();
     engine = null;
     log_print = null;
-
-    unload_calls += 1;
-
-    std.debug.print(
-        "[Zorcerer] Unload #{d}: this=0x{x}\n",
-        .{
-            unload_calls,
-            @intFromPtr(this),
-        },
-    );
 }
 
 fn pause(this: *anyopaque) callconv(.c) void {

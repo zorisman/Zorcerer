@@ -1,93 +1,83 @@
-//! Detects which exact IVEngineServer build the running engine actually
-//! is, and looks up the matching, independently-verified vtable indices
-//! for it - instead of a single hard-coded index that's silently wrong
-//! on any other build. "One branch has log_print_index = 72, another has
-//! 76" is exactly the problem this solves: CreateInterface requires an
-//! *exact* version-string match, so probing which strings the running
-//! engine actually answers to tells us which build we're on, and the
-//! indices for each *known* build come from a maintained table, not a
-//! single guess that quietly stops matching reality the moment you
-//! connect to a different branch.
+//! Confirms which IVEngineServer build is actually running, using *only*
+//! the constants EngineIndexesGenerator.zig produced
+//! (codegen_generated/engine_indexes.zig) - no separate, hand-maintained
+//! table anymore. The old `known_builds` table is gone: it carried its
+//! own guessed indices (76/36, 72/34) that were never independently
+//! verified and, as it turned out, matched neither the real calibrated
+//! values the codegen later produced (72/36) - exactly the kind of
+//! silent mismatch this whole project exists to catch instead of ship.
 //!
-//! What this can't do: fully automatic, headerless discovery of a
-//! correct index *for a build nobody has calibrated yet*. There's no
-//! safe way to derive "where is LogPrint in this vtable" from pure
-//! runtime probing alone, short of actually calling unknown function
-//! pointers with guessed arguments and seeing what happens - which is
-//! exactly the risk this table exists to avoid, not something to
-//! reintroduce as an automatic "best guess" fallback. A new build's row
-//! has to be calibrated once, deliberately, against that build's own
-//! matching SDK headers - see "Adding a new entry" below. This file's
-//! job is to make sure the plugin only ever *uses* a mapping that was
-//! actually verified for the engine it's actually running against, and
-//! refuses outright otherwise - loudly and safely, instead of silently
-//! hooking the wrong slot and crashing later the way the original
-//! hard-coded version did.
+//! Why this only ever checks *one* version string: `Indexes.IVEngineServer`
+//! holds exactly one set of vtable indices, computed against whichever
+//! single SDK header snapshot produced
+//! `Indexes.interfaceversion_vengineserver` (the "current"/unsuffixed
+//! constant - see engine_indexes.zig). Those indices are only verified
+//! correct for an engine that answers to *that exact string*. The older
+//! `interfaceversion_vengineserver_version_21`/`_22` constants the
+//! codegen also emits are real version strings a real engine might
+//! answer to, but this file has no separate, verified indices for them -
+//! it doesn't pretend otherwise by quietly reusing the "023" indices on
+//! an "021" engine. They're exposed here purely so a mismatch can be
+//! reported specifically ("found VEngineServer021, indices are for
+//! VEngineServer023") instead of a bare "unrecognized build".
 //!
-//! Adding a new entry (calibration): compile engine_adapter.cpp against
-//! the hl2sdk-tf2 checkout matching the new build, and call
-//! EngineAdapter_EngineInterfaceVersion() / EngineAdapter_LogPrintIndex()
-//! / EngineAdapter_ServerCommandIndex() once to get the three values for
-//! *that* build - a tiny one-off plugin that just logs them and exits is
-//! enough, you don't need the whole loader for this. Add the result as a
-//! new `KnownBuild` row below. From then on, every plugin using this
-//! table recognizes that build automatically, without engine_adapter.cpp
-//! needing to be recompiled or even present at runtime.
+//! If/when EngineIndexesGenerator.zig starts producing a *separate*
+//! index table per version, this file - and the single `Indexes.IVEngineServer`
+//! import everything else in this project uses - would need to grow a
+//! real per-version lookup. Until then, "the one version these indices
+//! are for" is the only thing worth detecting, and `detect` reflects
+//! that honestly rather than offering a lookup that doesn't exist yet.
 //!
-//! I could not compile-check this file myself (no Zig 0.16 toolchain, and
-//! no TF2 server to actually probe, available here).
+//! I could not compile-check this file myself (no Zig 0.16 toolchain,
+//! and no TF2 server to actually probe, available here).
 
 const std = @import("std");
+const Indexes = @import("../codegen_generated/engine_indexes.zig");
 
 pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
-
-pub const KnownBuild = struct {
-    /// Exact IVEngineServer version string this row was calibrated
-    /// against, e.g. "VEngineServer022".
-    engine_version: [:0]const u8,
-    log_print_index: usize,
-    server_command_index: usize,
-};
-
-/// Calibrated entries, newest first. Order matters for one reason: if a
-/// running engine happens to answer to more than one of these at once -
-/// plausible, since engines often keep an old version string mapped to a
-/// still-compatible interface for backward compatibility - `detect`
-/// returns the *first* match, so putting newer/more-specific rows first
-/// means a modern engine gets its own real entry rather than an older,
-/// merely-compatible one.
-///
-/// *** These two rows are placeholders illustrating the shape of the
-/// table, carried over from numbers earlier files in this project used -
-/// NEITHER has been independently re-verified against a real running
-/// server since engine_adapter.cpp was written. Treat them as examples
-/// to replace via real calibration, not as trustworthy out of the box.
-/// See "Adding a new entry" above. ***
-pub const known_builds = [_]KnownBuild{
-    .{ .engine_version = "VEngineServer022", .log_print_index = 76, .server_command_index = 36 },
-    .{ .engine_version = "VEngineServer021", .log_print_index = 72, .server_command_index = 34 },
-};
 
 pub const DetectError = error{UnrecognizedEngineBuild};
 
 pub const Detection = struct {
-    build: KnownBuild,
     engine: *anyopaque,
+    /// Always equal to `Indexes.interfaceversion_vengineserver` - `detect`
+    /// only ever succeeds by matching exactly that string. Returned
+    /// anyway (rather than the caller just using the constant directly)
+    /// so a comparison against it reads as a real check on the call
+    /// site, not an assumption baked in silently.
+    engine_version: []const u8,
 };
 
-/// Probes `known_builds` (in table order) against the engine's own
-/// CreateInterface and returns the first one it actually answers to,
-/// along with the resolved interface pointer (so the caller doesn't need
-/// a second CreateInterface call for the same thing). Calling this is
-/// always safe, even against a totally unknown build: it only ever calls
-/// CreateInterface itself, nothing derived from a possibly-wrong index -
-/// an unrecognized build just gets `error.UnrecognizedEngineBuild`, never
-/// a crash.
+/// Older, real version strings the codegen also knows the names of -
+/// *not* a fallback index source (see the module doc-comment). Checked
+/// in roughly newest-first order so a mismatch report names the closest
+/// known build first.
+const known_older_versions = [_][]const u8{
+    Indexes.interfaceversion_vengineserver_version_22,
+    Indexes.interfaceversion_vengineserver_version_21,
+};
+
+/// Queries the engine for exactly the version `Indexes.IVEngineServer`'s
+/// indices were calibrated against. Always safe to call, even against a
+/// totally unknown build: it only ever calls CreateInterface itself,
+/// nothing derived from a possibly-wrong index - failure here is just
+/// `error.UnrecognizedEngineBuild`, never a crash.
 pub fn detect(interface_factory: CreateInterfaceFn) DetectError!Detection {
-    for (known_builds) |build| {
-        if (interface_factory(build.engine_version, null)) |ptr| {
-            return .{ .build = build, .engine = ptr };
-        }
+    if (interface_factory(@ptrCast(Indexes.interfaceversion_vengineserver.ptr), null)) |ptr| {
+        return .{ .engine = ptr, .engine_version = Indexes.interfaceversion_vengineserver };
     }
     return error.UnrecognizedEngineBuild;
+}
+
+/// Diagnostic only, meant to be called after `detect` has already failed:
+/// does the engine answer to one of the *older* known version strings
+/// instead? Returns that string if so, so a caller can log specifically
+/// which older build it found - null means not even one of those
+/// matched either, a genuinely unknown build rather than just an older
+/// one this project happens to know the name of.
+pub fn detectOlderVersion(interface_factory: CreateInterfaceFn) ?[]const u8 {
+    for (known_older_versions) |version| {
+        if (interface_factory(@ptrCast(version.ptr), null) != null) return version;
+    }
+    return null;
 }
