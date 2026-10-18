@@ -15,7 +15,7 @@
 // string) as a new row there.
 //
 // Usage:
-//   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] -- <compiler args...>
+//   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] [--write-into <file.toml>] -- <compiler args...>
 //
 // Example, for TF2's hl2sdk-tf2 checkout:
 //   vtable-index-analyzer hl2sdk-tf2/public/eiface.h IVEngineServer \
@@ -78,6 +78,7 @@ namespace {
 struct Query {
     std::string className;
     std::vector<std::string> methodNames;
+    std::string writeIntoPath;
 };
 
 const CXXMethodDecl *findVirtualMethod(const CXXRecordDecl *RD, const std::string &name) {
@@ -93,7 +94,8 @@ const CXXMethodDecl *findVirtualMethod(const CXXRecordDecl *RD, const std::strin
 
 class IndexVisitor : public RecursiveASTVisitor<IndexVisitor> {
 public:
-    IndexVisitor(ASTContext &Context, const Query &Q) : Context(Context), Q(Q) {}
+    IndexVisitor(ASTContext &Context, const Query &Q, std::ostream *Output)
+        : Context(Context), Q(Q), Output(Output) {}
 
     bool VisitCXXRecordDecl(CXXRecordDecl *RD) {
         if (!RD->isCompleteDefinition())
@@ -154,6 +156,7 @@ public:
                     llvm::outs() << "  (deleting destructor)";
                 }
                 llvm::outs() << "\n";
+                writeTomlEntry(Method->getNameAsString(), SlotIndex, true);
             }
         } else {
           for (const auto &methodName : Q.methodNames) {
@@ -187,6 +190,7 @@ public:
                 << (index + 1) << ", for the deleting-destructor variant)";
             }
             llvm::outs() << "\n";
+            writeTomlEntry(methodName, index, false);
           }
         }
 
@@ -197,8 +201,67 @@ public:
     bool fatal_error = false;
 
 private:
+    static void writeTomlBasicString(std::ostream &Out, const std::string &Value) {
+        Out << '"';
+        for (const char C : Value) {
+            switch (C) {
+            case '\\': Out << "\\\\"; break;
+            case '"': Out << "\\\""; break;
+            case '\n': Out << "\\n"; break;
+            case '\r': Out << "\\r"; break;
+            case '\t': Out << "\\t"; break;
+            default: Out << C; break;
+            }
+        }
+        Out << '"';
+    }
+
+    static void writeTomlKey(std::ostream &Out, const std::string &Key) {
+        // TOML bare keys may contain only ASCII letters, digits, '_' and '-'.
+        const bool BareKey = !Key.empty() &&
+            std::all_of(Key.begin(), Key.end(), [](unsigned char C) {
+                return (C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z') ||
+                       (C >= '0' && C <= '9') || C == '_' || C == '-';
+            });
+        if (BareKey)
+            Out << Key;
+        else
+            writeTomlBasicString(Out, Key);
+    }
+
+    void writeTomlEntry(const std::string &MethodName, uint64_t Index,
+                        bool EnsureUniqueKey) {
+        if (Output == nullptr)
+            return;
+
+        std::string Key = MethodName;
+        if (EnsureUniqueKey &&
+            std::find(WrittenKeys.begin(), WrittenKeys.end(), Key) != WrittenKeys.end()) {
+            Key += "@" + std::to_string(Index);
+        }
+        WrittenKeys.push_back(Key);
+
+        if (!OutputHeaderWritten) {
+            // A quoted table key is required because ':' is not allowed in a TOML bare key.
+            *Output << "[";
+            writeTomlBasicString(*Output, "class::" + Q.className);
+            *Output << "]\n";
+            OutputHeaderWritten = true;
+        }
+
+        writeTomlKey(*Output, Key);
+        *Output << " = " << Index << '\n';
+        if (!*Output) {
+            llvm::errs() << "error: failed writing TOML output\n";
+            fatal_error = true;
+        }
+    }
+
     ASTContext &Context;
     const Query &Q;
+    std::ostream *Output = nullptr;
+    bool OutputHeaderWritten = false;
+    std::vector<std::string> WrittenKeys;
 };
 
 } // namespace
@@ -211,7 +274,8 @@ int main(int argc, char **argv) {
     // more than the lower-level pieces this tool actually depends on.
     if (argc < 4) {
         llvm::errs() << "usage: vtable-index-analyzer <header.h> <ClassName> "
-                         "<method1|*> [method2 ...] -- <compiler args...>\n";
+                         "<method1|*> [method2 ...] [--write-into <file.toml>] "
+                         "-- <compiler args...>\n";
         return 2;
     }
 
@@ -222,11 +286,20 @@ int main(int argc, char **argv) {
     std::vector<std::string> extraArgs;
     int i = 3;
     for (; i < argc; ++i) {
-        if (std::string(argv[i]) == "--") {
+        const std::string arg = argv[i];
+        if (arg == "--") {
             ++i;
             break;
         }
-        Q.methodNames.push_back(argv[i]);
+        if (arg == "--write-into") {
+            if (i + 1 >= argc || std::string(argv[i + 1]) == "--") {
+                llvm::errs() << "error: --write-into requires a file path\n";
+                return 2;
+            }
+            Q.writeIntoPath = argv[++i];
+            continue;
+        }
+        Q.methodNames.push_back(arg);
     }
     for (; i < argc; ++i) {
         extraArgs.push_back(argv[i]);
@@ -251,6 +324,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    std::ofstream tomlFile;
+    if (!Q.writeIntoPath.empty()) {
+        tomlFile.open(Q.writeIntoPath, std::ios::out | std::ios::app);
+        if (!tomlFile) {
+            llvm::errs() << "error: couldn't open TOML output file "
+                         << Q.writeIntoPath << "\n";
+            return 2;
+        }
+    }
+
     // #include the real header (rather than feeding its text directly as
     // the "file") so any relative #includes inside it resolve normally,
     // the same as if you'd written `#include "eiface.h"` in an ordinary
@@ -264,7 +347,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    IndexVisitor Visitor(AST->getASTContext(), Q);
+    IndexVisitor Visitor(AST->getASTContext(), Q,
+                         tomlFile.is_open() ? &tomlFile : nullptr);
     Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
 
     if (!Visitor.found) {
@@ -273,8 +357,20 @@ int main(int argc, char **argv) {
                         "parsing this header and its includes\n";
         return 1;
     }
-    if (Visitor.fatal_error)
+    if (Visitor.fatal_error) {
+        if (tomlFile.is_open())
+            tomlFile.close();
         return 1;
+    }
+
+    if (tomlFile.is_open()) {
+        tomlFile.close();
+        if (!tomlFile) {
+            llvm::errs() << "error: failed closing TOML output file "
+                         << Q.writeIntoPath << "\n";
+            return 2;
+        }
+    }
 
     return 0;
 }
