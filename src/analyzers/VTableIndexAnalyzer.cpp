@@ -69,6 +69,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 using namespace clang;
@@ -264,6 +265,134 @@ private:
     std::vector<std::string> WrittenKeys;
 };
 
+std::string trimLine(const std::string &Line) {
+    const std::size_t First = Line.find_first_not_of(" \t\r");
+    if (First == std::string::npos)
+        return "";
+    const std::size_t Last = Line.find_last_not_of(" \t\r");
+    return Line.substr(First, Last - First + 1);
+}
+
+bool isTomlTableHeader(const std::string &Line) {
+    const std::string Trimmed = trimLine(Line);
+    return Trimmed.size() >= 2 && Trimmed.front() == '[';
+}
+
+std::string tomlKeyFromLine(const std::string &Line) {
+    const std::size_t Equals = Line.find('=');
+    if (Equals == std::string::npos)
+        return "";
+    return trimLine(Line.substr(0, Equals));
+}
+
+int updateTomlFile(const std::string &Path, const std::string &GeneratedToml) {
+    std::istringstream GeneratedStream(GeneratedToml);
+    std::vector<std::string> GeneratedLines;
+    std::string Line;
+    while (std::getline(GeneratedStream, Line))
+        GeneratedLines.push_back(Line);
+
+    if (GeneratedLines.empty()) {
+        llvm::errs() << "error: no TOML entries were generated\n";
+        return 2;
+    }
+
+    const std::string TargetHeader = trimLine(GeneratedLines.front());
+    std::vector<std::string> Lines;
+    {
+        std::ifstream Input(Path);
+        if (Input.is_open()) {
+            while (std::getline(Input, Line))
+                Lines.push_back(Line);
+            const bool ReadFailed = Input.bad();
+            Input.close();
+            if (ReadFailed) {
+                llvm::errs() << "error: failed reading TOML file " << Path << "\n";
+                return 2;
+            }
+        } else {
+            struct stat FileInfo;
+            if (::stat(Path.c_str(), &FileInfo) == 0) {
+                llvm::errs() << "error: couldn't read existing TOML file " << Path << "\n";
+                return 2;
+            }
+            // A missing file is allowed; it will be created below.
+        }
+    }
+
+    std::size_t SectionStart = Lines.size();
+    for (std::size_t Index = 0; Index < Lines.size(); ++Index) {
+        if (trimLine(Lines[Index]) == TargetHeader) {
+            SectionStart = Index;
+            break;
+        }
+    }
+
+    if (SectionStart == Lines.size()) {
+        if (!Lines.empty() && !Lines.back().empty())
+            Lines.push_back("");
+        Lines.push_back(TargetHeader);
+        for (std::size_t Index = 1; Index < GeneratedLines.size(); ++Index)
+            Lines.push_back(GeneratedLines[Index]);
+    } else {
+        std::size_t SectionEnd = SectionStart + 1;
+        while (SectionEnd < Lines.size() && !isTomlTableHeader(Lines[SectionEnd]))
+            ++SectionEnd;
+
+        // Insert new methods before trailing blank lines that separate this table
+        // from the next one. Existing entries are replaced in place, even if the
+        // generated index is identical to the stored value.
+        std::size_t InsertAt = SectionEnd;
+        while (InsertAt > SectionStart + 1 && trimLine(Lines[InsertAt - 1]).empty())
+            --InsertAt;
+
+        for (std::size_t NewIndex = 1; NewIndex < GeneratedLines.size(); ++NewIndex) {
+            const std::string &NewEntry = GeneratedLines[NewIndex];
+            const std::string NewKey = tomlKeyFromLine(NewEntry);
+            if (NewKey.empty())
+                continue;
+
+            bool Replaced = false;
+            for (std::size_t ExistingIndex = SectionStart + 1;
+                 ExistingIndex < SectionEnd; ++ExistingIndex) {
+                if (tomlKeyFromLine(Lines[ExistingIndex]) == NewKey) {
+                    Lines[ExistingIndex] = NewEntry;
+                    Replaced = true;
+                    break;
+                }
+            }
+
+            if (!Replaced) {
+                Lines.insert(Lines.begin() + InsertAt, NewEntry);
+                ++InsertAt;
+                ++SectionEnd;
+            }
+        }
+    }
+
+    std::ofstream Output(Path, std::ios::out | std::ios::trunc);
+    if (!Output.is_open()) {
+        llvm::errs() << "error: couldn't open TOML output file " << Path << "\n";
+        return 2;
+    }
+
+    for (const std::string &OutputLine : Lines) {
+        Output << OutputLine << '\n';
+        if (!Output) {
+            llvm::errs() << "error: failed writing TOML output file " << Path << "\n";
+            Output.close();
+            return 2;
+        }
+    }
+
+    Output.close();
+    if (!Output) {
+        llvm::errs() << "error: failed closing TOML output file " << Path << "\n";
+        return 2;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -324,15 +453,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    std::ofstream tomlFile;
-    if (!Q.writeIntoPath.empty()) {
-        tomlFile.open(Q.writeIntoPath, std::ios::out | std::ios::app);
-        if (!tomlFile) {
-            llvm::errs() << "error: couldn't open TOML output file "
-                         << Q.writeIntoPath << "\n";
-            return 2;
-        }
-    }
+    // Buffer the generated table first. updateTomlFile() then merges its entries
+    // into an existing class table instead of blindly appending duplicate keys.
+    std::ostringstream tomlBuffer;
 
     // #include the real header (rather than feeding its text directly as
     // the "file") so any relative #includes inside it resolve normally,
@@ -348,7 +471,7 @@ int main(int argc, char **argv) {
     }
 
     IndexVisitor Visitor(AST->getASTContext(), Q,
-                         tomlFile.is_open() ? &tomlFile : nullptr);
+                         Q.writeIntoPath.empty() ? nullptr : &tomlBuffer);
     Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
 
     if (!Visitor.found) {
@@ -357,19 +480,13 @@ int main(int argc, char **argv) {
                         "parsing this header and its includes\n";
         return 1;
     }
-    if (Visitor.fatal_error) {
-        if (tomlFile.is_open())
-            tomlFile.close();
+    if (Visitor.fatal_error)
         return 1;
-    }
 
-    if (tomlFile.is_open()) {
-        tomlFile.close();
-        if (!tomlFile) {
-            llvm::errs() << "error: failed closing TOML output file "
-                         << Q.writeIntoPath << "\n";
-            return 2;
-        }
+    if (!Q.writeIntoPath.empty()) {
+        const int WriteResult = updateTomlFile(Q.writeIntoPath, tomlBuffer.str());
+        if (WriteResult != 0)
+            return WriteResult;
     }
 
     return 0;
