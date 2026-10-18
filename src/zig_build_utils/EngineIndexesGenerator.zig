@@ -9,8 +9,14 @@
 //!
 //!   "IVEngineServer::ChangeTeam" = 97
 //!
-//! The flat-key parser also accepts the unquoted spelling, even though a TOML
-//! key containing ':' should be quoted by a TOML parser.
+//! Global constants use:
+//!
+//!   ["global::Variables"]
+//!   CVAR_INTERFACE_VERSION = "VEngineCvar004"
+//!
+//! Global values are emitted as top-level Zig constants, not as a struct.
+//! The flat-key parser also accepts unquoted keys, even though TOML keys
+//! containing ':' should be quoted by a TOML parser.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,6 +32,12 @@ const Class = struct {
     methods: ArrayList(Method) = .empty,
 };
 
+const GlobalVariable = struct {
+    name: []const u8,
+    value: []const u8,
+    is_string: bool,
+};
+
 const whitespace = " \t\r\n";
 
 /// Parse the supported index-file format and return Zig source code.
@@ -37,7 +49,11 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
         classes.deinit(allocator);
     }
 
+    var global_variables: ArrayList(GlobalVariable) = .empty;
+    defer global_variables.deinit(allocator);
+
     var current_class: ?[]const u8 = null;
+    var current_section_is_global = false;
     var lines = std.mem.splitScalar(u8, source, '\n');
 
     while (lines.next()) |raw_line| {
@@ -55,11 +71,19 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
             section = unquote(section);
             if (std.mem.startsWith(u8, section, "class::")) {
                 section = section["class::".len..];
+                if (!isZigIdentifier(section)) return error.InvalidClassName;
+                current_class = section;
+                current_section_is_global = false;
+                try ensureClass(allocator, &classes, section);
+            } else if (std.mem.startsWith(u8, section, "global::")) {
+                current_class = null;
+                current_section_is_global = true;
+            } else {
+                if (!isZigIdentifier(section)) return error.InvalidClassName;
+                current_class = section;
+                current_section_is_global = false;
+                try ensureClass(allocator, &classes, section);
             }
-            if (!isZigIdentifier(section)) return error.InvalidClassName;
-
-            current_class = section;
-            try ensureClass(allocator, &classes, section);
             continue;
         }
 
@@ -70,31 +94,48 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
         key = unquote(key);
         if (key.len == 0 or value_text.len == 0) return error.InvalidAssignment;
 
-        const index = std.fmt.parseInt(usize, value_text, 10) catch
-            return error.InvalidIndex;
-
-        var class_name: []const u8 = undefined;
-        var method_name: []const u8 = undefined;
+        var class_name: ?[]const u8 = null;
+        var member_name: []const u8 = undefined;
+        var is_global = current_section_is_global;
         if (std.mem.indexOf(u8, key, "::")) |separator| {
             class_name = std.mem.trim(u8, key[0..separator], whitespace);
-            method_name = std.mem.trim(u8, key[separator + 2 ..], whitespace);
-            class_name = unquote(class_name);
-            method_name = unquote(method_name);
+            member_name = std.mem.trim(u8, key[separator + 2 ..], whitespace);
+            class_name = unquote(class_name.?);
+            member_name = unquote(member_name);
+            if (std.mem.eql(u8, class_name.?, "global")) {
+                is_global = true;
+            } else {
+                is_global = false;
+            }
         } else {
-            class_name = current_class orelse return error.MethodWithoutClass;
-            method_name = key;
+            member_name = key;
+            if (!is_global) class_name = current_class orelse return error.MethodWithoutClass;
         }
 
-        if (!isZigIdentifier(class_name)) return error.InvalidClassName;
-        if (!isZigIdentifier(method_name)) return error.InvalidMethodName;
-
-        // Check the final generated identifier too: e.g. "Error" converts to
-        // the Zig keyword "error" and cannot be emitted as a plain declaration.
-        const snake_name = try toSnakeCase(allocator, method_name);
+        if (!isZigIdentifier(member_name)) return error.InvalidMethodName;
+        const snake_name = try toSnakeCase(allocator, member_name);
         defer allocator.free(snake_name);
-        if (!isZigIdentifier(snake_name)) return error.InvalidGeneratedMethodName;
+        if (!isZigIdentifier(snake_name)) {
+            if (is_global) return error.InvalidGeneratedGlobalName;
+            return error.InvalidGeneratedMethodName;
+        }
 
-        try putMethod(allocator, &classes, class_name, method_name, index);
+        if (is_global) {
+            const is_string = value_text.len >= 2 and
+                value_text[0] == '"' and value_text[value_text.len - 1] == '"';
+            const value = if (is_string) unquote(value_text) else value_text;
+            if (!is_string) {
+                _ = std.fmt.parseInt(usize, value, 10) catch return error.InvalidGlobalValue;
+            }
+            try putGlobalVariable(allocator, &global_variables, member_name, value, is_string);
+            continue;
+        }
+
+        const index = std.fmt.parseInt(usize, value_text, 10) catch
+            return error.InvalidIndex;
+        const actual_class_name = class_name orelse return error.MethodWithoutClass;
+        if (!isZigIdentifier(actual_class_name)) return error.InvalidClassName;
+        try putMethod(allocator, &classes, actual_class_name, member_name, index);
     }
 
     var output: ArrayList(u8) = .empty;
@@ -103,6 +144,30 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
     try output.appendSlice(allocator,
         "// Generated by EngineIndexesGenerator.zig. Do not edit manually.\n\n",
     );
+
+    for (global_variables.items, 0..) |variable, variable_index| {
+        const snake_name = try toSnakeCase(allocator, variable.name);
+        defer allocator.free(snake_name);
+
+        for (global_variables.items[0..variable_index]) |previous| {
+            const previous_snake = try toSnakeCase(allocator, previous.name);
+            defer allocator.free(previous_snake);
+            if (std.mem.eql(u8, snake_name, previous_snake)) {
+                return error.DuplicateGeneratedGlobalName;
+            }
+        }
+
+        if (variable.is_string) {
+            try appendFmt(allocator, &output,
+                "pub const {s}: []const u8 = \"", .{snake_name});
+            try appendZigEscapedString(allocator, &output, variable.value);
+            try output.appendSlice(allocator, "\";\n");
+        } else {
+            try appendFmt(allocator, &output,
+                "pub const {s}: usize = {s};\n", .{ snake_name, variable.value });
+        }
+    }
+    if (global_variables.items.len != 0) try output.append(allocator, '\n');
 
     for (classes.items) |class| {
         try appendFmt(allocator, &output, "pub const {s} = struct {{\n", .{class.name});
@@ -176,6 +241,44 @@ fn putMethod(
     }
 
     try class.methods.append(allocator, .{ .name = method_name, .index = index });
+}
+
+fn putGlobalVariable(
+    allocator: Allocator,
+    variables: *ArrayList(GlobalVariable),
+    name: []const u8,
+    value: []const u8,
+    is_string: bool,
+) !void {
+    for (variables.items) |*variable| {
+        if (std.mem.eql(u8, variable.name, name)) {
+            variable.value = value;
+            variable.is_string = is_string;
+            return;
+        }
+    }
+    try variables.append(allocator, .{
+        .name = name,
+        .value = value,
+        .is_string = is_string,
+    });
+}
+
+fn appendZigEscapedString(
+    allocator: Allocator,
+    output: *ArrayList(u8),
+    value: []const u8,
+) !void {
+    for (value) |character| {
+        switch (character) {
+            '\\' => try output.appendSlice(allocator, "\\\\"),
+            '"' => try output.appendSlice(allocator, "\\\""),
+            '\n' => try output.appendSlice(allocator, "\\n"),
+            '\r' => try output.appendSlice(allocator, "\\r"),
+            '\t' => try output.appendSlice(allocator, "\\t"),
+            else => try output.append(allocator, character),
+        }
+    }
 }
 
 fn unquote(text: []const u8) []const u8 {
@@ -282,4 +385,28 @@ test "generate from flat keys" {
 
     try std.testing.expect(std.mem.indexOf(u8, generated,
         "pub const change_team: usize = 97;") != null);
+}
+
+
+test "generate global string constants" {
+    const source =
+        "[\"global::Variables\"]\n" ++
+        "CVAR_INTERFACE_VERSION = \"VEngineCvar004\"\n";
+
+    const generated = try generate(std.testing.allocator, source);
+    defer std.testing.allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated,
+        "pub const cvar_interface_version: []const u8 = \"VEngineCvar004\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated,
+        "pub const Variables = struct {") == null);
+}
+
+test "generate flat global keys" {
+    const source = "\"global::CVAR_INTERFACE_VERSION\" = \"VEngineCvar004\"\n";
+    const generated = try generate(std.testing.allocator, source);
+    defer std.testing.allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated,
+        "pub const cvar_interface_version: []const u8 = \"VEngineCvar004\";") != null);
 }

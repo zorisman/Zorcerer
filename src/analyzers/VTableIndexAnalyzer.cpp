@@ -16,6 +16,7 @@
 //
 // Usage:
 //   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] [--write-into <file.toml>] -- <compiler args...>
+//   --write-into also records discovered interface-version macros in ["global::Variables"].
 //
 // Example, for TF2's hl2sdk-tf2 checkout:
 //   vtable-index-analyzer hl2sdk-tf2/public/eiface.h IVEngineServer \
@@ -60,6 +61,9 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/VTableBuilder.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Lex/MacroInfo.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -69,6 +73,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <sys/stat.h>
 #include <vector>
 
@@ -393,6 +398,74 @@ int updateTomlFile(const std::string &Path, const std::string &GeneratedToml) {
     return 0;
 }
 
+// Source SDK interface versions are usually string-valued preprocessor macros,
+// for example INTERFACEVERSION_VENGINESERVER = "VEngineServer023". Iterate
+// the preprocessor after parsing the requested header so included headers are
+// searched as well.
+bool looksLikeInterfaceVersion(const std::string &Value) {
+    const std::size_t LastNonDigit = Value.find_last_not_of("0123456789");
+    if (LastNonDigit == std::string::npos || LastNonDigit + 1 == Value.size())
+        return false;
+    if (Value.size() - LastNonDigit - 1 < 2)
+        return false;
+
+    bool HasLetter = false;
+    for (std::size_t Index = 0; Index <= LastNonDigit; ++Index) {
+        const unsigned char C = static_cast<unsigned char>(Value[Index]);
+        if ((C >= 'A' && C <= 'Z') || (C >= 'a' && C <= 'z')) {
+            HasLetter = true;
+        } else if (C != '_' && C != '-') {
+            return false;
+        }
+    }
+    return HasLetter;
+}
+
+void appendFactoryVersions(Preprocessor &PP, std::ostream &Output) {
+    std::vector<std::pair<std::string, std::string>> Versions;
+
+    for (const auto &Entry : PP.macros()) {
+        const IdentifierInfo *Identifier = Entry.first;
+        if (Identifier == nullptr)
+            continue;
+
+        const std::string MacroName = Identifier->getName().str();
+        if (MacroName.find("VERSION") == std::string::npos &&
+            MacroName.find("INTERFACE") == std::string::npos)
+            continue;
+
+        const MacroInfo *Info = PP.getMacroInfo(Identifier);
+        if (Info == nullptr || Info->isFunctionLike() || Info->getNumTokens() != 1)
+            continue;
+
+        const Token &ValueToken = Info->tokens().front();
+        if (!ValueToken.is(tok::string_literal))
+            continue;
+
+        bool InvalidSpelling = false;
+        const std::string Spelling = Lexer::getSpelling(
+            ValueToken, PP.getSourceManager(), PP.getLangOpts(), &InvalidSpelling);
+        if (InvalidSpelling || Spelling.size() < 2 ||
+            Spelling.front() != '"' || Spelling.back() != '"')
+            continue;
+
+        const std::string Value = Spelling.substr(1, Spelling.size() - 2);
+        if (looksLikeInterfaceVersion(Value))
+            Versions.emplace_back(MacroName, Value);
+    }
+
+    if (Versions.empty())
+        return;
+
+    std::sort(Versions.begin(), Versions.end(),
+              [](const auto &A, const auto &B) { return A.first < B.first; });
+
+    // ':' requires a quoted table name in TOML.
+    Output << "[\"global::Variables\"]\n";
+    for (const auto &Version : Versions)
+        Output << Version.first << " = \"" << Version.second << "\"\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -487,6 +560,18 @@ int main(int argc, char **argv) {
         const int WriteResult = updateTomlFile(Q.writeIntoPath, tomlBuffer.str());
         if (WriteResult != 0)
             return WriteResult;
+
+        std::ostringstream variablesBuffer;
+        appendFactoryVersions(AST->getPreprocessor(), variablesBuffer);
+        const std::string variablesToml = variablesBuffer.str();
+        if (variablesToml.empty()) {
+            llvm::errs() << "warning: no interface-version string macros found in the parsed headers\n";
+        } else {
+            const int VariablesWriteResult =
+                updateTomlFile(Q.writeIntoPath, variablesToml);
+            if (VariablesWriteResult != 0)
+                return VariablesWriteResult;
+        }
     }
 
     return 0;
