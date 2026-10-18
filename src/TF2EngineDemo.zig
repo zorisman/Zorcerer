@@ -32,6 +32,7 @@
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
 const EngineVersions = @import("analyzers/EngineVersions.zig");
+const Indexes = @import("codegen_generated/engine_indexes.zig");
 
 const LogPrintFn = *const fn (engine: *anyopaque, msg: [*:0]const u8) callconv(.c) void;
 const ServerCommandFn = *const fn (engine: *anyopaque, str: [*:0]const u8) callconv(.c) void;
@@ -89,21 +90,21 @@ fn detourServerCommand(engine: *anyopaque, str: [*:0]const u8) callconv(.c) void
 /// what gets hooked. Installs both demo hooks; on failure, anything
 /// already installed is rolled back before the error is returned. A
 /// second call while already installed is a harmless no-op.
-pub fn install(engine: *anyopaque, build: EngineVersions.KnownBuild) VTableHooks.HookError!void {
+pub fn install(engine: *anyopaque) VTableHooks.HookError!void {
     if (installed) return;
 
     const vtable = VTableHooks.vtableOf(engine);
 
     log_print_hook = try VTableHooks.VtableHook.install(
         vtable,
-        build.log_print_index,
+        Indexes.IVEngineServer.log_print,
         @ptrCast(&detourLogPrint),
     );
     errdefer log_print_hook.uninstall() catch {};
 
     server_command_hook = try VTableHooks.VtableHook.install(
         vtable,
-        build.server_command_index,
+        Indexes.IVEngineServer.server_command,
         @ptrCast(&detourServerCommand),
     );
 

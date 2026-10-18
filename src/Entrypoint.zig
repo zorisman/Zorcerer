@@ -66,6 +66,7 @@ const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
 const TF2EngineDemo = @import("TF2EngineDemo.zig");
 const EngineVersions = @import("analyzers/EngineVersions.zig");
+const Indexes = @import("codegen_generated/engine_indexes.zig");
 
 const iface_ok: c_int = 0;
 const iface_failed: c_int = 1;
@@ -128,11 +129,11 @@ fn load(
 
     engine = detection.engine;
     const engine_vtable = VTableHooks.vtableOf(detection.engine);
-    log_print = @ptrCast(engine_vtable[detection.build.log_print_index]);
-    std.debug.print("{d}", .{@intFromPtr(engine_vtable[detection.build.log_print_index])});
+    log_print = @ptrCast(engine_vtable[Indexes.IVEngineServer.log_print]);
+    std.debug.print("{d}", .{@intFromPtr(engine_vtable[Indexes.IVEngineServer.log_print])});
     logLine("[MyLoader] Load() reached, recognized engine build: {s}\n", .{detection.build.engine_version});
 
-    TF2EngineDemo.install(detection.engine, detection.build) catch |err| {
+    TF2EngineDemo.install(detection.engine) catch |err| {
         logLine("[MyLoader] failed to install demo hooks: {s}\n", .{@errorName(err)});
         return false;
     };
@@ -142,12 +143,13 @@ fn load(
     load_calls += 1;
 
     std.debug.print(
-        "[Zorcerer] Load #{d}: this=0x{x}, engine_factory=0x{x}, game_factory=0x{x}\n",
+        "[Zorcerer] Load #{d}: this=0x{x}, engine_factory=0x{x}, game_factory=0x{x}\n Also, here's my index: {d}\n",
         .{
             load_calls,
             @intFromPtr(this),
             @intFromPtr(interface_factory),
             @intFromPtr(game_server_factory),
+            Indexes.IVEngineServer.log_print,
         },
     );
     return true;
