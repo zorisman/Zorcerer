@@ -25,6 +25,7 @@ const ArrayList = std.ArrayList;
 const Method = struct {
     name: []const u8,
     index: usize,
+    quoted_name: bool = false,
 };
 
 const Class = struct {
@@ -90,18 +91,24 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
         const equals_at = std.mem.indexOfScalar(u8, line, '=') orelse
             return error.InvalidAssignment;
         var key = std.mem.trim(u8, line[0..equals_at], whitespace);
+        const key_was_quoted = isQuotedTomlKey(key);
         const value_text = std.mem.trim(u8, line[equals_at + 1 ..], whitespace);
         key = unquote(key);
         if (key.len == 0 or value_text.len == 0) return error.InvalidAssignment;
 
         var class_name: ?[]const u8 = null;
         var member_name: []const u8 = undefined;
+        var member_name_is_quoted = false;
         var is_global = current_section_is_global;
         if (std.mem.indexOf(u8, key, "::")) |separator| {
             class_name = std.mem.trim(u8, key[0..separator], whitespace);
             member_name = std.mem.trim(u8, key[separator + 2 ..], whitespace);
             class_name = unquote(class_name.?);
             member_name = unquote(member_name);
+            // Composite keys are quoted in TOML because they contain ':'.
+            // Use a Zig quoted identifier only when the member name itself
+            // cannot be represented as a normal Zig identifier.
+            member_name_is_quoted = key_was_quoted and !isZigIdentifier(member_name);
             if (std.mem.eql(u8, class_name.?, "global")) {
                 is_global = true;
             } else {
@@ -109,16 +116,21 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
             }
         } else {
             member_name = key;
+            member_name_is_quoted = key_was_quoted;
             if (!is_global) class_name = current_class orelse return error.MethodWithoutClass;
         }
 
-        if (!isZigIdentifier(member_name)) return error.InvalidMethodName;
+        if (is_global or !member_name_is_quoted) {
+            if (!isZigIdentifier(member_name)) return error.InvalidMethodName;
+        } else if (!isValidQuotedIdentifier(member_name)) {
+            return error.InvalidQuotedMethodName;
+        }
         const snake_name = try toSnakeCase(allocator, member_name);
         defer allocator.free(snake_name);
-        if (!isZigIdentifier(snake_name)) {
-            if (is_global) return error.InvalidGeneratedGlobalName;
+        if (!is_global and !member_name_is_quoted and !isZigIdentifier(snake_name)) {
             return error.InvalidGeneratedMethodName;
         }
+        if (is_global and !isZigIdentifier(snake_name)) return error.InvalidGeneratedGlobalName;
 
         if (is_global) {
             const is_string = value_text.len >= 2 and
@@ -135,7 +147,14 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
             return error.InvalidIndex;
         const actual_class_name = class_name orelse return error.MethodWithoutClass;
         if (!isZigIdentifier(actual_class_name)) return error.InvalidClassName;
-        try putMethod(allocator, &classes, actual_class_name, member_name, index);
+        try putMethod(
+            allocator,
+            &classes,
+            actual_class_name,
+            member_name,
+            index,
+            member_name_is_quoted,
+        );
     }
 
     var output: ArrayList(u8) = .empty;
@@ -175,23 +194,33 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
         for (class.methods.items, 0..) |method, method_index| {
             const snake_name = try toSnakeCase(allocator, method.name);
             defer allocator.free(snake_name);
+            const generated_name = if (method.quoted_name) method.name else snake_name;
 
-            // Prevent two source names such as "ChangeTeam" and "change_team"
-            // from silently producing duplicate Zig declarations.
+            // Compare actual generated names, including escaped identifiers.
             for (class.methods.items[0..method_index]) |previous| {
                 const previous_snake = try toSnakeCase(allocator, previous.name);
                 defer allocator.free(previous_snake);
-                if (std.mem.eql(u8, snake_name, previous_snake)) {
+                const previous_generated_name = if (previous.quoted_name)
+                    previous.name
+                else
+                    previous_snake;
+                if (std.mem.eql(u8, generated_name, previous_generated_name)) {
                     return error.DuplicateGeneratedMethodName;
                 }
             }
 
-            try appendFmt(
-                allocator,
-                &output,
-                "    pub const {s}: usize = {d};\n",
-                .{ snake_name, method.index },
-            );
+            if (method.quoted_name) {
+                try output.appendSlice(allocator, "    pub const @\"");
+                try appendZigEscapedString(allocator, &output, method.name);
+                try appendFmt(allocator, &output, "\": usize = {d};\n", .{method.index});
+            } else {
+                try appendFmt(
+                    allocator,
+                    &output,
+                    "    pub const {s}: usize = {d};\n",
+                    .{ snake_name, method.index },
+                );
+            }
         }
 
         try output.appendSlice(allocator, "};\n\n");
@@ -217,6 +246,7 @@ fn putMethod(
     class_name: []const u8,
     method_name: []const u8,
     index: usize,
+    quoted_name: bool,
 ) !void {
     var class_index: ?usize = null;
     for (classes.items, 0..) |class, i| {
@@ -236,11 +266,16 @@ fn putMethod(
         if (std.mem.eql(u8, method.name, method_name)) {
             // Last value wins if the same method appears more than once.
             method.index = index;
+            method.quoted_name = quoted_name;
             return;
         }
     }
 
-    try class.methods.append(allocator, .{ .name = method_name, .index = index });
+    try class.methods.append(allocator, .{
+        .name = method_name,
+        .index = index,
+        .quoted_name = quoted_name,
+    });
 }
 
 fn putGlobalVariable(
@@ -279,6 +314,20 @@ fn appendZigEscapedString(
             else => try output.append(allocator, character),
         }
     }
+}
+
+fn isQuotedTomlKey(text: []const u8) bool {
+    return text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"';
+}
+
+fn isValidQuotedIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |character| {
+        if (character == '"' or character == '\\' or character == '\n' or character == '\r') {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn unquote(text: []const u8) []const u8 {
@@ -409,4 +458,16 @@ test "generate flat global keys" {
 
     try std.testing.expect(std.mem.indexOf(u8, generated,
         "pub const cvar_interface_version: []const u8 = \"VEngineCvar004\";") != null);
+}
+
+test "quoted TOML method key becomes escaped Zig identifier" {
+    const source =
+        "[\"class::ICvar\"]\n" ++
+        "\"GetCommands@17\" = 17\n";
+
+    const generated = try generate(std.testing.allocator, source);
+    defer std.testing.allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated,
+        "pub const @\"GetCommands@17\": usize = 17;") != null);
 }
