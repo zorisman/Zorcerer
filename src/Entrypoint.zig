@@ -73,10 +73,10 @@ const iface_failed: c_int = 1;
 
 /// Version strings this plugin answers to, newest first. All of them get
 /// the same vtable - the padding described above is what makes that safe.
-const plugin_interface_versions = [_][:0]const u8{
-    "ISERVERPLUGINCALLBACKS003",
-    "ISERVERPLUGINCALLBACKS002",
-    "ISERVERPLUGINCALLBACKS001",
+const plugin_interface_versions = [_][]const u8{
+    Indexes.interfaceversion_iserverplugincallbacks,
+    Indexes.interfaceversion_iserverplugincallbacks_version_2,
+    Indexes.interfaceversion_iserverplugincallbacks_version_1,
 };
 
 const Slot = ?*const anyopaque;
