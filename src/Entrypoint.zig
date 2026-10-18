@@ -65,7 +65,7 @@
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
 const TF2EngineDemo = @import("TF2EngineDemo.zig");
-const EngineVersions = @import("EngineVersions.zig");
+const EngineVersions = @import("analyzers/EngineVersions.zig");
 
 const iface_ok: c_int = 0;
 const iface_failed: c_int = 1;

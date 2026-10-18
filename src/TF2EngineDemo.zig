@@ -31,7 +31,7 @@
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
-const EngineVersions = @import("EngineVersions.zig");
+const EngineVersions = @import("analyzers/EngineVersions.zig");
 
 const LogPrintFn = *const fn (engine: *anyopaque, msg: [*:0]const u8) callconv(.c) void;
 const ServerCommandFn = *const fn (engine: *anyopaque, str: [*:0]const u8) callconv(.c) void;
