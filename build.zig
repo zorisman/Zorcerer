@@ -14,8 +14,8 @@ pub fn build(b: *std.Build) !void {
 
     index_analyzer.addIndexAnalyzer(b);
 
-    const toml = @embedFile("./engine.toml");
-    const engine_indexes_generated = try codegen.generate(b.allocator, toml);
+    const toml_cfg = @embedFile("./engine.toml");
+    const engine_indexes_generated = try codegen.generate(b.allocator, toml_cfg);
     try std.Io.Dir.writeFile(std.Io.Dir.cwd(), b.graph.io, .{
         .sub_path = b.path("src/codegen_generated/engine_indexes.zig").getPath(b),
         .data = engine_indexes_generated,
@@ -36,7 +36,14 @@ pub fn build(b: *std.Build) !void {
         .pic = true,
     });
 
-    const lib = b.addLibrary(.{
+    const toml = b.createModule(.{
+        .root_source_file = b.path("extern/zig-toml/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true
+    });
+
+    const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
         .linkage = .dynamic,
         .root_module = b.addModule("zorcerer", .{
@@ -47,9 +54,10 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
-    lib.root_module.addImport("hooks", hooks);
-    lib.out_filename = "zorcerer.so";
-    b.installArtifact(lib);
+    zorcerer.root_module.addImport("hooks", hooks);
+    zorcerer.root_module.addImport("toml", toml);
+    zorcerer.out_filename = "zorcerer.so";
+    b.installArtifact(zorcerer);
 
     const zig_commands = b.addLibrary(.{
         .name = "zorcerer-commands-plugin",
