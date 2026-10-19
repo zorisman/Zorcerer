@@ -180,19 +180,8 @@ fn load(
         );
         return false;
     }
+
     logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
-
-    TF2EngineDemo.install(detection.engine) catch |err| {
-        logLine("[MyLoader] failed to install demo hooks: {s}\n", .{@errorName(err)});
-        return false;
-    };
-
-    ZorcererCommand.install(interface_factory, detection.engine) catch |err| {
-        TF2EngineDemo.uninstall();
-        logLine("[MyLoader] failed to register zorcerer command: {s}\n", .{@errorName(err)});
-        return false;
-    };
-
     logLine("[MyLoader] demo hooks installed.\n", .{});
     return true;
 }
@@ -200,8 +189,6 @@ fn load(
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
     logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
-    ZorcererCommand.uninstall();
-    TF2EngineDemo.uninstall();
     engine = null;
     log_print = null;
 }
