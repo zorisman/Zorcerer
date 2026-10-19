@@ -185,10 +185,11 @@ fn load(
 
     var manager = Manager.Manager.init();
     defer manager.deinit();
-    const configs: []const []const u8 = manager.readConfig() catch &.{"Failed to load files"};
-    // const message = std.fmt.allocPrint(std.heap.page_allocator, "\nFiles: {s} \n", .{files}) catch "\nFmt failure\n";
-    for (configs) |config| {
-        std.debug.print("\n{s}\n", .{config});
+    const manifests: ?[]const Manager.Manifest = manager.readConfig() catch null;
+    if (manifests) |m| {
+        for (m) |manifest| {
+            std.debug.print("\n{s}: {s}\n", .{manifest.id, manifest.version});
+        }
     }
 
     return true;
