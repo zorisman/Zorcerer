@@ -73,10 +73,10 @@
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
-const TF2EngineDemo = @import("TF2EngineDemo.zig");
 const EngineVersions = @import("analyzers/EngineVersions.zig");
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 const ZorcererCommand = @import("ZorcererCommand.zig");
+const Manager = @import("PluginManager.zig");
 
 const iface_ok: c_int = 0;
 const iface_failed: c_int = 1;
@@ -182,7 +182,15 @@ fn load(
     }
 
     logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
-    logLine("[MyLoader] demo hooks installed.\n", .{});
+
+    var manager = Manager.Manager.init();
+    defer manager.deinit();
+    const configs: []const []const u8 = manager.readConfig() catch &.{"Failed to load files"};
+    // const message = std.fmt.allocPrint(std.heap.page_allocator, "\nFiles: {s} \n", .{files}) catch "\nFmt failure\n";
+    for (configs) |config| {
+        std.debug.print("\n{s}\n", .{config});
+    }
+
     return true;
 }
 
