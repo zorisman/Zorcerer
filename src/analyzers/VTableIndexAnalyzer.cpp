@@ -16,8 +16,8 @@
 //
 // Usage:
 //   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] [--write-into <file.toml>] -- <compiler args...>
-//   vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, {<header.h> const! <macro|*>}}' [--write-into <file.toml>] -- <compiler args...>
-//   Use const! instead of a class name to inspect object-like #define constants.
+//   vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, {<header.h> <ClassName> <method...>}}' [--write-into <file.toml>] -- <compiler args...>
+//   vtable-index-analyzer --read-from <config.toml> [--write-into <file.toml>] -- <compiler args...>
 //
 // Example, for TF2's hl2sdk-tf2 checkout:
 //   vtable-index-analyzer hl2sdk-tf2/public/eiface.h IVEngineServer \
@@ -25,12 +25,39 @@
 //       -I hl2sdk-tf2/public -I hl2sdk-tf2/public/engine -I hl2sdk-tf2/public/tier1 \
 //       -DCOMPILER_GCC -DPOSIX -D_LINUX -DGNUC -std=gnu++14 -m32
 //
-// Constants defined directly in the requested header:
-//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h const! \
-//       INTERFACEVERSION_VENGINESERVER INTERFACEVERSION_VENGINESERVER_INT -- \
-//       -I hl2sdk-tf2/public -I hl2sdk-tf2/public/engine -I hl2sdk-tf2/public/tier1 \
-//       -DCOMPILER_GCC -DPOSIX -D_LINUX -DGNUC -std=gnu++14 -m32
-//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h const! '*' -- <compiler args...>
+// --read-from reads a config file instead of the <header.h> <ClassName>
+// <method...> triple (or the brace-set form) - it replaces that argument
+// entirely, not combines with it. Schema (see analyzer.toml for a worked
+// example):
+//
+//   [root]
+//   path = "extern/source/source-sdk-2013/src"
+//
+//   [[class]]
+//   header = "game/server/baseentity.h"   # joined onto [root].path
+//   name = "CBaseEntity"
+//   methods = ["*"]                        # or a list of specific names
+//
+//   [[class]]
+//   header = "public/eiface.h"
+//   name = "IVEngineServer"
+//   methods = ["ServerCommand", "LogPrint"]
+//
+// Each [[class]] becomes exactly one Query, fed through the same
+// IndexVisitor/writeTomlEntry path as the other two input forms - the
+// only thing --read-from changes is where Queries come from, not how
+// they're resolved or reported. This is a deliberately minimal TOML
+// subset (flat key = "string" pairs and one array-of-strings field, no
+// escapes, no nested tables, no non-string values) - the same scope
+// restriction as this file's own --write-into output.
+//
+// No exceptions, no RTTI: this file was already free of both (Clang/
+// LLVM's dyn_cast is its own RTTI-free mechanism, not dynamic_cast/
+// typeid, and nothing here used try/throw/catch to begin with) - the
+// --read-from config parser added below keeps that property, using bool
+// returns and an out-param error string instead of exceptions, and
+// guarding every std::string::substr call against the out-of-range
+// cases that would otherwise throw.
 //
 // *** The compiler args after `--` carry the exact same risk engine_adapter.cpp
 // already flagged ***: eiface.h pulls in a real dependency tree
@@ -69,10 +96,6 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/VTableBuilder.h"
-#include "clang/Basic/TokenKinds.h"
-#include "clang/Lex/MacroInfo.h"
-#include "clang/Lex/Preprocessor.h"
-#include "clang/Lex/Token.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -212,44 +235,6 @@ public:
         return true;
     }
 
-    bool processMacros(Preprocessor &PP, const SourceManager &SM) {
-        const bool AllMacros = Q.methodNames.size() == 1 && Q.methodNames.front() == "*";
-        std::vector<std::string> FoundNames;
-
-        for (const auto &Entry : PP.macros(false)) {
-            const IdentifierInfo *Identifier = Entry.first;
-            const MacroInfo *MI = PP.getMacroInfo(Identifier);
-            if (MI == nullptr || MI->isFunctionLike() || MI->isBuiltinMacro() ||
-                MI->tokens_empty() ||
-                !definitionIsInHeader(SM, MI->getDefinitionLoc(), Q.headerPath))
-                continue;
-
-            const std::string Name = Identifier->getName().str();
-            if (!AllMacros && std::find(Q.methodNames.begin(), Q.methodNames.end(), Name) ==
-                                  Q.methodNames.end())
-                continue;
-
-            const std::string Value = macroValueAsToml(PP, *MI);
-            writeTomlEntryValue(Name, Value, true, std::to_string(FoundNames.size()));
-            llvm::outs() << Q.headerPath << "::" << Name << " = " << Value << '\n';
-            FoundNames.push_back(Name);
-        }
-
-        if (!AllMacros) {
-            for (const std::string &Requested : Q.methodNames) {
-                if (std::find(FoundNames.begin(), FoundNames.end(), Requested) == FoundNames.end()) {
-                    llvm::errs() << "error: no object-like macro named '" << Requested
-                                 << "' defined in " << Q.headerPath << "\n";
-                    return false;
-                }
-            }
-        } else if (FoundNames.empty()) {
-            llvm::errs() << "error: no object-like macros found in " << Q.headerPath << "\n";
-            return false;
-        }
-        return true;
-    }
-
     bool found = false;
     bool fatal_error = false;
 
@@ -282,104 +267,28 @@ private:
             writeTomlBasicString(Out, Key);
     }
 
-    static bool definitionIsInHeader(const SourceManager &SM, SourceLocation Loc,
-                                     const std::string &HeaderPath) {
-        const std::string DefinitionPath = SM.getFilename(Loc).str();
-        if (DefinitionPath == HeaderPath)
-            return true;
-        // Clang may report a resolved path while argv contains a relative path.
-        if (DefinitionPath.size() > HeaderPath.size() &&
-            DefinitionPath.compare(DefinitionPath.size() - HeaderPath.size(),
-                                   HeaderPath.size(), HeaderPath) == 0) {
-            const char Separator = DefinitionPath[DefinitionPath.size() - HeaderPath.size() - 1];
-            if (Separator == '/' || Separator == '\\')
-                return true;
-        }
-        return false;
-    }
-
-    static std::string macroValueAsToml(const Preprocessor &PP, const MacroInfo &MI,
-                                        unsigned Depth = 0) {
-        std::string Raw;
-        for (unsigned I = 0; I < MI.getNumTokens(); ++I) {
-            if (I != 0)
-                Raw += ' ';
-            Raw += PP.getSpelling(MI.getReplacementToken(I));
-        }
-
-        if (MI.getNumTokens() == 1) {
-            const Token &TokenValue = MI.getReplacementToken(0);
-            const std::string Spelling = PP.getSpelling(TokenValue);
-            if (TokenValue.is(tok::identifier) && Depth < 16) {
-                if (const MacroInfo *Alias = PP.getMacroInfo(TokenValue.getIdentifierInfo())) {
-                    if (Alias != &MI && !Alias->isFunctionLike() && !Alias->tokens_empty())
-                        return macroValueAsToml(PP, *Alias, Depth + 1);
-                }
-            }
-            if (TokenValue.is(tok::string_literal) && Spelling.size() >= 2 &&
-                Spelling.front() == '"' && Spelling.back() == '"')
-                return Spelling;
-            if (TokenValue.is(tok::numeric_constant)) {
-                std::string Number = Spelling;
-                while (!Number.empty() &&
-                       (Number.back() == 'u' || Number.back() == 'U' ||
-                        Number.back() == 'l' || Number.back() == 'L'))
-                    Number.pop_back();
-                bool Decimal = !Number.empty();
-                for (const char C : Number)
-                    Decimal = Decimal && C >= '0' && C <= '9';
-                const bool HexPrefix = Number.size() > 2 && Number[0] == '0' &&
-                                       (Number[1] == 'x' || Number[1] == 'X');
-                bool HexDigits = HexPrefix;
-                if (HexPrefix) {
-                    for (std::size_t I = 2; I < Number.size(); ++I) {
-                        const char C = Number[I];
-                        HexDigits = HexDigits &&
-                            ((C >= '0' && C <= '9') || (C >= 'a' && C <= 'f') ||
-                             (C >= 'A' && C <= 'F'));
-                    }
-                }
-                if ((Decimal && (Number.size() == 1 || Number[0] != '0')) ||
-                    HexDigits || Number == "0")
-                    return Number;
-            }
-            if (Spelling == "true" || Spelling == "false")
-                return Spelling;
-        }
-
-        // Preserve complex replacement lists as strings rather than invalid TOML syntax.
-        std::ostringstream Out;
-        writeTomlBasicString(Out, Raw);
-        return Out.str();
-    }
-
     void writeTomlEntry(const std::string &MethodName, uint64_t Index,
                         bool EnsureUniqueKey) {
-        writeTomlEntryValue(MethodName, std::to_string(Index), EnsureUniqueKey,
-                            std::to_string(Index));
-    }
-
-    void writeTomlEntryValue(const std::string &Name, const std::string &Value,
-                             bool EnsureUniqueKey, const std::string &DuplicateSuffix) {
         if (Output == nullptr)
             return;
 
-        std::string Key = Name;
+        std::string Key = MethodName;
         if (EnsureUniqueKey &&
-            std::find(WrittenKeys.begin(), WrittenKeys.end(), Key) != WrittenKeys.end())
-            Key += "@" + DuplicateSuffix;
+            std::find(WrittenKeys.begin(), WrittenKeys.end(), Key) != WrittenKeys.end()) {
+            Key += "@" + std::to_string(Index);
+        }
         WrittenKeys.push_back(Key);
 
         if (!OutputHeaderWritten) {
+            // A quoted table key is required because ':' is not allowed in a TOML bare key.
             *Output << "[";
-            writeTomlBasicString(*Output, Q.className == "const!"
-                ? "const::" + Q.headerPath : "class::" + Q.className);
+            writeTomlBasicString(*Output, "class::" + Q.className);
             *Output << "]\n";
             OutputHeaderWritten = true;
         }
 
         writeTomlKey(*Output, Key);
-        *Output << " = " << Value << '\n';
+        *Output << " = " << Index << '\n';
         if (!*Output) {
             llvm::errs() << "error: failed writing TOML output\n";
             fatal_error = true;
@@ -654,6 +563,210 @@ bool parseSetQueries(const std::vector<std::string> &Arguments,
     return true;
 }
 
+// ---- --read-from config file parsing ----
+// See the file's top comment for the schema. Deliberately minimal: flat
+// `key = "string"` pairs, one `[root]` table, any number of `[[class]]`
+// array-of-tables entries, `#` comments. No escapes, no nested tables, no
+// non-string values - matching this tool's existing --write-into output
+// scope rather than a general-purpose TOML implementation.
+
+bool parseQuotedTomlString(const std::string &Raw, std::string &Out) {
+    const std::string Trimmed = trimLine(Raw);
+    if (Trimmed.size() < 2 || Trimmed.front() != '"' || Trimmed.back() != '"')
+        return false;
+    // No escape handling, by design - see the module comment.
+    Out = Trimmed.substr(1, Trimmed.size() - 2);
+    return true;
+}
+
+bool parseTomlStringArray(const std::string &Raw, std::vector<std::string> &Out,
+                          std::string &Error) {
+    const std::string Trimmed = trimLine(Raw);
+    if (Trimmed.size() < 2 || Trimmed.front() != '[' || Trimmed.back() != ']') {
+        Error = "expected an array of quoted strings, got: " + Raw;
+        return false;
+    }
+    const std::string Inner = Trimmed.substr(1, Trimmed.size() - 2);
+    Out.clear();
+    std::size_t Pos = 0;
+    while (Pos < Inner.size()) {
+        const std::size_t Comma = Inner.find(',', Pos);
+        const std::string Item = trimLine(
+            Comma == std::string::npos ? Inner.substr(Pos) : Inner.substr(Pos, Comma - Pos));
+        if (!Item.empty()) {
+            std::string Value;
+            if (!parseQuotedTomlString(Item, Value)) {
+                Error = "expected a quoted string in array, got: " + Item;
+                return false;
+            }
+            Out.push_back(Value);
+        }
+        if (Comma == std::string::npos)
+            break;
+        Pos = Comma + 1;
+    }
+    return true;
+}
+
+// Reads `Path` and appends one Query per [[class]] entry to `Queries`.
+// `Queries` is only appended to on full success (an error partway through
+// doesn't leave a partially-populated result for the caller to trip
+// over) - everything is built into locals and only pushed in `FlushCurrent`,
+// which itself bails out through `Error` the same way every other
+// function here does, no throw involved.
+bool parseConfigFile(const std::string &Path, std::vector<Query> &Queries,
+                     std::string &Error) {
+    std::ifstream File(Path);
+    if (!File.is_open()) {
+        Error = "couldn't open " + Path;
+        return false;
+    }
+
+    std::vector<Query> Parsed;
+
+    enum class Section { None, Root, Class };
+    Section CurrentSection = Section::None;
+
+    std::string RootPath;
+    bool HaveRootPath = false;
+
+    struct PendingClass {
+        std::string header;
+        std::string name;
+        std::vector<std::string> methods;
+        bool haveHeader = false;
+        bool haveName = false;
+        bool haveMethods = false;
+    };
+    PendingClass Current;
+    bool HaveCurrent = false;
+
+    auto FlushCurrent = [&](std::string &FlushError) -> bool {
+        if (!HaveCurrent)
+            return true;
+        if (!Current.haveHeader || !Current.haveName || !Current.haveMethods) {
+            FlushError = "every [[class]] needs header, name, and methods";
+            return false;
+        }
+
+        Query Q;
+        Q.headerPath = HaveRootPath ? (RootPath + "/" + Current.header) : Current.header;
+        Q.className = Current.name;
+        Q.methodNames = Current.methods;
+
+        const bool HasWildcard = std::find(
+            Q.methodNames.begin(), Q.methodNames.end(), "*") != Q.methodNames.end();
+        if (HasWildcard && (Q.methodNames.size() != 1 || Q.methodNames.front() != "*")) {
+            FlushError = "'*' must be the only method selector for " + Q.className;
+            return false;
+        }
+
+        Parsed.push_back(Q);
+        Current = PendingClass();
+        HaveCurrent = false;
+        return true;
+    };
+
+    std::string RawLine;
+    while (std::getline(File, RawLine)) {
+        const std::string Line = trimLine(RawLine);
+        if (Line.empty() || Line.front() == '#')
+            continue;
+
+        if (Line.front() == '[') {
+            if (!FlushCurrent(Error))
+                return false;
+
+            if (Line.size() >= 4 && Line.compare(0, 2, "[[") == 0 &&
+                Line.compare(Line.size() - 2, 2, "]]") == 0) {
+                const std::string TableName = trimLine(Line.substr(2, Line.size() - 4));
+                if (TableName != "class") {
+                    Error = "unknown table array '[[" + TableName + "]]'";
+                    return false;
+                }
+                CurrentSection = Section::Class;
+                HaveCurrent = true;
+                continue;
+            }
+            if (Line.back() == ']') {
+                const std::string TableName = trimLine(Line.substr(1, Line.size() - 2));
+                if (TableName == "root") {
+                    CurrentSection = Section::Root;
+                    continue;
+                }
+                Error = "unknown table '[" + TableName + "]'";
+                return false;
+            }
+            Error = "malformed table header: " + Line;
+            return false;
+        }
+
+        const std::size_t Equals = Line.find('=');
+        if (Equals == std::string::npos) {
+            Error = "expected 'key = value', got: " + Line;
+            return false;
+        }
+        const std::string Key = trimLine(Line.substr(0, Equals));
+        const std::string Value = trimLine(Line.substr(Equals + 1));
+
+        if (CurrentSection == Section::Root) {
+            if (Key == "path") {
+                if (!parseQuotedTomlString(Value, RootPath)) {
+                    Error = "[root].path must be a quoted string";
+                    return false;
+                }
+                HaveRootPath = true;
+            } else {
+                Error = "unknown key '" + Key + "' in [root]";
+                return false;
+            }
+        } else if (CurrentSection == Section::Class) {
+            if (Key == "header") {
+                if (!parseQuotedTomlString(Value, Current.header)) {
+                    Error = "[[class]].header must be a quoted string";
+                    return false;
+                }
+                Current.haveHeader = true;
+            } else if (Key == "name") {
+                if (!parseQuotedTomlString(Value, Current.name)) {
+                    Error = "[[class]].name must be a quoted string";
+                    return false;
+                }
+                Current.haveName = true;
+            } else if (Key == "methods") {
+                if (!parseTomlStringArray(Value, Current.methods, Error))
+                    return false;
+                if (Current.methods.empty()) {
+                    Error = "[[class]].methods must have at least one entry";
+                    return false;
+                }
+                Current.haveMethods = true;
+            } else {
+                Error = "unknown key '" + Key + "' in [[class]]";
+                return false;
+            }
+        } else {
+            Error = "key-value pair outside of any table: " + Line;
+            return false;
+        }
+    }
+
+    if (!FlushCurrent(Error))
+        return false;
+
+    if (!HaveRootPath) {
+        Error = "[root].path is required";
+        return false;
+    }
+    if (Parsed.empty()) {
+        Error = "config file defined no [[class]] entries";
+        return false;
+    }
+
+    Queries.insert(Queries.end(), Parsed.begin(), Parsed.end());
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -668,6 +781,8 @@ int main(int argc, char **argv) {
                          "-- <compiler args...>\n"
                          "   or: vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, "
                          "{<header.h> <ClassName> <method...>}}' "
+                         "[--write-into <file.toml>] -- <compiler args...>\n"
+                         "   or: vtable-index-analyzer --read-from <config.toml> "
                          "[--write-into <file.toml>] -- <compiler args...>\n";
         return 2;
     }
@@ -681,6 +796,7 @@ int main(int argc, char **argv) {
     }
 
     std::string WriteIntoPath;
+    std::string ReadFromPath;
     std::vector<std::string> QueryArguments;
     for (int ArgIndex = 1; ArgIndex < Separator; ++ArgIndex) {
         const std::string Arg = argv[ArgIndex];
@@ -692,6 +808,14 @@ int main(int argc, char **argv) {
             WriteIntoPath = argv[++ArgIndex];
             continue;
         }
+        if (Arg == "--read-from") {
+            if (ArgIndex + 1 >= Separator) {
+                llvm::errs() << "error: --read-from requires a file path before '--'\n";
+                return 2;
+            }
+            ReadFromPath = argv[++ArgIndex];
+            continue;
+        }
         QueryArguments.push_back(Arg);
     }
 
@@ -701,35 +825,53 @@ int main(int argc, char **argv) {
             ExtraArgs.push_back(argv[ArgIndex]);
     }
 
-    if (QueryArguments.empty()) {
-        llvm::errs() << "error: no query was specified\n";
-        return 2;
-    }
-
     std::vector<Query> Queries;
-    std::string ParseError;
-    if (!QueryArguments.front().empty() && QueryArguments.front().front() == '{') {
-        if (!parseSetQueries(QueryArguments, Queries, ParseError)) {
-            llvm::errs() << "error: invalid query set: " << ParseError << "\n";
+
+    if (!ReadFromPath.empty()) {
+        // --read-from replaces the <header.h> <ClassName> <method...>
+        // triple (and the brace-set form) entirely - it's not meant to be
+        // combined with either, so catch that rather than silently
+        // ignoring whichever one the caller didn't mean to pass.
+        if (!QueryArguments.empty()) {
+            llvm::errs() << "error: --read-from replaces <header.h> <ClassName> "
+                            "<method...> (or a brace-set query) - don't pass both\n";
+            return 2;
+        }
+        std::string ConfigError;
+        if (!parseConfigFile(ReadFromPath, Queries, ConfigError)) {
+            llvm::errs() << "error: " << ReadFromPath << ": " << ConfigError << "\n";
             return 2;
         }
     } else {
-        // Backwards-compatible form: <header> <class> <method...>.
-        if (QueryArguments.size() < 3) {
-            llvm::errs() << "error: expected <header.h> <ClassName> <method1|*> [method2 ...]\n";
+        if (QueryArguments.empty()) {
+            llvm::errs() << "error: no query was specified\n";
             return 2;
         }
-        Query Q;
-        Q.headerPath = QueryArguments[0];
-        Q.className = QueryArguments[1];
-        Q.methodNames.assign(QueryArguments.begin() + 2, QueryArguments.end());
-        const bool HasWildcard = std::find(
-            Q.methodNames.begin(), Q.methodNames.end(), "*") != Q.methodNames.end();
-        if (HasWildcard && (Q.methodNames.size() != 1 || Q.methodNames.front() != "*")) {
-            llvm::errs() << "error: '*' must be the only method selector\n";
-            return 2;
+
+        std::string ParseError;
+        if (!QueryArguments.front().empty() && QueryArguments.front().front() == '{') {
+            if (!parseSetQueries(QueryArguments, Queries, ParseError)) {
+                llvm::errs() << "error: invalid query set: " << ParseError << "\n";
+                return 2;
+            }
+        } else {
+            // Backwards-compatible form: <header> <class> <method...>.
+            if (QueryArguments.size() < 3) {
+                llvm::errs() << "error: expected <header.h> <ClassName> <method1|*> [method2 ...]\n";
+                return 2;
+            }
+            Query Q;
+            Q.headerPath = QueryArguments[0];
+            Q.className = QueryArguments[1];
+            Q.methodNames.assign(QueryArguments.begin() + 2, QueryArguments.end());
+            const bool HasWildcard = std::find(
+                Q.methodNames.begin(), Q.methodNames.end(), "*") != Q.methodNames.end();
+            if (HasWildcard && (Q.methodNames.size() != 1 || Q.methodNames.front() != "*")) {
+                llvm::errs() << "error: '*' must be the only method selector\n";
+                return 2;
+            }
+            Queries.push_back(Q);
         }
-        Queries.push_back(Q);
     }
 
     for (Query &Q : Queries)
@@ -758,18 +900,6 @@ int main(int argc, char **argv) {
 
         IndexVisitor Visitor(AST->getASTContext(), Q,
                              WriteIntoPath.empty() ? nullptr : &TomlBuffer);
-        if (Q.className == "const!") {
-            if (!Visitor.processMacros(AST->getPreprocessor(), AST->getSourceManager()))
-                return 1;
-            if (Visitor.fatal_error)
-                return 1;
-            if (!WriteIntoPath.empty() && !TomlBuffer.str().empty()) {
-                const int WriteResult = updateTomlFile(WriteIntoPath, TomlBuffer.str());
-                if (WriteResult != 0)
-                    return WriteResult;
-            }
-            continue;
-        }
         Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
 
         if (!Visitor.found) {
