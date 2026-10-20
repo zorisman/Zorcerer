@@ -1,0 +1,232 @@
+[root]
+path = "extern/source/source-sdk-2013/src"
+
+[[class]]
+header = "game/server/baseentity.h"
+name = "CBaseEntity"
+methods = ["*"]
+
+[[class]]
+header = "game/server/player.h"
+name = "CBasePlayer"
+methods = ["*"]
+
+[[class]]
+header = "game/server/basecombatcharacter.h"
+name = "CBaseCombatCharacter"
+methods = ["*"]
+
+[[class]]
+header = "game/server/basecombatweapon.h"
+name = "CBaseCombatWeapon"
+methods = ["*"]
+
+[[class]]
+header = "game/shared/gamerules.h"
+name = "CGameRules"
+methods = ["*"]
+
+[[class]]
+header = "game/server/entitylist.h"
+name = "CGlobalEntityList"
+methods = ["*"]
+
+[[class]]
+header = "game/server/baseanimating.h"
+name = "CBaseAnimating"
+methods = ["*"]
+
+[[class]]
+header = "game/server/baseflex.h"
+name = "CBaseFlex"
+methods = ["*"]
+
+[[class]]
+header = "game/server/triggers.h"
+name = "CBaseTrigger"
+methods = ["*"]
+
+[[class]]
+header = "game/server/basetoggle.h"
+name = "CBaseToggle"
+methods = ["*"]
+
+[[class]]
+header = "game/server/pointentity.h"
+name = "CPointEntity"
+methods = ["*"]
+
+[[class]]
+header = "game/server/world.h"
+name = "CWorld"
+methods = ["*"]
+
+[[class]]
+header = "game/server/baseviewmodel.h"
+name = "CBaseViewModel"
+methods = ["*"]
+
+[[class]]
+header = "game/server/basegrenade.h"
+name = "CBaseGrenade"
+methods = ["*"]
+
+[[class]]
+header = "game/server/baseprop.h"
+name = "CBaseProp"
+methods = ["*"]
+
+[[class]]
+header = "game/server/doors.h"
+name = "CBaseDoor"
+methods = ["*"]
+
+[[class]]
+header = "game/server/baseplayerweapon.h"
+name = "CBasePlayerWeapon"
+methods = ["*"]
+
+[[class]]
+header = "public/eiface.h"
+name = "IVEngineServer"
+methods = ["*"]
+
+[[class]]
+header = "public/eiface.h"
+name = "IServerGameDLL"
+methods = ["*"]
+
+[[class]]
+header = "public/eiface.h"
+name = "IServerGameClients"
+methods = ["*"]
+
+[[class]]
+header = "public/iservergameents.h"
+name = "IServerGameEnts"
+methods = ["*"]
+
+[[class]]
+header = "public/iserverentity.h"
+name = "IServerEntity"
+methods = ["*"]
+
+[[class]]
+header = "public/edict.h"
+name = "edict_t"
+methods = ["*"]
+
+[[class]]
+header = "public/engine/IEngineTrace.h"
+name = "IEngineTrace"
+methods = ["*"]
+
+[[class]]
+header = "public/engine/IEngineSound.h"
+name = "IEngineSound"
+methods = ["*"]
+
+[[class]]
+header = "public/iplayerinfo.h"
+name = "IPlayerInfo"
+methods = ["*"]
+
+[[class]]
+header = "game/server/iservertools.h"
+name = "IServerTools"
+methods = ["*"]
+
+[[class]]
+header = "public/ienginevgui.h"
+name = "IEngineVGui"
+methods = ["*"]
+
+[[class]]
+header = "public/igameevents.h"
+name = "IGameEvent"
+methods = ["*"]
+
+[[class]]
+header = "public/igameevents.h"
+name = "IGameEventManager2"
+methods = ["*"]
+
+[[class]]
+header = "public/iserverplugin.h"
+name = "IServerPluginCallbacks"
+methods = ["*"]
+
+[[class]]
+header = "public/filesystem.h"
+name = "IFileSystem"
+methods = ["*"]
+
+[[class]]
+header = "public/icvar.h"
+name = "ICvar"
+methods = ["*"]
+
+[[class]]
+header = "public/tier1/convar.h"
+name = "ConVar"
+methods = ["*"]
+
+[[class]]
+header = "public/tier1/ConCommand.h"
+name = "ConCommand"
+methods = ["*"]
+
+[[class]]
+header = "public/mathlib/vector.h"
+name = "Vector"
+methods = ["*"]
+
+[[class]]
+header = "public/mathlib/vector.h"
+name = "QAngle"
+methods = ["*"]
+
+[[class]]
+header = "public/basehandle.h"
+name = "CBaseHandle"
+methods = ["*"]
+
+[[class]]
+header = "public/ihandleentity.h"
+name = "CHandle<T>"
+methods = ["*"]
+
+[[class]]
+header = "public/ihandleentity.h"
+name = "IHandleEntity"
+methods = ["*"]
+
+[[class]]
+header = "public/globalvars_base.h"
+name = "CGlobalVars"
+methods = ["*"]
+
+[[class]]
+header = "game/client/c_baseentity.h"
+name = "C_BaseEntity"
+methods = ["*"]
+
+[[class]]
+header = "game/client/c_baseplayer.h"
+name = "C_BasePlayer"
+methods = ["*"]
+
+[[class]]
+header = "game/shared/usercmd.h"
+name = "CUserCmd"
+methods = ["*"]
+
+[[class]]
+header = "game/shared/recipientfilter.h"
+name = "CRecipientFilter"
+methods = ["*"]
+
+[[class]]
+header = "game/shared/gamerules.h"
+name = "CGameRulesProxy"
+methods = ["*"]

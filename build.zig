@@ -1,6 +1,7 @@
 const std = @import("std");
 const index_analyzer = @import("src/zig_build_utils/build_index_analyzer.zig");
 const codegen = @import("src/zig_build_utils/EngineIndexesGenerator.zig");
+const DataAdapter = @import("src/analyzers/AnalyzerDataAdapter.zig");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{
@@ -11,15 +12,7 @@ pub fn build(b: *std.Build) !void {
         },
     });
     const optimize = b.standardOptimizeOption(.{});
-
-    index_analyzer.addIndexAnalyzer(b);
-
-    const toml_cfg = @embedFile("./engine.toml");
-    const engine_indexes_generated = try codegen.generate(b.allocator, toml_cfg);
-    try std.Io.Dir.writeFile(std.Io.Dir.cwd(), b.graph.io, .{
-        .sub_path = b.path("src/codegen_generated/engine_indexes.zig").getPath(b),
-        .data = engine_indexes_generated,
-    });
+    const io = b.graph.io;
 
     const hooks = b.addModule("hooks", .{
         .root_source_file = b.path("extern/zig-hooks/src/root.zig"),
@@ -50,5 +43,18 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.out_filename = "zorcerer.so";
+
+    index_analyzer.addIndexAnalyzer(b);
+
+    const toml_path = b.path("config/raw_data.toml").getPath(b);
+    const analyzer_path = b.path("zig-out/bin/vtable-index-analyzer").getPath(b);
+    const toml_output_path = b.path("config/engine_data.toml").getPath(b);
+
+    var args = try DataAdapter.prepareAnalyzerArgs(io, toml_path);
+    defer args.deinit();
+    var data = try DataAdapter.beginAnalyze(io, analyzer_path, &args);
+    defer data.deinit();
+    try DataAdapter.intoToml(io, toml_output_path, &data);
+
     b.installArtifact(zorcerer);
 }
