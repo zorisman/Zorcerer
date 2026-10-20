@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) !void {
         .data = engine_indexes_generated,
     });
 
-    const hooks = b.createModule(.{
+    const hooks = b.addModule("hooks", .{
         .root_source_file = b.path("extern/zig-hooks/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -29,14 +29,7 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
 
-    const zroot = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .pic = true,
-    });
-
-    const toml = b.createModule(.{
+    const toml = b.addModule("toml", .{
         .root_source_file = b.path("extern/zig-toml/src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -58,20 +51,4 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.out_filename = "zorcerer.so";
     b.installArtifact(zorcerer);
-
-    const zig_commands = b.addLibrary(.{
-        .name = "zorcerer-commands-plugin",
-        .linkage = .dynamic,
-        .root_module = b.addModule("zorcerer-commands", .{
-            .root_source_file = b.path("example-plugins/zorcerer-command-plugin/ZorcererCommandPlugin.zig"),
-            .target = target,
-            .optimize = optimize,
-            .pic = true,
-        }),
-    });
-
-    zig_commands.root_module.addImport("hooks", hooks);
-    zig_commands.root_module.addImport("zroot", zroot);
-    zig_commands.out_filename = "zorcerer-commands.so";
-    b.installArtifact(zig_commands);
 }
