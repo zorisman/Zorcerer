@@ -1,15 +1,37 @@
 #!/bin/sh
+# Zorcerer pre-push hook: test every pushed commit in a clean worktree.
+#
+# Reads the refs git feeds the hook on stdin ("<local ref> <local oid>
+# <remote ref> <remote oid>" per line) and runs `zig build tests` against
+# each unique pushed commit, so broken code can never reach the remote —
+# even when pushing branches other than the current one.
+#
+# Design notes:
+#   * Uncommitted changes are never tested: commits are checked out into a
+#     temporary worktree, mirroring exactly what will land on the remote.
+#   * Branch deletions (all-zero oids — works for both SHA-1 and SHA-256
+#     repositories) are skipped; several refs pointing at the same commit
+#     are tested once.
+#   * The main checkout's `extern/` directory is shared into the test
+#     worktree via a symlink, so local dependency storage is reused. If a
+#     pushed commit itself tracks `extern/`, the symlink is re-created
+#     after each checkout to keep the semantics uniform.
+#   * The test build runs in the background with `wait`, so signal traps
+#     (HUP/INT/TERM) fire immediately and cleanup is never deferred until
+#     the build finishes.
+#   * The hook itself uses no positional parameters, so `set --` is safe.
+#   * Requires: git >= 2.5 (worktree), zig on PATH.
+
 set -eu
 
-stage=0
-
-repo_root=$(git rev-parse --show-toplevel)
-commit=$(git -C "$repo_root" rev-parse HEAD)
-tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/zorcerer-pre-push.XXXXXX")
-worktree="$tmp_root/worktree"
+stage=1
+total=0
+zig_pid=
+tmp_root=
+worktree=
 
 stageMsg() {
-    printf '[Zorcerer] Stage %s: %s\n' "$stage" "$*"
+    printf '[Zorcerer] Stage %s/%s: %s\n' "$stage" "$total" "$*"
 }
 
 ensureSuccess() {
@@ -17,8 +39,8 @@ ensureSuccess() {
         stage=$((stage + 1))
     else
         status=$?
-        printf '[Zorcerer] Stage %s failed (exit code %s).\n' \
-            "$stage" "$status" >&2
+        printf '[Zorcerer] Stage %s/%s failed (exit code %s).\n' \
+            "$stage" "$total" "$status" >&2
         return "$status"
     fi
 }
@@ -29,31 +51,129 @@ clearGitEnv() {
     done
 }
 
+# Keep the developer's zig cache overrides from leaking into the clean test
+# run (they could silently reuse the main checkout's build cache).
+clearZigEnv() {
+    unset ZIG_GLOBAL_CACHE_DIR ZIG_LOCAL_CACHE_DIR ZIG_LIB_DIR \
+        ZIG_HOMEDIR_CACHE
+}
+
 cleanup() {
-    git -C "$repo_root" worktree remove --force "$worktree" \
-        >/dev/null 2>&1 || true
-    rm -rf "$tmp_root"
+    if [ -n "$zig_pid" ]; then
+        kill "$zig_pid" 2>/dev/null || true
+        wait "$zig_pid" 2>/dev/null || true
+    fi
+    if [ -n "$worktree" ]; then
+        if [ -L "$worktree/extern" ]; then
+            rm -f "$worktree/extern"
+        fi
+        git -C "$repo_root" worktree remove --force "$worktree" \
+            >/dev/null 2>&1 || true
+    fi
+    if [ -n "$tmp_root" ]; then
+        rm -rf "$tmp_root"
+    fi
+
+    git -C "$repo_root" worktree prune >/dev/null 2>&1 || true
 }
 
 prepare() {
-    clearGitEnv
+    if [ ! -d "$repo_root/extern" ]; then
+        printf '[Zorcerer] %s/extern not found.\n' "$repo_root" >&2
+        return 1
+    fi
+
     git -C "$repo_root" worktree add \
-        --quiet --detach "$worktree" "$commit"
+        --quiet --detach "$worktree" "$first_oid" || return $?
+
+    rm -rf "$worktree/extern" || return $?
+
+    ln -s "$repo_root/extern" "$worktree/extern"
 }
 
-runZigTests() {
+testCommit() {
+    # $1 = pushed commit oid. --force discards build residue (.zig-cache,
+    # zig-out, ...) that could otherwise block the next checkout.
+    git -C "$worktree" checkout --detach --force --quiet "$1" || return $?
+
+    # Re-create the shared extern link if this commit tracks extern/.
+    if [ ! -L "$worktree/extern" ]; then
+        rm -rf "$worktree/extern"
+        ln -s "$repo_root/extern" "$worktree/extern"
+    fi
+
+    # Run in background + wait so trapped signals are handled immediately;
+    # `exec` makes the subshell become zig itself, so $! is zig's pid.
     (
         cd "$worktree" &&
-        zig build tests </dev/null
-    )
+        exec zig build tests </dev/null
+    ) &
+    zig_pid=$!
+    wait "$zig_pid"
+    rc=$?
+    zig_pid=
+    return "$rc"
 }
 
-trap cleanup 0
+repo_root=$(git rev-parse --show-toplevel)
+
+if ! command -v zig >/dev/null 2>&1; then
+    printf '[Zorcerer] zig not found in PATH; cannot run tests.\n' >&2
+    exit 1
+fi
+
+if [ -t 0 ]; then
+    printf '[Zorcerer] This hook expects pre-push stdin; invoke it via git push.\n' >&2
+    exit 1
+fi
+
+clearGitEnv
+clearZigEnv
+
+# Collect unique local oids of every pushed ref. Skips deletions (all-zero
+# oid) regardless of hash algorithm; dedups refs sharing one commit.
+pushed_oids=
+pushed_list=
+while read -r _local_ref oid _remote_ref _remote_oid; do
+    case "$oid" in
+        *[!0]*) ;;        # a real oid
+        *) continue ;;    # all zeros -> ref deletion, nothing to test
+    esac
+    case "$pushed_oids" in
+        *" $oid "*) continue ;;
+    esac
+    pushed_oids="$pushed_oids $oid "
+    pushed_list="$pushed_list$oid $_local_ref
+"
+done
+
+set -- $pushed_oids
+oid_count=$#
+if [ "$oid_count" -eq 0 ]; then
+    printf '[Zorcerer] Nothing to test (deletion-only or empty push).\n'
+    exit 0
+fi
+first_oid=$1
+
+total=$((oid_count + 1))
+
+tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/zorcerer-pre-push.XXXXXX")
+worktree="$tmp_root/worktree"
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 stageMsg "Preparation"
 ensureSuccess prepare
 
-stageMsg "Zig tests for commit $commit"
-ensureSuccess runZigTests
+while read -r oid ref; do
+    [ -n "$oid" ] || continue
+    stageMsg "Testing $(git -C "$repo_root" rev-parse --short "$oid") ($ref)"
+    ensureSuccess testCommit "$oid"
+done <<EOF
+$pushed_list
+EOF
 
-printf '[Zorcerer] All %s stages passed.\n' "$stage"
+printf '[Zorcerer] All %s stages passed.\n' "$total"
