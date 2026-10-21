@@ -12,10 +12,17 @@
 #   * Branch deletions (all-zero oids — works for both SHA-1 and SHA-256
 #     repositories) are skipped; several refs pointing at the same commit
 #     are tested once.
-#   * The main checkout's `extern/` directory is shared into the test
-#     worktree via a symlink, so local dependency storage is reused. If a
-#     pushed commit itself tracks `extern/`, the symlink is re-created
-#     after each checkout to keep the semantics uniform.
+#   * Local dependency storage is reused: every submodule recorded under
+#     `extern/` in the pushed commit is relinked (leaf-level symlink) into
+#     the test worktree after each checkout. The path components above the
+#     submodule leaves stay real directories, because git refuses any
+#     symlinked component that leads to a submodule ("expected '...' in
+#     submodule path '...' not to be a symbolic link"). A leaf whose target
+#     is missing from the main checkout is linked anyway; the test build
+#     then fails on the absent dependency sources instead of fetching them.
+#   * Submodules are never cloned, initialized, updated, or fetched inside
+#     the temporary worktree: a commit's submodule oids are compared against
+#     whatever the developer has checked out, never pulled.
 #   * The test build runs in the background with `wait`, so signal traps
 #     (HUP/INT/TERM) fire immediately and cleanup is never deferred until
 #     the build finishes.
@@ -64,9 +71,10 @@ cleanup() {
         wait "$zig_pid" 2>/dev/null || true
     fi
     if [ -n "$worktree" ]; then
-        if [ -L "$worktree/extern" ]; then
-            rm -f "$worktree/extern"
-        fi
+        # Removes the worktree's shared links (leaf symlinks) before removal.
+        # `rm -rf` unlinks symlinks without following them into the main
+        # checkout's dependency directories.
+        rm -rf "$worktree/extern"
         git -C "$repo_root" worktree remove --force "$worktree" \
             >/dev/null 2>&1 || true
     fi
@@ -85,10 +93,22 @@ prepare() {
 
     git -C "$repo_root" worktree add \
         --quiet --detach "$worktree" "$first_oid" || return $?
+}
 
-    rm -rf "$worktree/extern" || return $?
-
-    ln -s "$repo_root/extern" "$worktree/extern"
+# Subdir of the gitlink path; dirname(1) is portable enough for paths like
+# extern/zig-toml, and the worktree checkout materializes all directories
+# above the submodule leaves anyway.
+linkSharedExtern() {
+    local name
+    git -C "$worktree" ls-tree -r -z HEAD |
+        tr '\0' '\n' |
+        awk -F '\t' '$1 ~ /^160000 commit / && $2 ~ /^extern\// {print $2}' |
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            mkdir -p "$worktree/$(dirname "$name")"
+            rm -rf "$worktree/$name"
+            ln -s "$repo_root/$name" "$worktree/$name"
+        done
 }
 
 testCommit() {
@@ -96,17 +116,24 @@ testCommit() {
     # zig-out, ...) that could otherwise block the next checkout.
     git -C "$worktree" checkout --detach --force --quiet "$1" || return $?
 
-    # Re-create the shared extern link if this commit tracks extern/.
-    if [ ! -L "$worktree/extern" ]; then
-        rm -rf "$worktree/extern"
-        ln -s "$repo_root/extern" "$worktree/extern"
-    fi
+    # Re-link the shared dependency sources: checkout materializes each
+    # recorded submodule path as an empty real directory (replacing the
+    # leaf symlink from the previous test), so the leaves are re-created
+    # against the new commit's submodule list. Path components above the
+    # leaves stay real directories, as git requires for submodule paths.
+    linkSharedExtern || return $?
 
     # Run in background + wait so trapped signals are handled immediately;
     # `exec` makes the subshell become zig itself, so $! is zig's pid.
+    #
+    # -Dskip-analyze=true: build.zig runs the analyzer data regeneration at
+    # plan time by spawning zig-out/bin/vtable-index-analyzer, an artifact
+    # that this clean worktree has never had (there is no build step that
+    # produces it before the top-level build script body runs). Skipping the
+    # analyzer data step keeps pushes working; the module tests still run.
     (
         cd "$worktree" &&
-        exec zig build tests </dev/null
+        exec zig build tests -Dskip-analyze=true </dev/null
     ) &
     zig_pid=$!
     wait "$zig_pid"
