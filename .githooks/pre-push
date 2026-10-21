@@ -1,6 +1,12 @@
 #!/bin/sh
+set -eu
 
 stage=0
+
+repo_root=$(git rev-parse --show-toplevel)
+commit=$(git -C "$repo_root" rev-parse HEAD)
+tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/zorcerer-pre-push.XXXXXX")
+worktree="$tmp_root/worktree"
 
 stageMsg() {
     printf '[Zorcerer] Stage %s: %s\n' "$stage" "$*"
@@ -17,19 +23,37 @@ ensureSuccess() {
     fi
 }
 
+clearGitEnv() {
+    for name in $(git -C "$repo_root" rev-parse --local-env-vars); do
+        unset "$name"
+    done
+}
+
+cleanup() {
+    git -C "$repo_root" worktree remove --force "$worktree" \
+        >/dev/null 2>&1 || true
+    rm -rf "$tmp_root"
+}
+
 prepare() {
-    set -eu
-    cd "$(git rev-parse --show-toplevel)"
+    clearGitEnv
+    git -C "$repo_root" worktree add \
+        --quiet --recurse-submodules --detach "$worktree" "$commit"
 }
 
 runZigTests() {
-    zig build tests || return $?
+    (
+        cd "$worktree" &&
+        zig build tests </dev/null
+    )
 }
+
+trap cleanup 0
 
 stageMsg "Preparation"
 ensureSuccess prepare
 
-stageMsg "Zig tests"
+stageMsg "Zig tests for commit $commit"
 ensureSuccess runZigTests
 
 printf '[Zorcerer] All %s stages passed.\n' "$stage"
