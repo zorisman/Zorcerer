@@ -52,7 +52,9 @@ name = "CBaseToggle"
 methods = ["*"]
 
 [[class]]
-header = "game/server/pointentity.h"
+# pointentity.h does not exist in this checkout; CPointEntity is
+# defined in game/server/baseentity.h:2884 instead.
+header = "game/server/baseentity.h"
 name = "CPointEntity"
 methods = ["*"]
 
@@ -67,12 +69,16 @@ name = "CBaseViewModel"
 methods = ["*"]
 
 [[class]]
-header = "game/server/basegrenade.h"
+# basegrenade.h does not exist in this checkout; CBaseGrenade is
+# defined in game/shared/basegrenade_shared.h instead.
+header = "game/shared/basegrenade_shared.h"
 name = "CBaseGrenade"
 methods = ["*"]
 
 [[class]]
-header = "game/server/baseprop.h"
+# baseprop.h does not exist in this checkout; CBaseProp is defined
+# in game/server/props.h instead.
+header = "game/server/props.h"
 name = "CBaseProp"
 methods = ["*"]
 
@@ -81,10 +87,8 @@ header = "game/server/doors.h"
 name = "CBaseDoor"
 methods = ["*"]
 
-[[class]]
-header = "game/server/baseplayerweapon.h"
-name = "CBasePlayerWeapon"
-methods = ["*"]
+# NOTE: no CBasePlayerWeapon query - this TF2-branch checkout defines
+# no class CBasePlayerWeapon anywhere (weapons derive from CTFWeaponBase).
 
 [[class]]
 header = "public/eiface.h"
@@ -102,7 +106,9 @@ name = "IServerGameClients"
 methods = ["*"]
 
 [[class]]
-header = "public/iservergameents.h"
+# iservergameents.h does not exist in this checkout; IServerGameEnts is
+# defined in public/eiface.h instead.
+header = "public/eiface.h"
 name = "IServerGameEnts"
 methods = ["*"]
 
@@ -111,10 +117,12 @@ header = "public/iserverentity.h"
 name = "IServerEntity"
 methods = ["*"]
 
-[[class]]
-header = "public/edict.h"
-name = "edict_t"
-methods = ["*"]
+# NOTE: no edict_t query - this checkout's edict_t (public/edict.h:429)
+# declares no virtual methods at all, so it has no vtable and the analyzer
+# rejects a wildcard query ("invalid vtable address point").
+
+# NOTE: no CGlobalVars query - public/globalvars_base.h declares no virtual
+# methods, so CGlobalVars has no vtable for the analyzer to index.
 
 [[class]]
 header = "public/engine/IEngineTrace.h"
@@ -127,12 +135,15 @@ name = "IEngineSound"
 methods = ["*"]
 
 [[class]]
-header = "public/iplayerinfo.h"
+# iplayerinfo.h lives under public/game/server/ in this checkout.
+header = "public/game/server/iplayerinfo.h"
 name = "IPlayerInfo"
 methods = ["*"]
 
 [[class]]
-header = "game/server/iservertools.h"
+# iservertools.h does not exist in this checkout; IServerTools is
+# defined in public/toolframework/itoolentity.h instead.
+header = "public/toolframework/itoolentity.h"
 name = "IServerTools"
 methods = ["*"]
 
@@ -152,7 +163,8 @@ name = "IGameEventManager2"
 methods = ["*"]
 
 [[class]]
-header = "public/iserverplugin.h"
+# iserverplugin.h lives under public/engine/ in this checkout.
+header = "public/engine/iserverplugin.h"
 name = "IServerPluginCallbacks"
 methods = ["*"]
 
@@ -172,38 +184,27 @@ name = "ConVar"
 methods = ["*"]
 
 [[class]]
-header = "public/tier1/ConCommand.h"
+# ConCommand.h does not exist in this checkout; ConCommand is defined
+# in public/tier1/convar.h:261 instead (already includes convar.h queries).
+header = "public/tier1/convar.h"
 name = "ConCommand"
 methods = ["*"]
 
-[[class]]
-header = "public/mathlib/vector.h"
-name = "Vector"
-methods = ["*"]
+# NOTE: no Vector/QAngle queries - public/mathlib/vector.h here contains
+# no virtual methods, so these classes have no vtable and the analyzer
+# rejects a wildcard query ("invalid vtable address point").
 
-[[class]]
-header = "public/mathlib/vector.h"
-name = "QAngle"
-methods = ["*"]
+# NOTE: no CBaseHandle query - public/basehandle.h here declares no virtual
+# methods, so CBaseHandle has no vtable (only CHandle<T>/IHandleEntity do).
 
-[[class]]
-header = "public/basehandle.h"
-name = "CBaseHandle"
-methods = ["*"]
-
-[[class]]
-header = "public/ihandleentity.h"
-name = "CHandle<T>"
-methods = ["*"]
+# NOTE: no CHandle<T> query - this checkout's CHandle (public/ihandleentity.h)
+# declares no virtual methods (only IHandleEntity does), and template names
+# never match the analyzer's class-name lookup anyway. CHandle churn reuses
+# IHandleEntity's three slots, which the next query covers.
 
 [[class]]
 header = "public/ihandleentity.h"
 name = "IHandleEntity"
-methods = ["*"]
-
-[[class]]
-header = "public/globalvars_base.h"
-name = "CGlobalVars"
 methods = ["*"]
 
 [[class]]
@@ -222,7 +223,9 @@ name = "CUserCmd"
 methods = ["*"]
 
 [[class]]
-header = "game/shared/recipientfilter.h"
+# recipientfilter.h only exists under game/server/ in this SDK checkout;
+# the analyzer run fails probing the old game/shared/ path.
+header = "game/server/recipientfilter.h"
 name = "CRecipientFilter"
 methods = ["*"]
 
