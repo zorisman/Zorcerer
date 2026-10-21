@@ -4,9 +4,7 @@
 //!
 //!     @import("build_index_analyzer.zig").addIndexAnalyzer(b);
 //!
-//! Enable it with:
-//!
-//!     zig build -Dindex-analyze
+//! The root build.zig controls whether this step is added via `-Dindex-analyzer`.
 //!
 //! The analyzer is compiled by the system C++ compiler, not Zig's C++
 //! frontend. This avoids mixing Zig's default libc++ with system Clang/LLVM
@@ -14,7 +12,7 @@
 //!
 //! Overrides, if the tools are versioned on your system:
 //!
-//!     zig build -Dindex-analyze -Dindex-cxx=clang++-21 -Dllvm-config=llvm-config-21
+//!     zig build -Dindex-analyzer -Dindex-cxx=clang++-21 -Dllvm-config=llvm-config-21
 //!
 //! A nonzero command status fails the Zig build step. The final compiler is
 //! invoked with `exec`, so its status becomes the shell status directly.
@@ -27,13 +25,6 @@
 const std = @import("std");
 
 pub fn addIndexAnalyzer(b: *std.Build) void {
-    const enabled = b.option(
-        bool,
-        "index-analyze",
-        "Build the Clang-AST-based vtable index analyzer (requires system Clang/LLVM development packages)",
-    ) orelse false;
-    if (!enabled) return;
-
     const llvm_config = b.option(
         []const u8,
         "llvm-config",

@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const index_analyzer = @import("src/zig_build_utils/build_index_analyzer.zig");
 const codegen = @import("src/zig_build_utils/EngineIndexesGenerator.zig");
 const DataAdapter = @import("src/analyzers/AnalyzerDataAdapter.zig");
@@ -44,17 +45,25 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.out_filename = "zorcerer.so";
 
-    index_analyzer.addIndexAnalyzer(b);
+    const enable_index_analyzer = b.option(
+        bool,
+        "index-analyzer",
+        "Build and run the Clang-based index analyzer (requires system Clang/LLVM development packages)",
+    ) orelse false;
 
-    const toml_path = b.path("config/raw_data.toml").getPath(b);
-    const analyzer_path = b.path("zig-out/bin/vtable-index-analyzer").getPath(b);
-    const toml_output_path = b.path("config/engine_data.toml").getPath(b);
+    if (enable_index_analyzer) {
+        index_analyzer.addIndexAnalyzer(b);
 
-    var args = try DataAdapter.prepareAnalyzerArgs(io, toml_path);
-    defer args.deinit();
-    var data = try DataAdapter.beginAnalyze(io, analyzer_path, &args);
-    defer data.deinit();
-    try DataAdapter.intoToml(io, toml_output_path, &data);
+        const toml_path = b.path("config/raw_data.toml").getPath(b);
+        const analyzer_path = b.path("zig-out/bin/vtable-index-analyzer").getPath(b);
+        const toml_output_path = b.path("config/engine_data.toml").getPath(b);
+
+        var args = try DataAdapter.prepareAnalyzerArgs(io, toml_path);
+        defer args.deinit();
+        var data = try DataAdapter.beginAnalyze(io, analyzer_path, &args);
+        defer data.deinit();
+        try DataAdapter.intoToml(io, toml_output_path, &data);
+    }
 
     b.installArtifact(zorcerer);
 }
