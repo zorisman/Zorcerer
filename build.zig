@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const index_analyzer = @import("src/zig_build_utils/build_index_analyzer.zig");
-const codegen = @import("src/zig_build_utils/EngineIndexesGenerator.zig");
-const DataAdapter = @import("src/analyzers/AnalyzerDataAdapter.zig");
+const index_analyzer = @import("build/build_index_analyzer.zig");
+const codegen = @import("build/EngineIndexesGenerator.zig");
+const DataAdapter = @import("build/analyzers/AnalyzerDataAdapter.zig");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{
