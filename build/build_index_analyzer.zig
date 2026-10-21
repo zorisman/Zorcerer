@@ -87,7 +87,7 @@ pub fn addIndexAnalyzer(b: *std.Build) void {
         "build-vtable-index-analyzer",
     });
 
-    command.addFileArg(b.path("src/analyzers/VTableIndexAnalyzer.cpp"));
+    command.addFileArg(b.path("build/analyzers/VTableIndexAnalyzer.cpp"));
     command.addArg(llvm_config);
     command.addArg(cxx);
     const analyzer = command.addOutputFileArg("vtable-index-analyzer");
