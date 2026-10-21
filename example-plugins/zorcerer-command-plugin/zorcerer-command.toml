@@ -1,5 +1,0 @@
-id = "zorcerer-command"
-name = "Zorcerer Command"
-version = "0.1.0"
-author = "Zorcerer example"
-file = "zorcerer_command.so"
