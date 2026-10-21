@@ -38,7 +38,7 @@ cleanup() {
 prepare() {
     clearGitEnv
     git -C "$repo_root" worktree add \
-        --quiet --recurse-submodules --detach "$worktree" "$commit"
+        --quiet --detach "$worktree" "$commit"
 }
 
 runZigTests() {
