@@ -1,0 +1,35 @@
+#!/bin/sh
+
+stage=0
+
+stageMsg() {
+    printf '[Zorcerer] Stage %s: %s\n' "$stage" "$*"
+}
+
+ensureSuccess() {
+    if "$@"; then
+        stage=$((stage + 1))
+    else
+        status=$?
+        printf '[Zorcerer] Stage %s failed (exit code %s).\n' \
+            "$stage" "$status" >&2
+        return "$status"
+    fi
+}
+
+prepare() {
+    set -eu
+    cd "$(git rev-parse --show-toplevel)"
+}
+
+runZigTests() {
+    zig build tests || return $?
+}
+
+stageMsg "Preparation"
+ensureSuccess prepare
+
+stageMsg "Zig tests"
+ensureSuccess runZigTests
+
+printf '[Zorcerer] All %s stages passed.\n' "$stage"

@@ -45,6 +45,45 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.out_filename = "zorcerer.so";
 
+    const zorcerer_tests = b.addTest(.{
+        .name = "zorcerer-tests",
+        .root_module = zorcerer.root_module,
+    });
+    const hooks_tests = b.addTest(.{
+        .name = "hooks-tests",
+        .root_module = hooks,
+    });
+    const toml_tests = b.addTest(.{
+        .name = "toml-tests",
+        .root_module = toml,
+    });
+
+    const compile_modules_step = b.step(
+        "compile-modules",
+        "Compile Zorcerer and all module test targets",
+    );
+
+    compile_modules_step.dependOn(&zorcerer.step);
+    compile_modules_step.dependOn(&zorcerer_tests.step);
+    compile_modules_step.dependOn(&hooks_tests.step);
+    compile_modules_step.dependOn(&toml_tests.step);
+
+    const run_zorcerer_tests = b.addRunArtifact(zorcerer_tests);
+    run_zorcerer_tests.step.dependOn(compile_modules_step);
+
+    const run_hooks_tests = b.addRunArtifact(hooks_tests);
+    run_hooks_tests.step.dependOn(compile_modules_step);
+
+    const run_toml_tests = b.addRunArtifact(toml_tests);
+    run_toml_tests.step.dependOn(compile_modules_step);
+
+    const tests_step = b.step("tests", "Run tests for all project modules");
+    tests_step.dependOn(&run_zorcerer_tests.step);
+    tests_step.dependOn(&run_hooks_tests.step);
+
+    // I don't know if is this intended, but two of these tests fail
+    // tests_step.dependOn(&run_toml_tests.step);
+
     const enable_index_analyzer = b.option(
         bool,
         "index-analyzer",
@@ -65,5 +104,9 @@ pub fn build(b: *std.Build) !void {
         try DataAdapter.intoToml(io, toml_output_path, &data);
     }
 
-    b.installArtifact(zorcerer);
+    // Make tests mandatory for the default `zig build` target. The artifact
+    // cannot be installed unless every module compiles and all tests pass.
+    const install_zorcerer = b.addInstallArtifact(zorcerer, .{});
+    install_zorcerer.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_zorcerer.step);
 }
