@@ -84,13 +84,13 @@ pub fn build(b: *std.Build) !void {
     // I don't know if is this intended, but two of these tests fail
     // tests_step.dependOn(&run_toml_tests.step);
 
-    const enable_index_analyzer = b.option(
+    const should_skip_analyze = b.option(
         bool,
-        "index-analyzer",
+        "skip-analyze",
         "Build and run the Clang-based index analyzer (requires system Clang/LLVM development packages)",
     ) orelse false;
 
-    if (enable_index_analyzer) {
+    if (!should_skip_analyze) {
         index_analyzer.addIndexAnalyzer(b);
 
         const toml_path = b.path("config/raw_data.toml").getPath(b);
