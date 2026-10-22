@@ -30,21 +30,15 @@ pub fn build(b: *std.Build) !void {
         .pic = true
     });
 
-    // ABI contract shared between the plugin manager and plugin modules
-    // (src/PluginContext.zig). Each side imports it as "plugin-context",
-    // so both compilations of the file stay identical.
+    // ABI contract between the plugin manager and plugin modules
+    // (src/PluginContext.zig). The manager imports it through src/root.zig
+    // (`abi`); plugin compilations import it as this module, so every side
+    // compiles the same declarations. Example plugins live outside src/ in
+    // example-plugins/ and cannot reach it by file path (imports may not
+    // escape a module's root directory), hence the module indirection.
     const plugin_context = b.addModule("plugin-context", .{
         .root_source_file = b.path("src/PluginContext.zig"),
     });
-
-    // Simple Source SDK console logging for the manager's own messages
-    // (src/Log.zig).
-    const log = b.addModule("log", .{
-        .root_source_file = b.path("src/Log.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    log.addImport("plugin-context", plugin_context);
 
     const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
@@ -59,8 +53,6 @@ pub fn build(b: *std.Build) !void {
 
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
-    zorcerer.root_module.addImport("plugin-context", plugin_context);
-    zorcerer.root_module.addImport("log", log);
     zorcerer.out_filename = "zorcerer.so";
 
     // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed
@@ -69,7 +61,7 @@ pub fn build(b: *std.Build) !void {
         .name = "hello-plugin",
         .linkage = .dynamic,
         .root_module = b.addModule("hello-plugin", .{
-            .root_source_file = b.path("src/plugins/hello/hello_plugin.zig"),
+            .root_source_file = b.path("example-plugins/hello/hello_plugin.zig"),
             .target = target,
             .optimize = optimize,
             .pic = true,
