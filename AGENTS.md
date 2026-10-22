@@ -126,6 +126,7 @@ For implementation tasks, report:
 - Which files were modified.
 - Which checks were actually executed and their results.
 - Any remaining risks, assumptions, or work that requires the user's decision.
+- Give a git commit suggestion.
 
 Keep the report concise and technically precise. Never claim completion beyond what the evidence supports.
 
