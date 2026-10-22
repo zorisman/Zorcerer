@@ -30,6 +30,17 @@ pub fn build(b: *std.Build) !void {
         .pic = true
     });
 
+    // Configuration of a single plugin's TOML manifest
+    // (src/PluginConfiguration.zig), later shared between the manager and
+    // the file access API in src/io/FileSystem.zig.
+    const plugin_configuration = b.addModule("plugin-configuration", .{
+        .root_source_file = b.path("src/PluginConfiguration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_configuration.addImport("toml", toml);
+
     // ABI contract between the plugin manager and plugin modules
     // (src/PluginContext.zig). The manager imports it through src/root.zig
     // (`abi`); plugin compilations import it as this module, so every side
@@ -53,6 +64,7 @@ pub fn build(b: *std.Build) !void {
 
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
+    zorcerer.root_module.addImport("plugin-configuration", plugin_configuration);
     zorcerer.out_filename = "zorcerer.so";
 
     // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed
@@ -82,6 +94,10 @@ pub fn build(b: *std.Build) !void {
         .name = "toml-tests",
         .root_module = toml,
     });
+    const plugin_configuration_tests = b.addTest(.{
+        .name = "plugin-configuration-tests",
+        .root_module = plugin_configuration,
+    });
 
     const compile_modules_step = b.step(
         "compile-modules",
@@ -92,6 +108,7 @@ pub fn build(b: *std.Build) !void {
     compile_modules_step.dependOn(&zorcerer_tests.step);
     compile_modules_step.dependOn(&hooks_tests.step);
     compile_modules_step.dependOn(&toml_tests.step);
+    compile_modules_step.dependOn(&plugin_configuration_tests.step);
     compile_modules_step.dependOn(&hello_plugin.step);
 
     const run_zorcerer_tests = b.addRunArtifact(zorcerer_tests);
@@ -103,12 +120,17 @@ pub fn build(b: *std.Build) !void {
     const run_toml_tests = b.addRunArtifact(toml_tests);
     run_toml_tests.step.dependOn(compile_modules_step);
 
+    const run_plugin_configuration_tests = b.addRunArtifact(plugin_configuration_tests);
+    run_plugin_configuration_tests.step.dependOn(compile_modules_step);
+
     const tests_step = b.step("tests", "Run tests for all project modules");
     tests_step.dependOn(&run_zorcerer_tests.step);
     tests_step.dependOn(&run_hooks_tests.step);
 
     // I don't know if is this intended, but two of these tests fail
     // tests_step.dependOn(&run_toml_tests.step);
+
+    tests_step.dependOn(&run_plugin_configuration_tests.step);
 
     const should_skip_analyze = b.option(
         bool,
