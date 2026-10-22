@@ -16,8 +16,16 @@
 //
 // Usage:
 //   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] [--write-into <file.toml>] -- <compiler args...>
-//   vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, {<header.h> const! <macro|*>}}' [--write-into <file.toml>] -- <compiler args...>
-//   Use const! instead of a class name to inspect object-like #define constants.
+//   vtable-index-analyzer '{{<header.h> <target> <selector...>}, {<header.h> <target> <selector...>}}' [--write-into <file.toml>] -- <compiler args...>
+//   <target> selects what is resolved: a class name resolves that
+//   class's virtual method vtable indices (named selectors may also
+//   resolve static const/constexpr data members of the class);
+//   "enum::<EnumName>" resolves the enumerator values of one enum type;
+//   the bare "const::" resolves object-like #define constants and
+//   namespace-scope const/constexpr variables defined in the requested
+//   header itself. A lone "*", as the only selector, asks for
+//   everything of the chosen element kind (vtable slots, enumerators,
+//   or header constants).
 //
 // Example, for TF2's hl2sdk-tf2 checkout:
 //   vtable-index-analyzer hl2sdk-tf2/public/eiface.h IVEngineServer \
@@ -26,11 +34,15 @@
 //       -DCOMPILER_GCC -DPOSIX -D_LINUX -DGNUC -std=gnu++14 -m32
 //
 // Constants defined directly in the requested header:
-//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h const! \
+//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h 'const::' \
 //       INTERFACEVERSION_VENGINESERVER INTERFACEVERSION_VENGINESERVER_INT -- \
 //       -I hl2sdk-tf2/public -I hl2sdk-tf2/public/engine -I hl2sdk-tf2/public/tier1 \
 //       -DCOMPILER_GCC -DPOSIX -D_LINUX -DGNUC -std=gnu++14 -m32
-//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h const! '*' -- <compiler args...>
+//   vtable-index-analyzer hl2sdk-tf2/public/eiface.h 'const::' '*' -- <compiler args...>
+//
+// Enumerators of one enum type (use whichever branch defines it):
+//   vtable-index-analyzer hl2sdk-tf2/public/game/shared/in_buttons.h enum::IN_BUTTONS \
+//       FIRST LAST '*' -- <compiler args...>
 //
 // *** The compiler args after `--` carry the exact same risk engine_adapter.cpp
 // already flagged ***: eiface.h pulls in a real dependency tree
@@ -72,11 +84,14 @@
 #include "clang/Lex/MacroInfo.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "toml.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -88,36 +103,122 @@ using namespace clang;
 
 namespace {
 
-/// A single user request: which header to parse, what target to inspect
-/// ("const!" inspects object-like #define macros instead of a class),
-/// and which method (or macro) names to resolve. A lone "*" as the only
-/// selector means every callable vtable slot of the class's primary
-/// vtable, or every object-like macro defined in the header itself.
+/// Which kind of element a query target names.
+enum class TargetKind {
+    /// A plain class name: resolve that class's virtual method vtable
+    /// indices through Itanium vtable layout. Named selectors may also
+    /// resolve static const/constexpr data members as constants.
+    Class,
+    /// "enum::<EnumName>": resolve the enumerator values of one enum
+    /// type.
+    Enum,
+    /// The bare "const::": resolve object-like #define macros and
+    /// namespace-scope const/constexpr variables whose definitions
+    /// live in the queried header itself.
+    Constants,
+};
+
+/// A single user request: which header to parse, what element kind and
+/// target to inspect, and which selector names to resolve. A lone "*"
+/// as the only selector means "everything of the chosen kind": all
+/// vtable slots of the class's primary vtable, all enumerators of the
+/// enum, or all constant definitions of the header.
 ///
 /// User-facing results are printed to stdout while resolving; the TOML
 /// output path is a per-invocation option, not per-query, so it lives
 /// outside this struct and is threaded through the run helpers.
 struct Query {
     /// Path of the header to parse, exactly as given on the command
-    /// line; also used for the macro-path TOML section key.
+    /// line; also used as the key of the Constants section, for the
+    /// macro/variable in-header filter, and in reports.
     std::string headerPath;
-    /// Class name to look up, or the literal "const!" for the macro path.
-    std::string className;
-    /// Method (or macro) names to resolve; a lone "*" enables wildcard
-    /// mode. Never empty (validated during parse).
-    std::vector<std::string> methodNames;
+    /// What the query resolves; see \c TargetKind.
+    TargetKind kind = TargetKind::Class;
+    /// Class or enum name to look up (empty for \c Constants, whose
+    /// selectors each name their own constant).
+    std::string targetName;
+    /// Method, enumerator, or constant selectors; a lone "*" enables
+    /// wildcard mode. Never empty (validated during parse).
+    std::vector<std::string> selectors;
 };
 
+/// Classifies a query's target token from the command line.
+///
+/// "enum::<Name>" and the bare "const::" (name part empty) are element
+/// queries; anything else - including qualified names like
+/// "ns::ClassName" - is treated as a plain class name, so preexisting
+/// qualified-class queries keep working.
+///
+/// \param Token target token exactly as it appears in the query.
+/// \param Kind receives the resolved element kind.
+/// \param Name receives the target name (empty for \c Constants).
+/// \param Error receives a user-facing message for malformed element
+///              queries ("enum::" with no name, or "const::<Name>").
+/// \returns true for well-formed targets; false and fills \p Error for
+///          malformed ones ("const::<Name>" has no meaning under the
+///          "const::" grammar where selectors carry the names).
+bool parseTarget(const std::string &Token, TargetKind &Kind,
+                 std::string &Name, std::string &Error) {
+    const std::size_t Separator = Token.find("::");
+    if (Separator == std::string::npos) {
+        Kind = TargetKind::Class;
+        Name = Token;
+        return true;
+    }
+
+    const std::string Type = Token.substr(0, Separator);
+    const std::string Rest = Token.substr(Separator + 2);
+    if (Type == "enum") {
+        if (Rest.empty()) {
+            Error = "enum::<Name> requires the enum type name";
+            return false;
+        }
+        Kind = TargetKind::Enum;
+        Name = Rest;
+        return true;
+    }
+    if (Type == "const" && Rest.empty()) {
+        Kind = TargetKind::Constants;
+        Name.clear();
+        return true;
+    }
+    if (Type == "const") {
+        Error = "'const::' takes no name; name the constants as selectors";
+        return false;
+    }
+    // Unknown prefix (or a leading "::") - keep treating the token as a
+    // class name so qualified-class queries are unaffected.
+    Kind = TargetKind::Class;
+    Name = Token;
+    return true;
+}
+
+/// Whether the query's selectors are the lone "*" wildcard form.
+bool wildcardsEverything(const Query &Q) {
+    return Q.selectors.size() == 1 && Q.selectors.front() == "*";
+}
+
 /// TOML section key under which a query's results are grouped in the
-/// --write-into file: "[class::<name>]" for class queries and
-/// "[const::<headerPath>]" for macro queries.
+/// --write-into file: "[class::<class>]" for class queries,
+/// "[enum::<enum>]" for enum queries, and "[const::<headerPath>]" for
+/// constant queries.
 ///
 /// \param Q the query being written out.
 /// \returns the section key without enclosing brackets.
 std::string tomlSectionName(const Query &Q) {
-    return Q.className == "const!"
-        ? "const::" + Q.headerPath
-        : "class::" + Q.className;
+    std::string Section;
+    switch (Q.kind) {
+    case TargetKind::Class:
+        Section = "class::" + Q.targetName;
+        break;
+    case TargetKind::Enum:
+        Section = "enum::" + Q.targetName;
+        break;
+    case TargetKind::Constants:
+        Section = "const::" + Q.headerPath;
+        break;
+    }
+    return Section;
 }
 
 /// Accumulates the TOML section generated for one query and writes each
@@ -155,11 +256,14 @@ public:
                  std::to_string(Index));
     }
 
-    /// Records a macro entry whose value is an arbitrary string; keys are
-    /// deduplicated with \p SequenceNumber as suffix.
-    void addMacroEntry(const std::string &Name, const std::string &Value,
-                       std::size_t SequenceNumber) {
-        addEntry(Name, Value, true, std::to_string(SequenceNumber));
+    /// Records a constant value entry under \p Name. When
+    /// \p EnsureUniqueKey is set, keys already recorded in this section
+    /// receive "@" + \p DuplicateSuffix so repeated selectors (e.g. a
+    /// value requested twice) cannot collide; pass false to preserve
+    /// the named-mode class behavior of writing plain keys verbatim.
+    void addValueEntry(const std::string &Name, const std::string &Value,
+                       bool EnsureUniqueKey, const std::string &DuplicateSuffix) {
+        addEntry(Name, Value, EnsureUniqueKey, DuplicateSuffix);
     }
 
     /// Whether any entry was recorded (i.e. the section contains data
@@ -215,15 +319,92 @@ const CXXMethodDecl *findVirtualMethod(const CXXRecordDecl *RD, const std::strin
     return nullptr;
 }
 
-/// AST visitor that resolves the method-index part of a class query
-/// against the vtable layout Clang computes for the requested class.
+/// Serializes an evaluated constant value as a TOML value literal:
+/// booleans as "true"/"false", integers as signed decimal literals, and
+/// floating-point values in round-trippable decimal form. Anything else
+/// (pointers, strings, class types, ...) is rejected - SDK headers
+/// define their string-ish values as #define macros, which follow a
+/// separate path.
+///
+/// \param Value evaluated initializer value, e.g. from
+///              \c VarDecl::evaluateValue() or \c EnumConstantDecl::
+///              \c getInitVal().
+/// \param Type declared type of the constant; distinguishes boolean
+///             from integer constants.
+/// \param Result receives the TOML literal on success.
+/// \param Error receives a user-facing message on failure.
+/// \returns true unless the value kind is unsupported (or the declared
+///          floating type is not half/float/double).
+bool apValueAsToml(const APValue &Value, const QualType &Type,
+                   std::string &Result, std::string &Error) {
+    if (Value.isInt()) {
+        if (Type->isBooleanType())
+            Result = Value.getInt().getBoolValue() ? "true" : "false";
+        else
+            Result = llvm::toString(Value.getInt(), 10);
+        return true;
+    }
+    if (Value.isFloat()) {
+        const llvm::APFloat &Float = Value.getFloat();
+        const llvm::fltSemantics &Semantics = Float.getSemantics();
+        if (&Semantics != &llvm::APFloat::IEEEhalf() &&
+            &Semantics != &llvm::APFloat::IEEEsingle() &&
+            &Semantics != &llvm::APFloat::IEEEdouble()) {
+            Error = "long double constants cannot be serialized";
+            return false;
+        }
+        // Plenty of digits for double round-trip; paddingLeft/precision
+        // improvements are not worth inventing a decimal printer here.
+        char Buffer[64];
+        std::snprintf(Buffer, sizeof(Buffer), "%.17g", Float.convertToDouble());
+        Result = Buffer;
+        return true;
+    }
+    Error = "unsupported constant kind (only integer, boolean, and "
+            "floating-point constants can be resolved)";
+    return false;
+}
+
+/// Finds one static const/constexpr data member named \p Name in the
+/// class, searching its bases recursively (Source SDK interfaces are
+/// single-inheritance per this tool's scope; the AST visitor reports
+/// multiple/virtual inheritance separately as a warning).
+///
+/// \param RD complete class definition to search.
+/// \param Name unqualified member name.
+/// \returns the first matching declaration found, or nullptr. The
+///          pointer is owned by the translation unit's AST.
+const VarDecl *findConstantMember(const CXXRecordDecl *RD, const std::string &Name) {
+    DeclarationName DN(&RD->getASTContext().Idents.get(Name));
+    for (const auto *D : RD->lookup(DN)) {
+        if (const auto *VD = dyn_cast<VarDecl>(D)) {
+            if (VD->isStaticDataMember() &&
+                (VD->getType().isConstQualified() || VD->isConstexpr()))
+                return VD;
+        }
+    }
+    for (const auto &Base : RD->bases()) {
+        if (const auto *BaseRD = Base.getType()->getAsCXXRecordDecl()) {
+            if (BaseRD->isCompleteDefinition()) {
+                if (const VarDecl *Found = findConstantMember(BaseRD, Name))
+                    return Found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+/// AST visitor that resolves the class part of a query against the
+/// vtable layout Clang computes for the requested class.
 ///
 /// It walks the parsed translation unit looking for a complete class
-/// definition matching the query's class name (by qualified or simple
-/// name), then reports each requested method's Itanium vtable index to
-/// stdout and records it in the section writer. Lifetime: bound
-/// references must outlive the traversal; the writer is shared state
-/// owned by the run helper.
+/// definition matching the query's target name (by qualified or simple
+/// name, first match wins), then reports each requested method's
+/// Itanium vtable index to stdout and records it in the section writer.
+/// Named selectors that are not virtual methods fall back to static
+/// const/constexpr data members, resolved through the compiler's own
+/// value evaluation. Lifetime: bound references must outlive the
+/// traversal; the writer is shared state owned by the run helper.
 class IndexVisitor : public RecursiveASTVisitor<IndexVisitor> {
 public:
     /// Prepares a visitor for one class query.
@@ -232,18 +413,18 @@ public:
 
     /// Reports every completed class definition whose qualified or
     /// simple name matches the query, then resolves its requested
-    /// methods; other declarations are skipped.
+    /// selectors; other declarations are skipped.
     bool VisitCXXRecordDecl(CXXRecordDecl *RD) {
         if (!RD->isCompleteDefinition())
             return true;
-        if (RD->getQualifiedNameAsString() != Q.className &&
-            RD->getNameAsString() != Q.className)
+        if (RD->getQualifiedNameAsString() != Q.targetName &&
+            RD->getNameAsString() != Q.targetName)
             return true;
 
         found = true;
 
         if (RD->getNumBases() > 1 || RD->getNumVBases() > 0) {
-            llvm::errs() << "warning: " << Q.className
+            llvm::errs() << "warning: " << Q.targetName
                          << " uses multiple or virtual inheritance - this tool "
                             "only reliably handles single inheritance. Verify "
                             "these indices another way (e.g. engine_adapter.cpp's "
@@ -253,11 +434,11 @@ public:
 
         ItaniumVTableContext VTContext(Context);
 
-        if (Q.methodNames.size() == 1 && Q.methodNames.front() == "*")
+        if (wildcardsEverything(Q))
             reportWildcardSlots(RD, VTContext);
         else
-            for (const std::string &MethodName : Q.methodNames)
-                reportNamedMethod(RD, VTContext, MethodName);
+            for (const std::string &Selector : Q.selectors)
+                reportNamedMethod(RD, VTContext, Selector);
 
         return true;
     }
@@ -278,7 +459,8 @@ private:
     /// relative to the address point, matching getMethodVTableIndex()'s
     /// index convention; ABI metadata (including RTTI) and unused slots
     /// are skipped. Destructor variants are annotated in the report and
-    /// deduplicated in the TOML keys by their slot index.
+    /// deduplicated in the TOML keys by their slot index. This mode
+    /// stays methods-only (no wildcard setup for constants exists).
     void reportWildcardSlots(const CXXRecordDecl *RD, ItaniumVTableContext &VTContext) {
         const VTableLayout &Layout = VTContext.getVTableLayout(RD);
         const auto AddressPoint =
@@ -292,7 +474,7 @@ private:
         if (AddressPoint.AddressPointIndex < VTableStart ||
             AddressPoint.AddressPointIndex >= VTableEnd) {
             llvm::errs() << "error: invalid vtable address point for "
-                         << Q.className << "\n";
+                         << Q.targetName << "\n";
             fatalError = true;
             return;
         }
@@ -306,7 +488,7 @@ private:
             const CXXMethodDecl *Method = Component.getFunctionDecl();
             const uint64_t SlotIndex =
                 ComponentIndex - AddressPoint.AddressPointIndex;
-            llvm::outs() << Q.className << "::" << Method->getNameAsString()
+            llvm::outs() << Q.targetName << "::" << Method->getNameAsString()
                          << " = " << SlotIndex;
             if (Component.getKind() == VTableComponent::CK_CompleteDtorPointer) {
                 llvm::outs() << "  (complete destructor)";
@@ -318,18 +500,25 @@ private:
         }
     }
 
-    /// Resolves and reports one named virtual method of the class,
-    /// including methods it inherits. Destructors are resolved through
-    /// their D1 (complete) variant; see the adjacency note in the
-    /// report. Names without any virtual method are reported as errors
-    /// on stderr and skipped (other requested names are still
-    /// processed).
+    /// Resolves and reports one named selector of the class: a virtual
+    /// method (including inherited ones) or, as a fallback, a static
+    /// const/constexpr data member evaluated as a constant. Destructors
+    /// are resolved through their D1 (complete) variant; see the
+    /// adjacency note in the report. Selectors matching neither are
+    /// reported as errors on stderr and skipped (other requested
+    /// selectors are still processed).
     void reportNamedMethod(const CXXRecordDecl *RD, ItaniumVTableContext &VTContext,
                            const std::string &MethodName) {
         const CXXMethodDecl *Target = findVirtualMethod(RD, MethodName);
         if (!Target) {
-            llvm::errs() << "error: no virtual method named '" << MethodName
-                         << "' found on or inherited into " << Q.className << "\n";
+            // Not a virtual method - report it as a constant member when
+            // the class (or a base) declares one with that name, so the
+            // class path can also calibrate compile-time member values.
+            if (reportConstantMember(RD, MethodName))
+                return;
+            llvm::errs() << "error: no virtual method or constant member named '"
+                         << MethodName << "' found on or inherited into "
+                         << Q.targetName << "\n";
             return;
         }
 
@@ -348,7 +537,7 @@ private:
         }
 
         const uint64_t Index = VTContext.getMethodVTableIndex(GD);
-        llvm::outs() << Q.className << "::" << MethodName << " = " << Index;
+        llvm::outs() << Q.targetName << "::" << MethodName << " = " << Index;
         if (IsDtor) {
             llvm::outs() << "  (virtual destructor: also reserves the next "
                             "slot, " << (Index + 1) << ", for the deleting-destructor "
@@ -356,6 +545,39 @@ private:
         }
         llvm::outs() << "\n";
         Writer.addMethodEntry(MethodName, Index, false);
+    }
+
+    /// Evaluates and reports one static const/constexpr data member of
+    /// the class - the named-method constant fallback.
+    ///
+    /// \param RD complete class definition containing (or whose bases
+    ///           contain) the member.
+    /// \param Name unqualified member name.
+    /// \returns true if a member with that name was reported (even when
+    ///          its value could not be evaluated - that is reported as
+    ///          an error); false if the class has no such member, so
+    ///          the caller can report the selector as missing.
+    bool reportConstantMember(const CXXRecordDecl *RD, const std::string &Name) {
+        const VarDecl *Member = findConstantMember(RD, Name);
+        if (Member == nullptr)
+            return false;
+
+        const APValue *Value = Member->evaluateValue();
+        if (Value == nullptr) {
+            llvm::errs() << "error: constant " << Q.targetName << "::" << Name
+                         << " has no evaluable compile-time value\n";
+            return true;
+        }
+        std::string TomlValue;
+        std::string EvalError;
+        if (!apValueAsToml(*Value, Member->getType(), TomlValue, EvalError)) {
+            llvm::errs() << "error: constant " << Q.targetName << "::" << Name
+                         << ": " << EvalError << "\n";
+            return true;
+        }
+        llvm::outs() << Q.targetName << "::" << Name << " = " << TomlValue << "\n";
+        Writer.addValueEntry(Name, TomlValue, false, "");
+        return true;
     }
 
     ASTContext &Context;
@@ -388,27 +610,123 @@ bool definitionIsInHeader(const SourceManager &SM, SourceLocation Loc,
     return false;
 }
 
-/// Resolves the const! macro part of a query against the preprocessor
-/// state of the parsed translation unit: object-like #define macros
-/// whose definition lives in the query's header. A lone "*" selects all
-/// matching macros; otherwise only the requested names are reported.
+/// AST visitor that resolves the namespace-scope constant-variable part
+/// of a "const::" query: definitions of const or constexpr variables at
+/// file scope whose definition lives in the query's header. Each value
+/// is reported to stdout and recorded in the section writer; received
+/// names are appended to the query's shared found-name list in
+/// encounter order.
+class ConstantVarVisitor : public RecursiveASTVisitor<ConstantVarVisitor> {
+public:
+    /// Prepares a visitor for one constant query.
+    ///
+    /// \param Q the query (header path and selectors; kind must be
+    ///          \c TargetKind::Constants).
+    /// \param SM source manager of the translation unit being walked;
+    ///           used to match variable definitions against the header.
+    /// \param Writer destination for the TOML section.
+    /// \param FoundNames shared list that receives every name this
+    ///                   visitor resolved.
+    ConstantVarVisitor(const Query &Q, const SourceManager &SM,
+                       TomlSectionWriter &Writer,
+                       std::vector<std::string> &FoundNames)
+        : Q(Q), SM(SM), Writer(Writer), FoundNames(FoundNames) {}
+
+    /// Reports every namespace-scope constant definition that lives in
+    /// the query's header and (in named mode) matches a selector;
+    /// declarations without a valued definition (e.g. `extern const`
+    /// forward declarations, non-const variables) in other scopes are
+    /// skipped.
+    bool VisitVarDecl(VarDecl *VD) {
+        const auto *Scope = VD->getDeclContext();
+        if (Scope == nullptr || !Scope->isFileContext())
+            return true;
+        const QualType Type = VD->getType();
+        if (!Type.isConstQualified() && !VD->isConstexpr())
+            return true;
+        if (VD->getInit() == nullptr)
+            return true;
+        if (!definitionIsInHeader(SM, VD->getLocation(), Q.headerPath))
+            return true;
+
+        const std::string Name = VD->getNameAsString();
+        if (!wildcardsEverything(Q) &&
+            std::find(Q.selectors.begin(), Q.selectors.end(), Name) ==
+                Q.selectors.end())
+            return true;
+
+        const APValue *Value = VD->evaluateValue();
+        if (Value == nullptr) {
+            if (wildcardsEverything(Q)) {
+                llvm::errs() << "warning: skipping constant " << Name
+                             << " - its initializer is not a compile-time "
+                                "constant value\n";
+                return true;
+            }
+            llvm::errs() << "error: constant " << Name << " in " << Q.headerPath
+                         << " has no evaluable compile-time value\n";
+            errored = true;
+            return true;
+        }
+
+        std::string TomlValue;
+        std::string EvalError;
+        if (!apValueAsToml(*Value, Type, TomlValue, EvalError)) {
+            if (wildcardsEverything(Q)) {
+                llvm::errs() << "warning: skipping constant " << Name
+                             << ": " << EvalError << "\n";
+                return true;
+            }
+            llvm::errs() << "error: constant " << Name << " in " << Q.headerPath
+                         << ": " << EvalError << "\n";
+            errored = true;
+            return true;
+        }
+
+        llvm::outs() << Q.headerPath << "::" << Name << " = " << TomlValue << '\n';
+        Writer.addValueEntry(Name, TomlValue, true, std::to_string(FoundNames.size()));
+        FoundNames.push_back(Name);
+        return true;
+    }
+
+    /// Sticky failure flag: a named selector matched a constant that
+    /// could not be evaluated. The caller must fail the query; other
+    /// names written before stay recorded.
+    bool errored = false;
+
+private:
+    const Query &Q;
+    const SourceManager &SM;
+    TomlSectionWriter &Writer;
+    std::vector<std::string> &FoundNames;
+};
+
+/// Resolves the bare "const::" constant query against the preprocessor
+/// state and AST of the parsed translation unit: object-like #define
+/// macros whose definition lives in the query's header, plus
+/// namespace-scope const/constexpr variables defined in that header.
+/// A lone "*" selects all of them; otherwise only the requested names
+/// are reported.
 ///
 /// Results are printed to stdout and recorded in the writer; a missing
-/// requested name only ends the query (reported on stderr, \c false
-/// returned), other names written before it stay recorded.
+/// requested name (or one whose value cannot be evaluated) ends the
+/// query with \c false, names written before it stay recorded.
+/// \c "#define" values keep the macro expansion text; variable values
+/// are compiler-evaluated compile-time constants (integer, boolean, or
+/// floating-point).
 ///
-/// \param Q the macro query ("const!" class name, method names as
-///          macro names).
-/// \param PP preprocessor of the translation unit parsed from the query
-///           header.
+/// \param Q the constant query (kind \c TargetKind::Constants).
+/// \param Context AST context of the parsed translation unit.
+/// \param PP preprocessor of the same translation unit.
 /// \param SM source manager of the same translation unit; used to match
-///           macro definitions against the header path.
+///           macro and variable definitions against the header path.
 /// \param Writer destination for the TOML section.
 /// \returns true if every requested name was resolved (or "*" mode
-///          found at least one macro); false otherwise.
-bool processMacroQuery(const Query &Q, Preprocessor &PP, const SourceManager &SM,
-                       TomlSectionWriter &Writer) {
-    const bool AllMacros = Q.methodNames.size() == 1 && Q.methodNames.front() == "*";
+///          found at least one constant); false otherwise.
+bool processConstantQuery(const Query &Q, ASTContext &Context,
+                          Preprocessor &PP, const SourceManager &SM,
+                          TomlSectionWriter &Writer) {
+    const bool AllConstants = wildcardsEverything(Q);
     std::vector<std::string> FoundNames;
 
     for (const auto &Entry : PP.macros(false)) {
@@ -420,30 +738,110 @@ bool processMacroQuery(const Query &Q, Preprocessor &PP, const SourceManager &SM
             continue;
 
         const std::string Name = Identifier->getName().str();
-        if (!AllMacros && std::find(Q.methodNames.begin(), Q.methodNames.end(), Name) ==
-                              Q.methodNames.end())
+        if (!AllConstants && std::find(Q.selectors.begin(), Q.selectors.end(), Name) ==
+                                 Q.selectors.end())
             continue;
 
         const std::string Value = macroValueAsToml(PP, *MI);
-        Writer.addMacroEntry(Name, Value, FoundNames.size());
+        Writer.addValueEntry(Name, Value, true, std::to_string(FoundNames.size()));
         llvm::outs() << Q.headerPath << "::" << Name << " = " << Value << '\n';
         FoundNames.push_back(Name);
     }
 
-    if (!AllMacros) {
-        for (const std::string &Requested : Q.methodNames) {
+    ConstantVarVisitor VarVisitor(Q, SM, Writer, FoundNames);
+    VarVisitor.TraverseDecl(Context.getTranslationUnitDecl());
+    if (VarVisitor.errored)
+        return false;
+
+    if (!AllConstants) {
+        for (const std::string &Requested : Q.selectors) {
             if (std::find(FoundNames.begin(), FoundNames.end(), Requested) == FoundNames.end()) {
-                llvm::errs() << "error: no object-like macro named '" << Requested
-                             << "' defined in " << Q.headerPath << "\n";
+                llvm::errs() << "error: no constant named '" << Requested
+                             << "' (object-like #define or const variable) defined in "
+                             << Q.headerPath << "\n";
                 return false;
             }
         }
     } else if (FoundNames.empty()) {
-        llvm::errs() << "error: no object-like macros found in " << Q.headerPath << "\n";
+        llvm::errs() << "error: no constants found in " << Q.headerPath << "\n";
         return false;
     }
     return true;
 }
+
+/// AST visitor that resolves the enum part of a query: finds the
+/// complete definition of the named enum type (first match by qualified
+/// or simple name, like the class path) and reports enumerator values.
+/// Nested enums (declared inside classes) resolve the same way, so
+/// "enum::Outer::Kind" works like a qualified class name.
+class EnumVisitor : public RecursiveASTVisitor<EnumVisitor> {
+public:
+    /// Prepares a visitor for one enum query.
+    EnumVisitor(const Query &Q, TomlSectionWriter &Writer)
+        : Q(Q), Writer(Writer) {}
+
+    /// Reports every completed enum definition whose qualified or
+    /// simple name matches the query's target; other declarations are
+    /// skipped. In wildcard mode every enumerator is reported; in named
+    /// mode unknown selectors are reported as errors and skipped
+    /// (other requested enumerators are still processed).
+    bool VisitEnumDecl(EnumDecl *ED) {
+        if (!ED->isCompleteDefinition())
+            return true;
+        if (ED->getQualifiedNameAsString() != Q.targetName &&
+            ED->getNameAsString() != Q.targetName)
+            return true;
+
+        found = true;
+
+        if (wildcardsEverything(Q)) {
+            for (const EnumConstantDecl *Constant : ED->enumerators())
+                reportEnumerator(Constant);
+            return true;
+        }
+
+        for (const std::string &Selector : Q.selectors) {
+            const EnumConstantDecl *Constant = nullptr;
+            for (const EnumConstantDecl *Candidate : ED->enumerators()) {
+                if (Candidate->getNameAsString() == Selector) {
+                    Constant = Candidate;
+                    break;
+                }
+            }
+            if (Constant == nullptr) {
+                llvm::errs() << "error: no enumerator named '" << Selector
+                             << "' in enum " << Q.targetName << "\n";
+                missing = true;
+                continue;
+            }
+            reportEnumerator(Constant);
+        }
+        return true;
+    }
+
+    /// True once at least one matching complete enum definition was
+    /// seen during traversal; callers must report the enum as missing
+    /// when this stays false.
+    bool found = false;
+    /// Sticky failure flag: at least one requested enumerator name does
+    /// not exist in the enum; callers must fail the query.
+    bool missing = false;
+
+private:
+    /// Reports and records one enumerator: "<Enum>::<Name> = <value>"
+    /// on stdout and a TOML entry in the enum's section (keys are
+    /// deduplicated by record order for repeated selectors).
+    void reportEnumerator(const EnumConstantDecl *Constant) {
+        const std::string Name = Constant->getNameAsString();
+        const std::string Value = llvm::toString(Constant->getInitVal(), 10);
+        llvm::outs() << Q.targetName << "::" << Name << " = " << Value << '\n';
+        Writer.addValueEntry(Name, Value, true, std::to_string(RecordedCount++));
+    }
+
+    const Query &Q;
+    TomlSectionWriter &Writer;
+    std::size_t RecordedCount = 0;
+};
 
 /// Split brace-set syntax even when the whole expression is quoted as one
 /// shell argument, e.g. '{{a.h A Foo}, {b.h B Bar}}'.
@@ -478,9 +876,9 @@ std::vector<std::string> tokenizeSetArguments(
 /// only selector or not appear at all.
 bool validateMethodSelectors(Query &Q, std::string &Error) {
     const bool HasWildcard = std::find(
-        Q.methodNames.begin(), Q.methodNames.end(), "*") != Q.methodNames.end();
-    if (HasWildcard && (Q.methodNames.size() != 1 || Q.methodNames.front() != "*")) {
-        Error = "'*' must be the only method selector in a query for " + Q.className;
+        Q.selectors.begin(), Q.selectors.end(), "*") != Q.selectors.end();
+    if (HasWildcard && (Q.selectors.size() != 1 || Q.selectors.front() != "*")) {
+        Error = "'*' must be the only selector in a query for " + Q.targetName;
         return false;
     }
     return true;
@@ -509,13 +907,14 @@ bool parseQueryBody(const std::vector<std::string> &Tokens,
     ++Position;
 
     if (Body.size() < 3) {
-        Error = "each query must contain a header, class name, and at least one method";
+        Error = "each query must contain a header, a target, and at least one selector";
         return false;
     }
 
     Q.headerPath = Body[0];
-    Q.className = Body[1];
-    Q.methodNames.assign(Body.begin() + 2, Body.end());
+    if (!parseTarget(Body[1], Q.kind, Q.targetName, Error))
+        return false;
+    Q.selectors.assign(Body.begin() + 2, Body.end());
     return validateMethodSelectors(Q, Error);
 }
 
@@ -657,15 +1056,16 @@ bool parseCommandLine(int argc, char **argv, CommandLine &Command,
         return true;
     }
 
-    // Backwards-compatible form: <header> <class> <method...>.
+    // Backwards-compatible form: <header> <target> <selector...>.
     if (Command.preQueryArgs.size() < 3) {
-        Error = "expected <header.h> <ClassName> <method1|*> [method2 ...]";
+        Error = "expected <header.h> <Class|enum::<Enum>|const::> <select1|*> [more ...]";
         return false;
     }
     Query Q;
     Q.headerPath = Command.preQueryArgs[0];
-    Q.className = Command.preQueryArgs[1];
-    Q.methodNames.assign(Command.preQueryArgs.begin() + 2, Command.preQueryArgs.end());
+    if (!parseTarget(Command.preQueryArgs[1], Q.kind, Q.targetName, Error))
+        return false;
+    Q.selectors.assign(Command.preQueryArgs.begin() + 2, Command.preQueryArgs.end());
     if (!validateMethodSelectors(Q, Error)) {
         // The legacy form used a shorter selector error; keep it for
         // existing users of the tool.
@@ -713,22 +1113,39 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
     }
 
     int Status = 0;
-    if (Q.className == "const!") {
-        if (!processMacroQuery(Q, AST->getPreprocessor(), AST->getSourceManager(),
-                               Writer))
+    switch (Q.kind) {
+    case TargetKind::Constants:
+        if (!processConstantQuery(Q, AST->getASTContext(), AST->getPreprocessor(),
+                                  AST->getSourceManager(), Writer))
             Status = 1;
-    } else {
+        break;
+    case TargetKind::Enum: {
+        EnumVisitor Visitor(Q, Writer);
+        Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
+        if (!Visitor.found) {
+            llvm::errs() << "error: enum '" << Q.targetName
+                         << "' (as a complete definition) was never found while parsing '"
+                         << Q.headerPath << "' and its includes\n";
+            Status = 1;
+        }
+        if (Visitor.missing)
+            Status = 1;
+        break;
+    }
+    case TargetKind::Class: {
         IndexVisitor Visitor(AST->getASTContext(), Q, Writer);
         Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
 
         if (!Visitor.found) {
-            llvm::errs() << "error: class '" << Q.className
+            llvm::errs() << "error: class '" << Q.targetName
                          << "' (as a complete definition) was never found while parsing '"
                          << Q.headerPath << "' and its includes\n";
             Status = 1;
         }
         if (Visitor.fatalError)
             Status = 1;
+        break;
+    }
     }
 
     if (Writer.failed())
@@ -746,11 +1163,12 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        llvm::errs() << "usage: vtable-index-analyzer <header.h> <ClassName> "
-                         "<method1|*> [method2 ...] [--write-into <file.toml>] "
+        llvm::errs() << "usage: vtable-index-analyzer <header.h> "
+                         "<Class|enum::<Enum>|const::> <selector1|*> "
+                         "[selector2 ...] [--write-into <file.toml>] "
                          "-- <compiler args...>\n"
-                         "   or: vtable-index-analyzer '{{<header.h> <ClassName> <method...>}, "
-                         "{<header.h> <ClassName> <method...>}}' "
+                         "   or: vtable-index-analyzer '{{<header.h> <target> <selector...>}, "
+                         "{<header.h> <target> <selector...>}}' "
                          "[--write-into <file.toml>] -- <compiler args...>\n";
         return 2;
     }
