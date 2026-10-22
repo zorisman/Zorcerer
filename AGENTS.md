@@ -44,7 +44,26 @@
 - Treat planned architecture and future components as design goals, not as proof that a feature already exists.
 - Before changing module boundaries or public interfaces, inspect existing callers and dependencies.
 
-## 5. Zig Requirements
+## 5. Documentation Requirements
+
+- Document every newly introduced struct and function.
+- Use idiomatic documentation comments for the language.
+- For each struct, describe its purpose, important invariants,
+  and the meaning of its fields.
+- For each function, describe its purpose, parameters,
+  return value, possible errors, and relevant side effects.
+- Document ownership, lifetimes, preconditions, and resource
+  management whenever they affect correct usage.
+- Describe only information that is useful for understanding,
+  calling, maintaining, or safely modifying the code.
+- Do not merely repeat names, types, or obvious implementation
+  details in prose.
+- Do not invent undocumented behavior or possible errors.
+  Verify the implementation before documenting its contract.
+- Update existing documentation whenever a code change
+  makes it inaccurate.
+
+## 6. Zig Requirements
 
 - Target Zig 0.16.0 exclusively.
 - Do not use APIs, standard-library examples, or build-system patterns from other Zig versions without verifying their compatibility with Zig 0.16.0.
@@ -53,9 +72,8 @@
 - Preserve the project's existing I/O, allocator, error-handling, and resource-lifetime conventions.
 - Do not introduce abstractions or generic frameworks when a small explicit implementation is sufficient.
 - Keep source comments and code documentation in English.
-- To every written struct and function, add documentation. Describe what it does, which fields or arguments it takes, what returns and possible errors. Write only the information that is useful for coding.
 
-## 6. C++ and Source SDK Requirements
+## 7. C++ and Source SDK Requirements
 
 - Preserve the C++ standard and compiler flags configured by the project.
 - The vtable analyzer currently targets C++17 and has been designed to build without RTTI and exceptions. Verify the existing build configuration before changing these constraints.
@@ -66,7 +84,7 @@
 - Do not change Source SDK interfaces, ABI assumptions, calling conventions, or hook behavior without understanding the consequences for the target game.
 - Avoid adding C++ runtime dependencies to the core unless explicitly approved.
 
-## 7. Dependencies and Build Configuration
+## 8. Dependencies and Build Configuration
 
 - Minimize dependencies, especially dependencies included in the runtime or plugin-manager core.
 - Reuse the project's existing libraries and build conventions.
@@ -77,7 +95,7 @@
 - Do not assume that every optional component should be compiled in every build.
 - Inspect `build.zig`, relevant documentation, and existing build scripts before selecting commands or changing build options.
 
-## 8. Working Procedure
+## 9. Working Procedure
 
 For each task:
 
@@ -91,7 +109,7 @@ For each task:
 
 Do not restart the entire investigation if the relevant facts are already established in the current session. Reuse verified findings, but re-check facts that may have changed.
 
-## 9. Build and Test Verification
+## 10. Build and Test Verification
 
 - Discover build and test commands from `build.zig`, project documentation, and existing scripts.
 - Never invent a test command or claim that a test suite exists without verifying it.
@@ -100,7 +118,7 @@ Do not restart the entire investigation if the relevant facts are already establ
 - When a check fails, report the relevant output and distinguish the underlying problem from unrelated environment failures.
 - If verification cannot be performed, explain why and state what remains unverified.
 
-## 10. Final Response
+## 11. Final Response
 
 For implementation tasks, report:
 
