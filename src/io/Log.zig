@@ -11,7 +11,7 @@
 //! messages, mirroring how Manager.logLine() behaves before setLogger().
 
 const std = @import("std");
-const abi = @import("PluginContext.zig");
+const abi = @import("../PluginContext.zig");
 
 /// The captured Source SDK logging sink: the engine context paired with
 /// its LogPrint entry, exactly as Logger describes it. Null until setup().
