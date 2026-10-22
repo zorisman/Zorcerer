@@ -2,7 +2,7 @@
 //!
 //! logLine() formats one message and sends it to the Source SDK logging
 //! system: the engine's IVEngineServer::LogPrint, expressed as the
-//! context/print pair of plugin-context's Logger. Allowing any other
+//! context/print pair of abi.Logger (src/PluginContext.zig). Allowing any other
 //! destination is out of scope for now.
 //!
 //! The hook into the engine stays with the entrypoint: it resolves the
@@ -11,7 +11,7 @@
 //! messages, mirroring how Manager.logLine() behaves before setLogger().
 
 const std = @import("std");
-const abi = @import("plugin-context");
+const abi = @import("PluginContext.zig");
 
 /// The captured Source SDK logging sink: the engine context paired with
 /// its LogPrint entry, exactly as Logger describes it. Null until setup().
