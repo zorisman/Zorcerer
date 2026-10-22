@@ -77,6 +77,8 @@ const EngineVersions = @import("analyzers/EngineVersions.zig");
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
 
+pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
+
 const iface_ok: c_int = 0;
 const iface_failed: c_int = 1;
 
@@ -98,43 +100,13 @@ const PluginObject = extern struct {
 };
 
 var plugin_instance = PluginObject{ .vptr = &vtable };
-
-/// Saved across calls so LevelInit/ServerActivate/etc. can log through
-/// them. Null until Load() succeeds.
 var engine: ?*anyopaque = null;
-
-const LogPrintFn = *const fn (engine: *anyopaque, msg: [*:0]const u8) callconv(.c) void;
-var log_print: ?LogPrintFn = null;
 
 /// Plugin manager singleton. load() wires the engine logger into it, then
 /// discovers/caches the plugin .so files under tf/addons/zorcerer/plugins/
 /// and runs each plugin's load() hook; unload() runs the unload() hooks
 /// again and releases everything (see src/PluginManager.zig).
 var plugin_manager = Manager.Manager.init();
-
-fn logLine(comptime fmt: []const u8, args: anytype) void {
-    const e = engine orelse return;
-    const print = log_print orelse return;
-
-    var buf: [512]u8 = undefined;
-    const line: [:0]const u8 = if (std.fmt.bufPrintZ(&buf, fmt, args)) |formatted|
-        formatted
-    else |_|
-        "[MyLoader] (message too long to log)\n";
-    print(e, line.ptr);
-}
-
-/// Writes straight to the process's own stderr via a raw syscall, no
-/// engine involved. The *only* place this project reaches for this
-/// instead of `logLine`: the one early failure path in `load` where, by
-/// definition, we don't have a verified LogPrint pointer to log through
-/// yet - which is also exactly the failure mode that produced total
-/// silence during the earlier "LogPrint isn't firing" investigation.
-/// Writing here means a detection failure is now visible in the server's
-/// own console/log instead of vanishing.
-fn debugWriteStderr(msg: []const u8) void {
-    _ = std.os.linux.write(2, msg.ptr, msg.len);
-}
 
 fn load(
     this: *anyopaque,
