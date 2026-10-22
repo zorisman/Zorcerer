@@ -53,6 +53,7 @@
 - Preserve the project's existing I/O, allocator, error-handling, and resource-lifetime conventions.
 - Do not introduce abstractions or generic frameworks when a small explicit implementation is sufficient.
 - Keep source comments and code documentation in English.
+- To every written struct and function, add documentation. Describe what it does, which fields or arguments it takes, what returns and possible errors. Write only the information that is useful for coding.
 
 ## 6. C++ and Source SDK Requirements
 
