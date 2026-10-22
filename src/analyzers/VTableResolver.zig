@@ -2,14 +2,15 @@
 //! there's no CreateInterface-exposed singleton to call the hook library's
 //! `VTableHook.vtableOf` on directly - e.g. entity classes like CTFPlayer,
 //! which aren't reachable through any interface factory, only through a
-//! live instance you may not have yet. The result is exactly the
-//! `VTable` value that `VTableHook.VtableHook.install` consumes in the
-//! hook library ("hooks" build module, extern/zig-hooks/src/hooks/VTableHook.zig).
+//! live instance you may not have yet.
 //!
-//! Status: this file is currently not referenced by the build, and its
-//! `VTableHooks.zig` import below does not resolve - that import was
-//! never re-pointed at the hook library after the resolvers/→/analyzers
-//! move. Fix the import (and wire the module in) before using the code.
+//! Everything here returns exactly the `VTable` value that
+//! `VTableHooks.VtableHook.install` consumes (the `hooks` build module,
+//! extern/zig-hooks/src/hooks/VTableHook.zig): a pointer to the vtable's
+//! function-pointer array (index 0 = first virtual method) - precisely what
+//! an Itanium-ABI object's vptr holds. Never the raw `_ZTV` symbol base,
+//! which sits `VTableHooks.header_words` words earlier in the vtable
+//! group (offset-to-top, then the type_info pointer).
 //!
 //! Two strategies, tried in order by `resolve`:
 //!
@@ -46,28 +47,19 @@
 //! name); namespaced/templated names mangle very differently and aren't
 //! handled here.
 //!
-//! *** UNVERIFIED, LIKELY THE WEAKEST PART OF THIS FILE ***
-//! `readProcSelfMaps` is the one piece of this file that does blocking
-//! file I/O, which is exactly the area Zig 0.16 reworked most (the
-//! std.Io interface). It has never been built against a real 0.16
-//! toolchain, so if something here doesn't build, start by looking at
-//! that one function - the actual RTTI-chasing logic in `resolveViaRtti`
-//! only operates on plain byte slices and raw addresses, and doesn't
-//! depend on how you got the maps text into memory. If
-//! `std.Io.Dir.openFileAbsolute`/`File.read` don't match your toolchain,
-//! swap `readProcSelfMaps`'s body for whatever the project already uses
-//! to read a file, or for a raw `std.os.linux.read`-based loop - either
-//! way, just hand `moduleRanges` the resulting text.
+//! Status: compiles against the Zig 0.16.0 toolchain; its unit tests run
+//! through the compile check in src/root.zig. Nothing in production code
+//! calls it yet: before using it, pick the install site, and on the RTTI
+//! path decide who performs the candidate validation described above.
 //!
-//! Also note: dlsym/dlopen aren't raw syscalls (there's no such thing as
-//! a "dlopen syscall" - the dynamic linker implements them), so this file
-//! needs libc linked in. The project already links libc into the `hooks`
-//! module (build.zig), and the C++ parts that use libstdc++
-//! (build/analyzers/VTableIndexAnalyzer.cpp) transitively pull libc in
-//! too, so this shouldn't add a new practical dependency.
+//! I/O shape of 0.16: reading /proc/self/maps (see `readProcSelfMaps`)
+//! needs an explicit `std.Io` handle, exactly like the rest of the
+//! project's runtime file I/O (src/PluginManager.zig threads one through
+//! as `threaded_io`). Pass the caller's instance in rather than creating
+//! another one.
 
 const std = @import("std");
-const VTableHooks = @import("VTableHooks.zig");
+const VTableHooks = @import("hooks").VTableHook;
 
 const RTLD_NOW: c_int = 2;
 const RTLD_NOLOAD: c_int = 4;
@@ -76,6 +68,7 @@ const RTLD_NOLOAD: c_int = 4;
 // 1. std.c requires a linkage with C standard library, which is not really needed since Source engine already links it. The less symbols library contains, the less size it has.
 // 2. std.DynLib causes segfault. I think the reason hides somewhere in conflicts between GNU and LLVM ABI.
 extern fn dlopen(path: ?[*:0]const u8, flags: c_int) ?*anyopaque;
+extern fn dlclose(handle: ?*anyopaque) c_int;
 extern fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
 
 pub const ResolveError = error{
@@ -84,32 +77,68 @@ pub const ResolveError = error{
     NotFound,
 } || std.mem.Allocator.Error;
 
+pub const ReadProcSelfMapsError = std.Io.File.OpenError || std.Io.File.ReadPositionalError || error{
+    /// /proc/self/maps did not fit into the supplied buffer; refused
+    /// instead of returning a truncated maps text.
+    MapDataTooLarge,
+};
+
+/// One of the module's mapped memory ranges, as listed in /proc/self/maps.
+/// `start` is the first mapped byte (inclusive), `end` is one past the
+/// last mapped byte (exclusive). Ranges are page-aligned in practice, so
+/// every range is at least `@alignOf(usize)`-aligned. `executable` marks
+/// ranges with the 'x' permission bit; the scanning helpers skip these
+/// (vtables and RTTI data live in data segments, code references them
+/// only through GOT/data indirection - scanning code pages finds only
+/// stray immediates, and they're the largest segments, so excluding them
+/// is both a speedup and a noise reduction).
+///
+/// Note the invariant implied by the parsing: ranges are per-VMA, not
+/// merged across adjacent mappings that happen to be contiguous.
 pub const MappedRange = struct {
     start: usize,
     end: usize,
+    executable: bool,
 };
 
-/// Reads /proc/self/maps into `buf` (whole file, must fit - a few hundred
-/// KB is typical even for a large process; size accordingly). See the
-/// module doc-comment: this is the one function most likely to need
-/// adapting to your exact Zig version.
-pub fn readProcSelfMaps(buf: []u8) ![]const u8 {
-    var file = try std.Io.Dir.openFileAbsolute("/proc/self/maps", .{});
-    defer file.close();
+/// Reads /proc/self/maps into `buf` (whole file, one syscall series) -
+/// typically well over a hundred KB for a Source-engine process
+/// (thousands of VMAs); size accordingly. Returns the slice of `buf`
+/// actually filled. `io` is the `std.Io` instance the caller owns (see
+/// the module doc-comment); this is the only function in this file doing
+/// file I/O.
+///
+/// Refuses to truncate silently: if the whole file does not fit, `buf`
+/// exactly fills and one further byte exists, `error.MapDataTooLarge` is
+/// returned. File open/read/close failures surface through
+/// `std.Io.File.OpenError` / `ReadPositionalError`.
+pub fn readProcSelfMaps(io: std.Io, buf: []u8) ReadProcSelfMapsError![]const u8 {
+    const file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/maps", .{});
+    defer file.close(io);
 
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try file.read(buf[total..]);
-        if (n == 0) break;
-        total += n;
+    const total = try file.readPositionalAll(io, buf, 0);
+    if (total == buf.len) {
+        var probe = [1]u8{0};
+        const more = try file.readPositional(io, &.{&probe}, total);
+        if (more != 0) return error.MapDataTooLarge;
     }
 
     return buf[0..total];
 }
 
-/// Every mapped, readable range whose /proc/self/maps line contains
-/// `module_substr` (e.g. "server.so"). `maps_text` is the file's contents,
-/// however you obtained them (see `readProcSelfMaps`).
+/// Every mapped, readable range whose /proc/self/maps line names the
+/// target: `module_substr` (e.g. "server.so") is matched against the
+/// pathname token only, never against addresses/perms/offsets/inode
+/// values, so a substring like "1048577" cannot match an inode field.
+/// `maps_text` is the file's contents, however you obtained them (see
+/// `readProcSelfMaps`).
+///
+/// Preconditions: `module_substr` must be non-empty (an empty string
+/// matches every file-backed mapping). Anonymous and pseudo-file mappings
+/// ([heap], [stack], ...) never match - they have no pathname token,
+/// which is correct: the vtables we hunt live in the module's own
+/// file-backed segments. Unreadable ranges (e.g. `---p` RELRO holes) are
+/// skipped; vtables sit in readable data regardless.
 pub fn moduleRanges(
     allocator: std.mem.Allocator,
     maps_text: []const u8,
@@ -120,20 +149,33 @@ pub fn moduleRanges(
 
     var lines = std.mem.splitScalar(u8, maps_text, '\n');
     while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (std.mem.indexOf(u8, line, module_substr) == null) continue;
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const address = fields.next() orelse continue;
+        const perms = fields.next() orelse continue;
+        // offset, device, inode precede the pathname; require them so
+        // `fields.rest()` is never a shorter line's tail.
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
 
-        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
-        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-        if (space <= dash) continue;
+        if (perms[0] != 'r') continue; // skip unreadable ranges
 
-        const start = std.fmt.parseUnsigned(usize, line[0..dash], 16) catch continue;
-        const end = std.fmt.parseUnsigned(usize, line[dash + 1 .. space], 16) catch continue;
+        // `rest()` skips only the leading spaces, so pathnames with
+        // spaces (common in Steam install paths) arrive intact.
+        const pathname = fields.rest();
+        if (pathname.len == 0) continue;
+        if (std.mem.find(u8, pathname, module_substr) == null) continue;
 
-        const perms_start = space + 1;
-        if (perms_start >= line.len or line[perms_start] != 'r') continue; // skip unreadable ranges
+        const dash = std.mem.findScalar(u8, address, '-') orelse continue;
+        const start = std.fmt.parseUnsigned(usize, address[0..dash], 16) catch continue;
+        const end = std.fmt.parseUnsigned(usize, address[dash + 1 ..], 16) catch continue;
+        if (end < start) continue; // nonsensical line; cannot fold into a range
 
-        try ranges.append(allocator, .{ .start = start, .end = end });
+        try ranges.append(allocator, .{
+            .start = start,
+            .end = end,
+            .executable = std.mem.findScalar(u8, perms, 'x') != null,
+        });
     }
 
     if (ranges.items.len == 0) return error.ModuleNotFound;
@@ -148,6 +190,15 @@ fn mangleSimpleName(buf: []u8, class_name: []const u8) ResolveError![]u8 {
     return std.fmt.bufPrint(buf, "{d}{s}", .{ class_name.len, class_name }) catch error.NameTooLong;
 }
 
+/// The non-executable counterpart of scanning work: the name string and
+/// the pointer arrays this file chases all live in data segments (see
+/// `MappedRange.executable`).
+fn scanTarget(range: MappedRange) bool {
+    return !range.executable;
+}
+
+/// Finds the address of every occurrence of `needle` within the ranges to
+/// scan (see `scanTarget`). Failures are allocation failures only.
 fn findAllOccurrences(
     allocator: std.mem.Allocator,
     ranges: []const MappedRange,
@@ -157,21 +208,25 @@ fn findAllOccurrences(
     errdefer found.deinit(allocator);
 
     for (ranges) |range| {
+        if (!scanTarget(range)) continue;
         const len = range.end - range.start;
         if (len < needle.len) continue;
-        const haystack: [*]const u8 = @ptrFromInt(range.start);
 
-        var i: usize = 0;
-        while (i <= len - needle.len) : (i += 1) {
-            if (std.mem.eql(u8, haystack[i .. i + needle.len], needle)) {
-                try found.append(allocator, range.start + i);
-            }
+        const haystack: [*]const u8 = @ptrFromInt(range.start);
+        var pos: usize = 0;
+        while (std.mem.findPos(u8, haystack[0..len], pos, needle)) |at| {
+            try found.append(allocator, range.start + at);
+            pos = at + 1;
         }
     }
 
     return found;
 }
 
+/// Finds the address of every `@alignOf(usize)`-aligned pointer-sized
+/// word in the ranges to scan (see `scanTarget`) that stores exactly
+/// `target`. Range starts are page-aligned, so aligned dereferences are
+/// always well-defined.
 fn findAllPointersTo(
     allocator: std.mem.Allocator,
     ranges: []const MappedRange,
@@ -181,6 +236,8 @@ fn findAllPointersTo(
     errdefer found.deinit(allocator);
 
     for (ranges) |range| {
+        if (!scanTarget(range)) continue;
+
         var addr = std.mem.alignForward(usize, range.start, @alignOf(usize));
         while (addr + @sizeOf(usize) <= range.end) : (addr += @sizeOf(usize)) {
             const ptr: *const usize = @ptrFromInt(addr);
@@ -196,11 +253,28 @@ fn findAllPointersTo(
 /// that's genuinely already loaded into the process - it will not load a
 /// fresh copy from disk (which would re-run that module's static
 /// initializers mid-process, a bad time to discover a second one exists).
-/// `module_name` should be the same name/path the module already appears
-/// under - whatever string shows up for it in /proc/self/maps is a safe
-/// choice, since that's what this is cross-checked against anyway.
+/// `module_name` should be the exact path/name the module was loaded
+/// under - dlopen's NOLOAD lookup matches the load-time path, and a
+/// differently-spelled variant (e.g. through a symlink) of the same file
+/// may legitimately fail; the pathname shown for the module in
+/// /proc/self/maps is the reliable choice.
+///
+/// Returns the vtable's function-pointer array (the address point):
+/// the dlsym result is advanced by `VTableHooks.header_words` slots to
+/// get there. Exact for classes without virtual bases / vcall offsets,
+/// which covers the Source SDK classes this resolver targets; the RTTI
+/// scan (`resolveViaRtti`) needs no such assumption, so both paths agree.
+///
+/// The dlopen handle is dropped immediately (dlclose) - with RTLD_NOLOAD
+/// it only ever bumped a refcount on a module the process already keeps
+/// loaded, so the returned pointer stays valid for the process lifetime.
+///
+/// Every failure - module not loaded, class name too long to mangle,
+/// symbol not exported - collapses into `null` (this strategy is the
+/// optional fast path; `resolve` simply falls through to the RTTI scan).
 pub fn resolveViaSymbol(module_name: [:0]const u8, class_name: []const u8) ?VTableHooks.VTable {
     const handle = dlopen(module_name.ptr, RTLD_NOW | RTLD_NOLOAD) orelse return null;
+    defer _ = dlclose(handle);
 
     var mangled_buf: [256]u8 = undefined;
     const mangled = mangleSimpleName(&mangled_buf, class_name) catch return null;
@@ -209,7 +283,7 @@ pub fn resolveViaSymbol(module_name: [:0]const u8, class_name: []const u8) ?VTab
     const symbol = std.fmt.bufPrintZ(&symbol_buf, "_ZTV{s}", .{mangled}) catch return null;
 
     const sym = dlsym(handle, symbol.ptr) orelse return null;
-    return @ptrCast(@alignCast(sym));
+    return @ptrFromInt(@intFromPtr(sym) + VTableHooks.header_words * @sizeOf(VTableHooks.Slot));
 }
 
 /// Walks the RTTI chain by scanning already-mapped memory; see the module
@@ -218,6 +292,13 @@ pub fn resolveViaSymbol(module_name: [:0]const u8, class_name: []const u8) ?VTab
 /// module (see `moduleRanges`) - vtables and their RTTI data can land in
 /// different segments (.rodata, .data.rel.ro, ...) depending on how the
 /// module was built.
+///
+/// The scans have two known-harmless extra candidates that appear for
+/// every resolution and are discarded by the chain itself, but cost a
+/// wasted sweep each: the `_ZTS...` string's sibling copy in .dynstr,
+/// and address-sized immediates/other pointer slots that alias a
+/// candidate. Callers therefore must not assume the returned slice is
+/// minimal - only that it contains the real vtable when one exists.
 pub fn resolveViaRtti(
     allocator: std.mem.Allocator,
     ranges: []const MappedRange,
@@ -273,10 +354,15 @@ pub fn resolveViaRtti(
 
 /// Tries the fast, exact symbol route first; falls back to the RTTI scan
 /// over `ranges` (see `moduleRanges` for how to get those) if that fails.
-/// The caller owns the returned slice either way (free with
-/// `allocator.free`) - a successful symbol match is still wrapped in a
-/// freshly-allocated single-element slice, so freeing is uniform
-/// regardless of which path actually resolved it.
+/// Returns every candidate the chosen path produced (a successful symbol
+/// match is a freshly-allocated single-element slice, so owning the
+/// result is uniform regardless of the path; free with `allocator.free`).
+/// The caller owns `ranges`; this file never allocates into them.
+///
+/// `resolveViaSymbol` never errors (it null-falls back), so this
+/// function's error set is dominated by the RTTI scan's: `NotFound`,
+/// `NameTooLong` (both from mangling and the scan), `ModuleNotFound`
+/// (only returned by `moduleRanges`, not this function), plus OOM.
 pub fn resolve(
     allocator: std.mem.Allocator,
     module_name: [:0]const u8,
@@ -289,4 +375,60 @@ pub fn resolve(
         return single;
     }
     return resolveViaRtti(allocator, ranges, class_name);
+}
+
+const testing = std.testing;
+
+test "mangleSimpleName prefixes the byte length, and rejects overflow" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("9CTFPlayer", try mangleSimpleName(&buf, "CTFPlayer"));
+
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.NameTooLong, mangleSimpleName(&tiny, "CTFPlayer"));
+}
+
+test "moduleRanges keeps only the named module's readable ranges, flags code, and ignores the rest" {
+    const maps_text =
+        "00400000-00401000 r--p 00000000 08:01 1048577  /home/user/Team Fortress 2/tf/bin/server.so\n" ++
+        "00401000-00402000 r-xp 00001000 08:01 1048577  /home/user/Team Fortress 2/tf/bin/server.so\n" ++
+        "00402000-00403000 ---p 00002000 08:01 1048577  /home/user/Team Fortress 2/tf/bin/server.so\n" ++
+        "7f0000002000-7f0000003000 r--p 00000000 08:01 1048661  /etc/ld.so.cache\n" ++
+        "7f0000004000-7f0000005000 rw-p 00000000 00:00 0  [heap]\n" ++
+        "7f0000006000-7f0000007000 rwxp 00000000 08:01 1048578  /home/user/other/game.so";
+
+    const ranges = try moduleRanges(testing.allocator, maps_text, "server.so");
+    defer testing.allocator.free(ranges);
+
+    try testing.expectEqual(@as(usize, 2), ranges.len);
+
+    try testing.expectEqual(@as(usize, 0x00400000), ranges[0].start);
+    try testing.expectEqual(@as(usize, 0x00401000), ranges[0].end);
+    try testing.expect(!ranges[0].executable);
+
+    try testing.expectEqual(@as(usize, 0x00401000), ranges[1].start);
+    try testing.expectEqual(@as(usize, 0x00402000), ranges[1].end);
+    try testing.expect(ranges[1].executable);
+
+    // The unreadable module line is skipped despite matching the substring,
+    // non-module pathnames ([heap], ld.so.cache) never match, and pathnames
+    // with spaces survive intact:
+    const other = try moduleRanges(testing.allocator, maps_text, "game.so");
+    defer testing.allocator.free(other);
+    try testing.expectEqual(@as(usize, 1), other.len);
+    try testing.expectEqual(@as(usize, 0x7f0000006000), other[0].start);
+    try testing.expect(other[0].executable);
+}
+
+test "moduleRanges reports ModuleNotFound when nothing matches" {
+    const maps_text = "00400000-00401000 r--p 00000000 08:01 1048577  /tf/bin/server.so\n";
+    try testing.expectError(
+        error.ModuleNotFound,
+        moduleRanges(testing.allocator, maps_text, "engine.so"),
+    );
+}
+
+test "resolveViaSymbol fails cleanly (null) on a module the OS cannot resolve" {
+    // RTLD_NOLOAD never touches the filesystem for real loads; requesting
+    // an absent module is a pure in-process lookup that returns null.
+    try testing.expect(resolveViaSymbol("definitely-not-a-module-zorcerer-test", "CTFPlayer") == null);
 }
