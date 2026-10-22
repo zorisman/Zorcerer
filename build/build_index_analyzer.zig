@@ -4,7 +4,9 @@
 //!
 //!     @import("build_index_analyzer.zig").addIndexAnalyzer(b);
 //!
-//! The root build.zig controls whether this step is added via `-Dindex-analyzer`.
+//! build.zig calls this unconditionally; running the build with
+//! `-DSkip-analyzer` skips both this analyzer compilation and the
+//! index-extraction invocation driven by DataAdapter.
 //!
 //! The analyzer is compiled by the system C++ compiler, not Zig's C++
 //! frontend. This avoids mixing Zig's default libc++ with system Clang/LLVM
@@ -12,7 +14,8 @@
 //!
 //! Overrides, if the tools are versioned on your system:
 //!
-//!     zig build -Dindex-analyzer -Dindex-cxx=clang++-21 -Dllvm-config=llvm-config-21
+//!     zig build -Dindex-cxx=clang++-21 -Dllvm-config=llvm-config-21
+//!     zig build -DSkip-analyzer   # to skip analyzer compilation and index generation
 //!
 //! A nonzero command status fails the Zig build step. The final compiler is
 //! invoked with `exec`, so its status becomes the shell status directly.

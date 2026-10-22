@@ -8,8 +8,11 @@
 //!
 //! The plugin manager dlopen()s the .so, looks up the exported `load` and
 //! `unload` symbols (ABI contract in src/PluginAbi.zig) and calls them
-//! with a *const HostApi. Here load() prints "Hello, Plugin Manager!"
-//! into the server console and unload() prints "Bye, Plugin Manager!".
+//! with a *const HostApi. load() verifies the ABI version, then prints
+//! "Hello, Plugin Manager!" and unload() prints "Bye, Plugin Manager!".
+//! Both print via std.debug.print (stderr) - not the host logger; the
+//! `consolePrint` helper below is the logger-based path and is not
+//! called yet.
 
 const std = @import("std");
 const abi = @import("plugin-abi");

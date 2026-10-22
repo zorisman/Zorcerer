@@ -3,24 +3,16 @@
 //! Metamod:Source itself uses to get loaded, rather than substituting or
 //! LD_PRELOAD-wrapping server.so/engine.so.
 //!
-//! Changes in this revision: every engine-side index and version string
-//! now comes from exactly one place - codegen_generated/engine_indexes.zig,
-//! produced at build time by EngineIndexesGenerator.zig. Nothing in this
-//! file (or TF2EngineDemo.zig, or EngineVersions.zig) hand-maintains an
-//! index or a version string of its own any more. `load` also now makes
-//! the version check explicit: it compares the engine version the
-//! codegen's indices were generated for against the version that
-//! actually answered CreateInterface, and logs the result either way,
-//! rather than only ever implicitly relying on EngineVersions.detect
-//! having already enforced that by construction.
+//! Engine-side indices and version strings come from exactly one place:
+//! codegen_generated/engine_indexes.zig. That file is committed by hand;
+//! its producer, build/EngineIndexesGenerator.zig, is not wired into the
+//! build yet. Nothing in this file hand-maintains an index or a version
+//! string of its own.
 //!
-//! Also cleaned up here: the load_calls/unload_calls counters and the
-//! raw std.debug.print pointer dumps from the "LogPrint isn't firing"
-//! troubleshooting session are gone - that was diagnostic scaffolding for
-//! one specific investigation, not something to ship. The one piece of
-//! that session worth keeping permanently is the early, pre-LogPrint
-//! failure path being visible at all (see `debugWriteStderr` below) -
-//! everything else was temporary.
+//! Engine version detection in `load` is being reworked after
+//! src/analyzers/EngineVersions.zig was removed. Until that rewrite
+//! lands, some calls and inline comments below still refer to the
+//! deleted module and are not current.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -55,21 +47,16 @@
 //! verified-match treatment, even though it now comes from the codegen
 //! too (consistency, not safety).
 //!
-//! I could not compile-check this file myself (no Zig 0.16 toolchain,
-//! and obviously no TF2 dedicated server, available in this environment)
-//! - please build and load it on a listen/test server first, not
-//! production.
-//!
-//! Build as a shared library for x86-linux (32-bit - confirmed from the
-//! crash dump analyzed earlier). Drop the result at `<mod>/addons/<name>.so`
-//! alongside the matching myplugin.vdf, e.g. `tf/addons/zorcerer.so` +
-//! `tf/addons/zorcerer.vdf`. For fast iteration without restarting the
-//! server, the engine also supports loading/unloading a VSP interactively
-//! from the server console: `plugin_load addons/zorcerer` /
-//! `plugin_unload <index>` (index shown by `plugin_print`) - no .vdf
-//! needed while testing. Note `plugin_load` only works before a map is
-//! running (see the console-command discussion earlier) - the .vdf route
-//! is what actually loads this on a live server.
+//! Build with `zig build`: the result is zig-out/lib/zorcerer.so, built
+//! for the x86_64-linux-gnu target configured in build.zig. Drop the .so
+//! at `<mod>/addons/<name>.so` alongside a matching .vdf, e.g.
+//! `tf/addons/zorcerer.so` + `tf/addons/zorcerer.vdf`. For fast iteration
+//! without restarting the server, the engine also supports
+//! loading/unloading a VSP interactively from the server console:
+//! `plugin_load addons/zorcerer` / `plugin_unload <index>` (index shown
+//! by `plugin_print`) - no .vdf needed while testing. Note `plugin_load`
+//! only works before a map is running (see the console-command discussion
+//! earlier) - the .vdf route is what actually loads this on a live server.
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
@@ -117,10 +104,10 @@ fn load(
     _ = game_server_factory;
 
     const detection = EngineVersions.detect(interface_factory) catch {
-        // EngineVersions.detectOlderVersion is diagnostic-only - it does
-        // NOT give us indices to fall back on (see EngineVersions.zig).
-        // Finding a name here only changes *what gets logged*, never
-        // whether we proceed: we still refuse either way.
+        // This block still wires into the removed EngineVersions.zig and is
+        // being reworked (see the module doc-comment). What stays true
+        // regardless of the rewrite: a refusal here exits before any hook
+        // is installed, and the failure is reported without log_print.
         if (EngineVersions.detectOlderVersion(interface_factory)) |older| {
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(
@@ -138,18 +125,15 @@ fn load(
     engine = detection.engine;
     log_print = @ptrCast(VTableHooks.vtableOf(detection.engine)[Indexes.IVEngineServer.log_print]);
 
-    // The check this revision specifically adds: compare the engine
-    // version the codegen's indices were generated for against the
-    // version that actually answered CreateInterface, and say so in the
-    // log either way - rather than only ever relying on
-    // EngineVersions.detect having already enforced that match
-    // internally. Given detect()'s current (deliberately strict) design,
-    // `detection.engine_version` can only ever already equal
-    // `Indexes.interfaceversion_vengineserver` here - this can't actually
-    // fire today. It's still worth doing: it turns an invariant enforced
-    // by code elsewhere into something visible in the server's own log,
-    // and it's the one spot that would need to start doing real work if
-    // `detect` is ever loosened to accept more than one version string.
+    // The codegen's indices and version strings were generated from
+    // exactly one engine build: whatever CreateInterface actually
+    // answered when engine_indexes.zig was produced. Hooks whose
+    // positions came from those indices are only valid for an engine
+    // answering the same version string. Checking it here makes that
+    // invariant visible in the server's own log instead of leaving it
+    // implicit, and this is the one spot that must start doing real
+    // work if detection is ever loosened to accept more than one
+    // version string.
     if (!std.mem.eql(u8, detection.engine_version, Indexes.interfaceversion_vengineserver)) {
         logLine(
             "[MyLoader] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",

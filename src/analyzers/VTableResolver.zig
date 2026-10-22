@@ -1,9 +1,15 @@
 //! Finds a C++ class's vtable address at runtime, for the cases where
-//! there's no CreateInterface-exposed singleton to call
-//! VTableHooks.vtableOf on directly - e.g. entity classes like CTFPlayer,
+//! there's no CreateInterface-exposed singleton to call the hook library's
+//! `VTableHook.vtableOf` on directly - e.g. entity classes like CTFPlayer,
 //! which aren't reachable through any interface factory, only through a
-//! live instance you may not have yet. The result is exactly the `vtable:
-//! VTableHooks.VTable` value VtableHook.install needs.
+//! live instance you may not have yet. The result is exactly the
+//! `VTable` value that `VTableHook.VtableHook.install` consumes in the
+//! hook library ("hooks" build module, extern/zig-hooks/src/hooks/VTableHook.zig).
+//!
+//! Status: this file is currently not referenced by the build, and its
+//! `VTableHooks.zig` import below does not resolve - that import was
+//! never re-pointed at the hook library after the resolvers/→/analyzers
+//! move. Fix the import (and wire the module in) before using the code.
 //!
 //! Two strategies, tried in order by `resolve`:
 //!
@@ -43,21 +49,22 @@
 //! *** UNVERIFIED, LIKELY THE WEAKEST PART OF THIS FILE ***
 //! `readProcSelfMaps` is the one piece of this file that does blocking
 //! file I/O, which is exactly the area Zig 0.16 reworked most (the
-//! std.Io interface). I could not compile-check this against a real 0.16
+//! std.Io interface). It has never been built against a real 0.16
 //! toolchain, so if something here doesn't build, start by looking at
 //! that one function - the actual RTTI-chasing logic in `resolveViaRtti`
 //! only operates on plain byte slices and raw addresses, and doesn't
 //! depend on how you got the maps text into memory. If
-//! `std.fs.openFileAbsolute`/`File.read` don't match your toolchain,
-//! swap `readProcSelfMaps`'s body for whatever your project already uses
+//! `std.Io.Dir.openFileAbsolute`/`File.read` don't match your toolchain,
+//! swap `readProcSelfMaps`'s body for whatever the project already uses
 //! to read a file, or for a raw `std.os.linux.read`-based loop - either
 //! way, just hand `moduleRanges` the resulting text.
 //!
 //! Also note: dlsym/dlopen aren't raw syscalls (there's no such thing as
 //! a "dlopen syscall" - the dynamic linker implements them), so this file
-//! needs libc linked in, unlike the rest of this project so far. Since
-//! engine_adapter.cpp already pulls in libstdc++ (and transitively libc)
-//! for the C++ runtime, this shouldn't add a new practical dependency.
+//! needs libc linked in. The project already links libc into the `hooks`
+//! module (build.zig), and the C++ parts that use libstdc++
+//! (build/analyzers/VTableIndexAnalyzer.cpp) transitively pull libc in
+//! too, so this shouldn't add a new practical dependency.
 
 const std = @import("std");
 const VTableHooks = @import("VTableHooks.zig");

@@ -1,4 +1,6 @@
-//! Build-time generator for EngineIndexes.generated.zig.
+//! Build-time generator for src/codegen_generated/engine_indexes.zig.
+//! The generated file is currently committed by hand; no build step
+//! invokes this generator.
 //!
 //! Supported TOML-like forms:
 //!
