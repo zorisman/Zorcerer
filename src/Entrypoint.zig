@@ -75,7 +75,6 @@ const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
 const EngineVersions = @import("analyzers/EngineVersions.zig");
 const Indexes = @import("codegen_generated/engine_indexes.zig");
-const ZorcererCommand = @import("ZorcererCommand.zig");
 const Manager = @import("PluginManager.zig");
 
 const iface_ok: c_int = 0;
@@ -106,6 +105,12 @@ var engine: ?*anyopaque = null;
 
 const LogPrintFn = *const fn (engine: *anyopaque, msg: [*:0]const u8) callconv(.c) void;
 var log_print: ?LogPrintFn = null;
+
+/// Plugin manager singleton. load() wires the engine logger into it, then
+/// discovers/caches the plugin .so files under tf/addons/zorcerer/plugins/
+/// and runs each plugin's load() hook; unload() runs the unload() hooks
+/// again and releases everything (see src/PluginManager.zig).
+var plugin_manager = Manager.Manager.init();
 
 fn logLine(comptime fmt: []const u8, args: anytype) void {
     const e = engine orelse return;
@@ -183,12 +188,20 @@ fn load(
 
     logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
 
-    var manager = Manager.Manager.init();
-    defer manager.deinit();
-    const manifests: ?[]const Manager.Manifest = manager.readConfig() catch null;
+    // From here on the engine pointers are valid; hand them to the plugin
+    // manager as the way every scanned plugin prints into the server
+    // console, then discover and load the plugins.
+    plugin_manager.setLogger(engine.?, log_print.?);
+    plugin_manager.loadPlugins() catch |err| {
+        // A scan that ends badly can only leave zero plugins (loadPlugins
+        // unloads on the way out); the server load itself continues.
+        logLine("[MyLoader] plugin loading failed: {s}\n", .{@errorName(err)});
+    };
+
+    const manifests: ?[]const Manager.Manifest = plugin_manager.readConfig() catch null;
     if (manifests) |m| {
         for (m) |manifest| {
-            std.debug.print("\n{s}: {s}\n", .{manifest.id, manifest.version});
+            std.debug.print("\n{s}: {s}\n", .{ manifest.id, manifest.version });
         }
     }
 
@@ -198,6 +211,9 @@ fn load(
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
     logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
+    // Runs every active plugin's unload() and releases the caches; the
+    // manager itself stays reusable for a plugin_load/reload of ours.
+    plugin_manager.deinit();
     engine = null;
     log_print = null;
 }
