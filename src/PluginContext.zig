@@ -2,7 +2,7 @@
 //! and every plugin it loads.
 //!
 //! The file is shared by both sides of the dlopen() boundary: the manager
-//! imports it through the `plugin-abi` build module and plugin modules use
+//! imports it through the `plugin-context` build module and plugin modules use
 //! the same import, so these declarations stay identical everywhere.
 //!
 //! Every plugin exports the two symbols shown below with C linkage

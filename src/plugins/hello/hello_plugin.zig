@@ -7,7 +7,7 @@
 //!     tf/addons/zorcerer/plugins/hello/hello_plugin.so
 //!
 //! The plugin manager dlopen()s the .so, looks up the exported `load` and
-//! `unload` symbols (ABI contract in src/PluginAbi.zig) and calls them
+//! `unload` symbols (ABI contract in src/PluginContext.zig) and calls them
 //! with a *const HostApi. load() verifies the ABI version, then prints
 //! "Hello, Plugin Manager!" and unload() prints "Bye, Plugin Manager!".
 //! Both print via std.debug.print (stderr) - not the host logger; the
@@ -15,7 +15,7 @@
 //! called yet.
 
 const std = @import("std");
-const abi = @import("plugin-abi");
+const abi = @import("plugin-context");
 
 /// Sends one message through the logger the plugin manager configured.
 /// Does nothing when the host could not provide one.

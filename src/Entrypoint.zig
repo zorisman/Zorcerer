@@ -67,7 +67,7 @@ const VTableHooks = @import("hooks").VTableHook;
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
 const Log = @import("log");
-const abi = @import("plugin-abi");
+const abi = @import("plugin-context");
 
 pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
 

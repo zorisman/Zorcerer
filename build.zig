@@ -31,10 +31,10 @@ pub fn build(b: *std.Build) !void {
     });
 
     // ABI contract shared between the plugin manager and plugin modules
-    // (src/PluginAbi.zig). Each side imports it as "plugin-abi", so both
-    // compilations of the file stay identical.
-    const plugin_abi = b.addModule("plugin-abi", .{
-        .root_source_file = b.path("src/PluginAbi.zig"),
+    // (src/PluginContext.zig). Each side imports it as "plugin-context",
+    // so both compilations of the file stay identical.
+    const plugin_context = b.addModule("plugin-context", .{
+        .root_source_file = b.path("src/PluginContext.zig"),
     });
 
     // Simple Source SDK console logging for the manager's own messages
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    log.addImport("plugin-abi", plugin_abi);
+    log.addImport("plugin-context", plugin_context);
 
     const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) !void {
 
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
-    zorcerer.root_module.addImport("plugin-abi", plugin_abi);
+    zorcerer.root_module.addImport("plugin-context", plugin_context);
     zorcerer.root_module.addImport("log", log);
     zorcerer.out_filename = "zorcerer.so";
 
@@ -75,7 +75,7 @@ pub fn build(b: *std.Build) !void {
             .pic = true,
         }),
     });
-    hello_plugin.root_module.addImport("plugin-abi", plugin_abi);
+    hello_plugin.root_module.addImport("plugin-context", plugin_context);
     hello_plugin.out_filename = "hello_plugin.so";
 
     const zorcerer_tests = b.addTest(.{

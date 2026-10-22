@@ -1,6 +1,6 @@
 const std = @import("std");
 const toml = @import("toml");
-const abi = @import("plugin-abi");
+const abi = @import("plugin-context");
 const Log = @import("log");
 
 /// Plugin directory relative to the process working directory.
@@ -47,7 +47,7 @@ pub const Plugin = struct {
 /// (see plugins_directory and Plugin), caches them and calls each plugin's
 /// load(); unloadAll() reverses that for every plugin that became active,
 /// then releases the cache. Plugins only ever talk to the host through
-/// src/PluginAbi.zig, so no plugin-defined code needs direct links into the
+/// src/PluginContext.zig, so no plugin-defined code needs direct links into the
 /// process. A plugin is skipped (with a log line through the logger) when
 /// its directory cannot be opened, dlopen() fails or an export is missing.
 pub const Manager = struct {
@@ -193,7 +193,7 @@ pub const Manager = struct {
 
     /// Iterates the directories inside plugins_directory, opens every .so
     /// file directly inside them, looks up the plugin ABI's load()/unload()
-    /// exports (src/PluginAbi.zig), adds the library into the cache and
+    /// exports (src/PluginContext.zig), adds the library into the cache and
     /// calls its load(). Sketchy entities are skipped with a log line
     /// instead of aborting the whole scan; everything cached until then is
     /// unloaded on the way out if a fatal error aborts the scan.
