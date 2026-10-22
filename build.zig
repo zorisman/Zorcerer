@@ -37,6 +37,15 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/PluginAbi.zig"),
     });
 
+    // Simple Source SDK console logging for the manager's own messages
+    // (src/Log.zig).
+    const log = b.addModule("log", .{
+        .root_source_file = b.path("src/Log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log.addImport("plugin-abi", plugin_abi);
+
     const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
         .linkage = .dynamic,
@@ -51,6 +60,7 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.root_module.addImport("plugin-abi", plugin_abi);
+    zorcerer.root_module.addImport("log", log);
     zorcerer.out_filename = "zorcerer.so";
 
     // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed

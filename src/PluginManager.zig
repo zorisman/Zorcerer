@@ -1,6 +1,7 @@
 const std = @import("std");
 const toml = @import("toml");
 const abi = @import("plugin-abi");
+const Log = @import("log");
 
 /// Plugin directory relative to the process working directory.
 /// If srcds is launched from the server root, this usually starts with "tf/".
@@ -172,13 +173,16 @@ pub const Manager = struct {
         return owned_result;
     }
 
-    /// Captures how plugins send messages into the server console: an
-    /// opaque host context is paired with the print function that consumes
-    /// it (for Entrypoint.zig: the engine's IVEngineServer pointer together
-    /// with its LogPrint vtable entry). Must be called before loadPlugins()
-    /// for the scanned plugins to receive a logger.
+    /// Captures how the manager and every plugin send messages into the
+    /// server console: an opaque host context is paired with the print
+    /// function that consumes it (for Entrypoint.zig: the engine's
+    /// IVEngineServer pointer together with its LogPrint vtable entry).
+    /// The same sink is handed to the Log module for the manager's own
+    /// messages. Must be called before loadPlugins() for the scanned
+    /// plugins to receive a logger.
     pub fn setLogger(self: *@This(), context: *anyopaque, print: abi.Logger.PrintFn) void {
         self.logger = .{ .context = context, .print = print };
+        Log.setup(self.logger.?);
     }
 
     /// Builds the HostApi handed to plugin entry points. The returned
@@ -302,18 +306,12 @@ pub const Manager = struct {
         self.plugins.clearRetainingCapacity();
     }
 
-    /// Sends one message into the server console through the logger
-    /// captured by setLogger(); does nothing until there is one.
-    /// Mirrors Entrypoint.zig's logLine(): callers supply the trailing
-    /// "\n", and an overflowing message loses everything except a note.
+    /// Sends one message into the server console through the Source SDK
+    /// logging sink captured by setLogger() (via src/Log.zig); does
+    /// nothing until there is one. Callers supply the trailing "\n", and
+    /// an overflowing message loses everything except a note.
     fn logLine(self: *@This(), comptime fmt: []const u8, args: anytype) void {
-        const logger = self.logger orelse return;
-
-        var buf: [512]u8 = undefined;
-        const line: [:0]const u8 = if (std.fmt.bufPrintZ(&buf, fmt, args)) |formatted|
-            formatted
-        else |_|
-            "[zorcerer] (message too long to log)\n";
-        logger.print(logger.context, line.ptr);
+        _ = self;
+        Log.logLine(fmt, args);
     }
 };
