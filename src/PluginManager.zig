@@ -215,7 +215,7 @@ pub const Manager = struct {
             }
 
             var plugin_dir = root.openDir(io, dir.name, .{ .iterate = true }) catch |err| {
-                self.logLine("[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n", .{ plugins_directory, dir.name, @errorName(err) });
+                Log.logLine("[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n", .{ plugins_directory, dir.name, @errorName(err) });
                 continue;
             };
             defer plugin_dir.close(io);
@@ -239,20 +239,20 @@ pub const Manager = struct {
         errdefer self.allocator.free(path);
 
         var lib = std.DynLib.open(path) catch |err| {
-            self.logLine("[zorcerer] {s}: dlopen failed ({s}), skipping\n", .{ path, @errorName(err) });
+            Log.logLine("[zorcerer] {s}: dlopen failed ({s}), skipping\n", .{ path, @errorName(err) });
             return;
         };
 
         // Both exports are required: load() binds the plugin, and unload()
         // is what lets the manager ever release it again.
         const load_fn = lib.lookup(abi.LoadFn, "load") orelse {
-            self.logLine("[zorcerer] {s}: missing load() export, skipping\n", .{path});
+            Log.logLine("[zorcerer] {s}: missing load() export, skipping\n", .{path});
             lib.close();
             return;
         };
 
         const unload_fn = lib.lookup(abi.UnloadFn, "unload") orelse {
-            self.logLine("[zorcerer] {s}: missing unload() export, skipping\n", .{path});
+            Log.logLine("[zorcerer] {s}: missing unload() export, skipping\n", .{path});
             lib.close();
             return;
         };
@@ -273,7 +273,7 @@ pub const Manager = struct {
         var host = self.hostApi();
         const status = plugin.load(&host);
         if (status != 0) {
-            self.logLine("[zorcerer] {s}: load() returned {d}, not marked active\n", .{ plugin.path, status });
+            Log.logLine("[zorcerer] {s}: load() returned {d}, not marked active\n", .{ plugin.path, status });
             return;
         }
 
@@ -295,7 +295,7 @@ pub const Manager = struct {
                 plugin.active = false;
                 const status = plugin.unload(&host);
                 if (status != 0) {
-                    self.logLine("[zorcerer] {s}: unload() returned {d}\n", .{ plugin.path, status });
+                    Log.logLine("[zorcerer] {s}: unload() returned {d}\n", .{ plugin.path, status });
                 }
             }
 
@@ -304,14 +304,5 @@ pub const Manager = struct {
         }
 
         self.plugins.clearRetainingCapacity();
-    }
-
-    /// Sends one message into the server console through the Source SDK
-    /// logging sink captured by setLogger() (via src/Log.zig); does
-    /// nothing until there is one. Callers supply the trailing "\n", and
-    /// an overflowing message loses everything except a note.
-    fn logLine(self: *@This(), comptime fmt: []const u8, args: anytype) void {
-        _ = self;
-        Log.logLine(fmt, args);
     }
 };

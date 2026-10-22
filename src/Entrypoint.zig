@@ -60,9 +60,10 @@
 
 const std = @import("std");
 const VTableHooks = @import("hooks").VTableHook;
-const EngineVersions = @import("analyzers/EngineVersions.zig");
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
+const Log = @import("log");
+const abi = @import("plugin-abi");
 
 pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
 
@@ -97,33 +98,21 @@ var plugin_manager = Manager.Manager.init();
 
 fn load(
     this: *anyopaque,
-    interface_factory: EngineVersions.CreateInterfaceFn,
-    game_server_factory: EngineVersions.CreateInterfaceFn,
+    interface_factory: CreateInterfaceFn,
+    game_server_factory: CreateInterfaceFn,
 ) callconv(.c) bool {
     _ = this;
     _ = game_server_factory;
 
-    const detection = EngineVersions.detect(interface_factory) catch {
-        // This block still wires into the removed EngineVersions.zig and is
-        // being reworked (see the module doc-comment). What stays true
-        // regardless of the rewrite: a refusal here exits before any hook
-        // is installed, and the failure is reported without log_print.
-        if (EngineVersions.detectOlderVersion(interface_factory)) |older| {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &buf,
-                "[MyLoader] engine answered as {s}, but indices were generated for {s} - refusing to load\n",
-                .{ older, Indexes.interfaceversion_vengineserver },
-            ) catch "[MyLoader] engine is an older, recognized build, but indices don't match it - refusing to load\n";
-            debugWriteStderr(msg);
-        } else {
-            debugWriteStderr("[MyLoader] unrecognized engine build - refusing to load\n");
-        }
-        return false;
-    };
-
-    engine = detection.engine;
-    log_print = @ptrCast(VTableHooks.vtableOf(detection.engine)[Indexes.IVEngineServer.log_print]);
+    // Wiring for every log line below: the entrypoint logs only through
+    // the Log module, whose single routing point cannot work until the
+    // engine's IVEngineServer pointer and LogPrint vtable slot are
+    // captured as its Source SDK logging sink. This happens right after
+    // detection, before any decision is made, so that even the refusal
+    // messages below reach the server console. The same print function
+    // is handed to the plugin manager further down, though its own
+    // setLogger() would capture the identical sink for it.
+    Log.setup(.{ .context = engine.?, .print = print_fn });
 
     // The codegen's indices and version strings were generated from
     // exactly one engine build: whatever CreateInterface actually
@@ -135,23 +124,23 @@ fn load(
     // work if detection is ever loosened to accept more than one
     // version string.
     if (!std.mem.eql(u8, detection.engine_version, Indexes.interfaceversion_vengineserver)) {
-        logLine(
+        Log.logLine(
             "[MyLoader] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
             .{ Indexes.interfaceversion_vengineserver, detection.engine_version },
         );
         return false;
     }
 
-    logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
+    Log.logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
 
     // From here on the engine pointers are valid; hand them to the plugin
     // manager as the way every scanned plugin prints into the server
     // console, then discover and load the plugins.
-    plugin_manager.setLogger(engine.?, log_print.?);
+    plugin_manager.setLogger(engine.?, print_fn);
     plugin_manager.loadPlugins() catch |err| {
         // A scan that ends badly can only leave zero plugins (loadPlugins
         // unloads on the way out); the server load itself continues.
-        logLine("[MyLoader] plugin loading failed: {s}\n", .{@errorName(err)});
+        Log.logLine("[MyLoader] plugin loading failed: {s}\n", .{@errorName(err)});
     };
 
     const manifests: ?[]const Manager.Manifest = plugin_manager.readConfig() catch null;
@@ -166,12 +155,14 @@ fn load(
 
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
-    logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
+    Log.logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
     // Runs every active plugin's unload() and releases the caches; the
     // manager itself stays reusable for a plugin_load/reload of ours.
     plugin_manager.deinit();
     engine = null;
-    log_print = null;
+    // The Log module keeps the captured sink: the engine interface stays
+    // resident for the whole process lifetime, so it remains valid, and
+    // plugin_load/reload re-captures it in load() anyway.
 }
 
 fn pause(this: *anyopaque) callconv(.c) void {
@@ -189,7 +180,7 @@ fn getPluginDescription(this: *anyopaque) callconv(.c) [*:0]const u8 {
 
 fn levelInit(this: *anyopaque, map_name: [*:0]const u8) callconv(.c) void {
     _ = this;
-    logLine("[MyLoader] LevelInit: {s}\n", .{std.mem.span(map_name)});
+    Log.logLine("[MyLoader] LevelInit: {s}\n", .{std.mem.span(map_name)});
 }
 
 fn serverActivate(
@@ -200,7 +191,7 @@ fn serverActivate(
 ) callconv(.c) void {
     _ = this;
     _ = edict_list;
-    logLine("[MyLoader] ServerActivate: {d} edicts, {d} max clients\n", .{ edict_count, client_max });
+    Log.logLine("[MyLoader] ServerActivate: {d} edicts, {d} max clients\n", .{ edict_count, client_max });
 }
 
 fn gameFrame(this: *anyopaque, simulating: bool) callconv(.c) void {
@@ -210,7 +201,7 @@ fn gameFrame(this: *anyopaque, simulating: bool) callconv(.c) void {
 
 fn levelShutdown(this: *anyopaque) callconv(.c) void {
     _ = this;
-    logLine("[MyLoader] LevelShutdown\n", .{});
+    Log.logLine("[MyLoader] LevelShutdown\n", .{});
 }
 
 /// Placeholder for every method this foundation doesn't implement yet.
