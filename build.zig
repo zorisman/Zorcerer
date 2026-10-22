@@ -30,6 +30,13 @@ pub fn build(b: *std.Build) !void {
         .pic = true
     });
 
+    // ABI contract shared between the plugin manager and plugin modules
+    // (src/PluginAbi.zig). Each side imports it as "plugin-abi", so both
+    // compilations of the file stay identical.
+    const plugin_abi = b.addModule("plugin-abi", .{
+        .root_source_file = b.path("src/PluginAbi.zig"),
+    });
+
     const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
         .linkage = .dynamic,
@@ -43,7 +50,23 @@ pub fn build(b: *std.Build) !void {
 
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
+    zorcerer.root_module.addImport("plugin-abi", plugin_abi);
     zorcerer.out_filename = "zorcerer.so";
+
+    // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed
+    // and needs no libc of its own.
+    const hello_plugin = b.addLibrary(.{
+        .name = "hello-plugin",
+        .linkage = .dynamic,
+        .root_module = b.addModule("hello-plugin", .{
+            .root_source_file = b.path("src/plugins/hello/hello_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    hello_plugin.root_module.addImport("plugin-abi", plugin_abi);
+    hello_plugin.out_filename = "hello_plugin.so";
 
     const zorcerer_tests = b.addTest(.{
         .name = "zorcerer-tests",
@@ -67,6 +90,7 @@ pub fn build(b: *std.Build) !void {
     compile_modules_step.dependOn(&zorcerer_tests.step);
     compile_modules_step.dependOn(&hooks_tests.step);
     compile_modules_step.dependOn(&toml_tests.step);
+    compile_modules_step.dependOn(&hello_plugin.step);
 
     const run_zorcerer_tests = b.addRunArtifact(zorcerer_tests);
     run_zorcerer_tests.step.dependOn(compile_modules_step);
@@ -109,4 +133,9 @@ pub fn build(b: *std.Build) !void {
     const install_zorcerer = b.addInstallArtifact(zorcerer, .{});
     install_zorcerer.step.dependOn(tests_step);
     b.getInstallStep().dependOn(&install_zorcerer.step);
+
+    // Same tests gate for the example plugin (mirrors the comment above).
+    const install_hello_plugin = b.addInstallArtifact(hello_plugin, .{});
+    install_hello_plugin.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_hello_plugin.step);
 }
