@@ -2,6 +2,7 @@ const std = @import("std");
 const toml = @import("toml");
 const abi = @import("root.zig").abi;
 const Log = @import("root.zig").Log;
+const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 
 /// Plugin directory relative to the process working directory.
 /// If srcds is launched from the server root, this usually starts with "tf/".
@@ -204,6 +205,15 @@ pub const Manager = struct {
 
         errdefer self.unloadAll();
 
+        // Plugin configurations parsed from each plugin directory's
+        // manifest.toml, in filesystem discovery order. The list holds
+        // owner-allocated pointers, but their manifest strings are owned by
+        // PluginConfiguration.parseConfig()'s internal arena, which stays
+        // valid for the process' lifetime.
+        // TODO: retain this list on the manager and release it in unloadAll()/
+        // deinit(); for now it is only filled so the manifest state is read.
+        var managed_plugins: std.ArrayList(*PluginConfiguration) = .empty;
+
         const io = self.threaded_io.io();
         var root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
         defer root.close(io);
@@ -219,6 +229,31 @@ pub const Manager = struct {
                 continue;
             };
             defer plugin_dir.close(io);
+
+            // Plugins that carry a manifest.toml are managed: parse the
+            // manifest and remember its configuration. A directory without
+            // a readable manifest stays unmanaged and is only picked up
+            // through its .so file(s).
+            const manifest_name = "manifest.toml";
+
+            const manifest_toml = plugin_dir.readFileAlloc(io, manifest_name, self.allocator, .unlimited) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => {
+                    Log.logLine("[zorcerer] {s}/{s}: reading {s} failed ({s}), skipping\n", .{ plugins_directory, dir.name, manifest_name, @errorName(err) });
+                    continue;
+                },
+            };
+            defer self.allocator.free(manifest_toml);
+
+            const configuration = PluginConfiguration.parseConfig(manifest_toml) catch |err| {
+                Log.logLine("[zorcerer] {s}/{s}: {s} parse failed ({s}), plugin skipped\n", .{ plugins_directory, dir.name, manifest_name, @errorName(err) });
+                continue;
+            };
+
+            const configuration_ptr = try self.allocator.create(PluginConfiguration);
+            configuration_ptr.* = configuration;
+
+            try managed_plugins.append(self.allocator, configuration_ptr);
 
             var files = plugin_dir.iterate();
             while (try files.next(io)) |file| {
