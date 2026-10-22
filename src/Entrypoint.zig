@@ -9,10 +9,14 @@
 //! build yet. Nothing in this file hand-maintains an index or a version
 //! string of its own.
 //!
-//! Engine version detection in `load` is being reworked after
-//! src/analyzers/EngineVersions.zig was removed. Until that rewrite
-//! lands, some calls and inline comments below still refer to the
-//! deleted module and are not current.
+//! Engine version handling in `load` no longer needs the removed
+//! src/analyzers/EngineVersions.zig: the engine server interface is
+//! probed directly against the version strings the codegen module knows
+//! (see engine_interface_versions), and the version check in load()
+//! refuses every build whose answered string does not equal the one the
+//! codegen indices were generated for. That leaves the version probe
+//! reduced to "which string answered" - the part the removed module used
+//! to own.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -80,6 +84,19 @@ const plugin_interface_versions = [_][]const u8{
 
 const Slot = ?*const anyopaque;
 
+/// IVEngineServer interface version strings the engine module might
+/// answer with, newest first. Both these strings and the LogPrint slot
+/// index that logPrintOf() consumes come from the same codegen module,
+/// so engine probing and index use agree on which engine build the slot
+/// layout was recorded for. Order: the current build answers with the
+/// exact string the codegen generated for, while older recognized builds
+/// surface only through the fallback constants.
+const engine_interface_versions = [_][]const u8{
+    Indexes.interfaceversion_vengineserver,
+    Indexes.interfaceversion_vengineserver_version_22,
+    Indexes.interfaceversion_vengineserver_version_21,
+};
+
 /// An IServerPluginCallbacks instance is just a vptr as far as the engine
 /// is concerned - no RTTI header to worry about, since nothing does
 /// dynamic_cast/typeid on a plugin interface the engine loaded generically.
@@ -96,6 +113,49 @@ var engine: ?*anyopaque = null;
 /// again and releases everything (see src/PluginManager.zig).
 var plugin_manager = Manager.Manager.init();
 
+/// Pulls the engine's Source SDK console logging function out of a live
+/// IVEngineServer instance. `engine_interface` is the interface pointer
+/// the engine module factory probe in load() resolved; zig-hooks reads
+/// the virtual method table behind it, the slot that
+/// codegen_generated/engine_indexes.zig records under
+/// `IVEngineServer.log_print` is selected, and its contents are
+/// reinterpreted as `abi.Logger.PrintFn` - the signature that matches
+/// the LogPrint ABI that index was produced for (this pointer first, then
+/// one zero-terminated line).
+/// Returns the print function, or null when the recorded slot holds no
+/// entry: the running engine then does not match the index layout that
+/// every hook installation further down load() relies on.
+fn logPrintOf(engine_interface: *anyopaque) ?abi.Logger.PrintFn {
+    const slot = VTableHooks.vtableOf(engine_interface)[Indexes.IVEngineServer.log_print];
+    return @ptrCast(slot orelse return null);
+}
+
+test "logPrintOf resolves the slot the codegen recorded for LogPrint" {
+    const fake_log_print: abi.Logger.PrintFn = struct {
+        fn print(context: *anyopaque, message: [*:0]const u8) callconv(.c) void {
+            _ = context;
+            _ = message;
+        }
+    }.print;
+
+    // A fake IVEngineServer-shaped object: the first member is the vtable
+    // pointer, and enough trailing slots exist to reach the recorded
+    // LogPrint index.
+    var slots = [_]Slot{null} ** (Indexes.IVEngineServer.log_print + 1);
+    slots[Indexes.IVEngineServer.log_print] = @ptrCast(fake_log_print);
+    var fake = extern struct { vptr: [*]const Slot }{ .vptr = &slots };
+
+    const resolved = logPrintOf(@ptrCast(&fake)).?;
+    try std.testing.expectEqual(@intFromPtr(fake_log_print), @intFromPtr(resolved));
+}
+
+test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
+    var slots = [_]Slot{null} ** (Indexes.IVEngineServer.log_print + 1);
+    var fake = extern struct { vptr: [*]const Slot }{ .vptr = &slots };
+
+    try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
+}
+
 fn load(
     this: *anyopaque,
     interface_factory: CreateInterfaceFn,
@@ -104,42 +164,62 @@ fn load(
     _ = this;
     _ = game_server_factory;
 
-    // Wiring for every log line below: the entrypoint logs only through
-    // the Log module, whose single routing point cannot work until the
-    // engine's IVEngineServer pointer and LogPrint vtable slot are
-    // captured as its Source SDK logging sink. This happens right after
-    // detection, before any decision is made, so that even the refusal
-    // messages below reach the server console. The same print function
-    // is handed to the plugin manager further down, though its own
-    // setLogger() would capture the identical sink for it.
+    // Extracting the Source engine's console logging function, in three
+    // steps:
+    //   1. Get the engine interface itself out of the engine: probe the
+    //      engine module's CreateInterface factory with the IVEngineServer
+    //      version strings the codegen knows (newest first) and remember
+    //      the string that actually answered.
+    //   2. Receive the LogPrint pointer out of that interface via
+    //      logPrintOf(), which picks the virtual method table slot the
+    //      codegen recorded under IVEngineServer.log_print.
+    //   3. Capture both in the Log module as its Source SDK logging sink,
+    //      before any load decision is made, so even the refusal messages
+    //      below reach the server console. The same print function is
+    //      handed to the plugin manager further down.
+    //
+    // Only a matching engine build is fully trustworthy: for any refused
+    // build the single log call in the refusal path may go through a slot
+    // whose meaning shifted with the engine version - the accepted
+    // trade-off for being able to report the refusal at all. Without any
+    // answered engine build there is nothing to extract the logger from
+    // and no working channel to report that fact through; the load is
+    // refused immediately.
+    var probe_version_buf: [32]u8 = undefined;
+    const engine_version: []const u8 = version: {
+        for (engine_interface_versions) |requested_version| {
+            const engine_module_name = std.fmt.bufPrintZ(
+                &probe_version_buf,
+                "{s}",
+                .{requested_version},
+            ) catch break :version "";
+            engine = interface_factory(engine_module_name.ptr, null);
+
+            if (engine != null) {
+                break :version requested_version;
+            }
+        }
+        break :version "";
+    };
+    if (engine_version.len == 0) {
+        return false;
+    }
+
+    const print_fn = logPrintOf(engine.?) orelse return false;
     Log.setup(.{ .context = engine.?, .print = print_fn });
 
-    // The codegen's indices and version strings were generated from
-    // exactly one engine build: whatever CreateInterface actually
-    // answered when engine_indexes.zig was produced. Hooks whose
-    // positions came from those indices are only valid for an engine
-    // answering the same version string. Checking it here makes that
-    // invariant visible in the server's own log instead of leaving it
-    // implicit, and this is the one spot that must start doing real
-    // work if detection is ever loosened to accept more than one
-    // version string.
-    if (!std.mem.eql(u8, detection.engine_version, Indexes.interfaceversion_vengineserver)) {
+    if (!std.mem.eql(u8, engine_version, Indexes.interfaceversion_vengineserver)) {
         Log.logLine(
             "[MyLoader] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
-            .{ Indexes.interfaceversion_vengineserver, detection.engine_version },
+            .{ Indexes.interfaceversion_vengineserver, engine_version },
         );
         return false;
     }
 
-    Log.logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{detection.engine_version});
+    Log.logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{engine_version});
 
-    // From here on the engine pointers are valid; hand them to the plugin
-    // manager as the way every scanned plugin prints into the server
-    // console, then discover and load the plugins.
     plugin_manager.setLogger(engine.?, print_fn);
     plugin_manager.loadPlugins() catch |err| {
-        // A scan that ends badly can only leave zero plugins (loadPlugins
-        // unloads on the way out); the server load itself continues.
         Log.logLine("[MyLoader] plugin loading failed: {s}\n", .{@errorName(err)});
     };
 
