@@ -1,7 +1,7 @@
 const std = @import("std");
 const toml = @import("toml");
-const abi = @import("plugin-context");
-const Log = @import("log");
+const abi = @import("root.zig").abi;
+const Log = @import("root.zig").Log;
 
 /// Plugin directory relative to the process working directory.
 /// If srcds is launched from the server root, this usually starts with "tf/".
