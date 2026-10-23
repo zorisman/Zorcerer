@@ -20,6 +20,7 @@
 - Do not access external services, use the network, install software, or modify the host system unless explicitly authorized.
 - Do not initialize, update, or recursively download Git submodules unless explicitly requested.
 - Do not assume that permission to inspect a resource also grants permission to modify or execute it.
+- Use .tmp directory in the repository root for temporary files instead of /tmp.
 
 ## 3. Change Authorization
 
@@ -126,7 +127,7 @@ For implementation tasks, report:
 - Which files were modified.
 - Which checks were actually executed and their results.
 - Any remaining risks, assumptions, or work that requires the user's decision.
-- Give a git commit suggestion.
+- Make a git commit on changes.
 
 Keep the report concise and technically precise. Never claim completion beyond what the evidence supports.
 
