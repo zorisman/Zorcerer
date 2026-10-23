@@ -16,17 +16,44 @@ const ClassConfig = struct {
     methods: []const []const u8,
 };
 
+/// One `[[const]]` query: resolves selector constants from one header.
+/// Each entry in `names` names either an object-like `#define` macro or a
+/// namespace-scope const/constexpr variable whose definition lives in
+/// `header` itself; a lone `"*"` selects every constant of the header.
+const ConstConfig = struct {
+    header: []const u8,
+    names: []const []const u8,
+};
+
+/// One `[[enum]]` query: resolves enumerator values of one enum type
+/// found under `header` (possibly nested; `name` may be a qualified
+/// name like `Outer::Kind`). Each entry in `enumerators` names one
+/// enumerator of that enum; a lone `"*"` selects all of them.
+const EnumConfig = struct {
+    header: []const u8,
+    /// Plain enum type name, without the `enum::` target decoration
+    /// (the adapter adds it when building the analyzer target token).
+    name: []const u8,
+    enumerators: []const []const u8,
+};
+
 const AnalyzerConfig = struct {
     root: RootConfig,
-    class: []const ClassConfig,
+    class: []const ClassConfig = &.{},
+    @"const": []const ConstConfig = &.{},
+    @"enum": []const EnumConfig = &.{},
 };
 
 pub const QueryInfo = struct {
     header_path: []const u8,
+    /// Analyzer target token, verbatim: a class name, `"enum::<Enum>"`,
+    /// or the bare `"const::"`.
     name: []const u8,
-    /// Method/macro selector tokens, passed to the analyzer verbatim
-    /// (a `const!` query's selectors are macro names, not methods).
+    /// Selector tokens (methods or enumerator names, macro names, or a
+    /// lone `*`), passed to the analyzer verbatim.
     methods: []const []const u8,
+    /// Whether the query is a `const::` constants query (its selectors
+    /// are macro/constant names, not methods or enumerators).
     is_const: bool,
 };
 
@@ -148,8 +175,13 @@ fn appendIncludeArg(
 }
 
 /// Reads an analyzer TOML configuration and prepares the analyzer's argv for
-/// one invocation per query domain (see `AnalyzerDomain`). The returned value
-/// owns its memory and must be released with `PreparedAnalyzerArgs.deinit()`.
+/// one invocation per query domain (see `AnalyzerDomain`). The configuration
+/// carries a `[[root]]` table with the SDK path plus `[[class]]`, `[[const]]`,
+/// and `[[enum]]` query tables; all of them are optional but at least one
+/// query must be present.
+///
+/// The returned value owns its memory and must be released with
+/// `PreparedAnalyzerArgs.deinit()`.
 pub fn prepareAnalyzerArgs(io: std.Io, toml_path: []const u8) !PreparedAnalyzerArgs {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -163,47 +195,39 @@ pub fn prepareAnalyzerArgs(io: std.Io, toml_path: []const u8) !PreparedAnalyzerA
     const config = parsed.value;
 
     if (config.root.path.len == 0) return error.EmptySdkRootPath;
-    if (config.class.len == 0) return error.NoAnalyzerQueries;
+    if (config.class.len == 0 and config.@"const".len == 0 and
+        config.@"enum".len == 0) return error.NoAnalyzerQueries;
 
     const domain_count = @typeInfo(AnalyzerDomain).@"enum".fields.len;
     var domain_indices: [domain_count]std.ArrayList(QueryInfo) = .{ .empty, .empty, .empty };
 
     // First pass: validate every query and bucket it into its domain.
+    // `[[class]]` targets are taken verbatim; `[[const]]` queries share
+    // the bare `const::` target whose selectors each name their own
+    // constant; `[[enum]]` target names get the `enum::` decoration here.
     for (config.class) |query| {
-        if (query.header.len == 0 or query.name.len == 0)
-            return error.EmptyQueryField;
-        if (query.methods.len == 0)
-            return error.QueryHasNoMethods;
-
-        const full_header_path = try makeJoinedPath(alloc, config.root.path, query.header);
-        if (containsUnsupportedQueryChar(full_header_path) or containsUnsupportedQueryChar(query.name))
-            return error.UnsupportedQueryToken;
-
-        for (query.methods) |method| {
-            if (method.len == 0 or containsUnsupportedQueryChar(method))
-                return error.UnsupportedQueryToken;
-        }
-
-        const is_const = std.mem.eql(u8, query.name, "const!");
-        if (!is_const and std.mem.eql(u8, query.name, "*"))
+        if (std.mem.eql(u8, query.name, "*"))
             return error.InvalidClassName;
+        // The pre-enum-grammar sentinel; sending it would now make the
+        // analyzer parse it as a literal class name.
+        if (std.mem.eql(u8, query.name, "const!"))
+            return error.InvalidClassName;
+        try bucketQuery(alloc, config.root.path, &domain_indices,
+            query.header, query.name, query.methods, false);
+    }
 
-        var has_wildcard = false;
-        for (query.methods) |method| {
-            if (std.mem.eql(u8, method, "*")) has_wildcard = true;
-        }
-        if (has_wildcard and query.methods.len != 1)
-            return error.InvalidWildcardUsage;
+    for (config.@"const") |query|
+        try bucketQuery(alloc, config.root.path, &domain_indices,
+            query.header, "const::", query.names, true);
 
-        try domain_indices[@intFromEnum(domainForHeaderPath(query.header))].append(
-            alloc,
-            .{
-                .header_path = full_header_path,
-                .name = query.name,
-                .methods = query.methods,
-                .is_const = is_const,
-            },
-        );
+    for (config.@"enum") |query| {
+        // `enum::` is added by this adapter; a name that already carries
+        // it would double-decorate the analyzer target token.
+        if (std.mem.startsWith(u8, query.name, "enum::") or
+            std.mem.eql(u8, query.name, "*")) return error.InvalidEnumName;
+        const target = try std.fmt.allocPrint(alloc, "enum::{s}", .{query.name});
+        try bucketQuery(alloc, config.root.path, &domain_indices,
+            query.header, target, query.enumerators, false);
     }
 
     var domain_runs: std.ArrayList(AnalyzerRun) = .empty;
@@ -223,6 +247,69 @@ pub fn prepareAnalyzerArgs(io: std.Io, toml_path: []const u8) !PreparedAnalyzerA
         .arena = arena,
         .runs = owned_runs,
     };
+}
+
+/// Validates one query table and appends it to the bucket of the domain
+/// its header belongs to (see `AnalyzerDomain`).
+///
+/// The same validation applies to every query kind: non-empty header and
+/// target, at least one selector, no selector/target/header token that
+/// the analyzer's brace-set grammar cannot carry (`QueryInfo.methods`
+/// holds the selectors regardless of kind), and `"*"` accepted only as
+/// the sole selector.
+///
+/// \param alloc arena allocator the appended `QueryInfo` borrows from.
+/// \param root_path SDK root the `header` is resolved against.
+/// \param domain_indices one bucket per `AnalyzerDomain` value, filled
+///                       in `@intFromEnum` order.
+/// \param header SDK-relative header path of the query.
+/// \param target analyzer target token, already decorated (`enum::<Name>`
+///               or bare `const::`) where applicable.
+/// \param selectors method/constant/enumerator selectors, verbatim.
+/// \param is_const true for `const::` queries.
+/// \returns query errors (`error.EmptyQueryField`,
+///          `error.QueryHasNoMethods`, `error.UnsupportedQueryToken`,
+///          `error.InvalidWildcardUsage`) on invalid input; allocation
+///          errors propagate.
+fn bucketQuery(
+    alloc: Allocator,
+    root_path: []const u8,
+    domain_indices: *[3]std.ArrayList(QueryInfo),
+    header: []const u8,
+    target: []const u8,
+    selectors: []const []const u8,
+    is_const: bool,
+) !void {
+    if (header.len == 0 or target.len == 0)
+        return error.EmptyQueryField;
+    if (selectors.len == 0)
+        return error.QueryHasNoMethods;
+
+    const full_header_path = try makeJoinedPath(alloc, root_path, header);
+    if (containsUnsupportedQueryChar(full_header_path) or containsUnsupportedQueryChar(target))
+        return error.UnsupportedQueryToken;
+
+    for (selectors) |selector| {
+        if (selector.len == 0 or containsUnsupportedQueryChar(selector))
+            return error.UnsupportedQueryToken;
+    }
+
+    var has_wildcard = false;
+    for (selectors) |selector| {
+        if (std.mem.eql(u8, selector, "*")) has_wildcard = true;
+    }
+    if (has_wildcard and selectors.len != 1)
+        return error.InvalidWildcardUsage;
+
+    try domain_indices[@intFromEnum(domainForHeaderPath(header))].append(
+        alloc,
+        .{
+            .header_path = full_header_path,
+            .name = target,
+            .methods = selectors,
+            .is_const = is_const,
+        },
+    );
 }
 
 fn appendArgsFrom(
