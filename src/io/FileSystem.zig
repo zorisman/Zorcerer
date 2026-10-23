@@ -443,6 +443,20 @@ pub const FlushError = error{
     FlushFailed,
 };
 
+/// Errors of `File.remove()`.
+pub const RemoveError = error{
+    /// The path's permission set (see `checkPermission`) does not grant
+    /// write access, which deleting a file requires.
+    PermissionDenied,
+    /// The path's scheme has no removal backend: `game://` content is
+    /// read-only by policy and the bound engine `Abi` exposes no remove
+    /// method, and hand-built paths outside the plugin root are refused.
+    OperationNotAllowed,
+    /// The `std.Io` backend could not delete the file (for example it does
+    /// not exist, or the OS refused the operation).
+    RemoveFailed,
+};
+
 // --- Unified file ------------------------------------------------------------
 
 /// A file opened through the backend selected by the path's scheme
@@ -497,6 +511,30 @@ pub const File = union(enum) {
             .engine => |*f| f.close(),
             .host => |*f| f.close(),
         }
+    }
+
+    /// Deletes the file `path` without opening it first.
+    ///
+    /// Deleting requires write access, so the path's permission set is
+    /// enforced before the backend is asked; see `HostFile.remove()` for
+    /// the host-side checks. This is a whole-path operation, not a method
+    /// on an open file: `path` does not have to correspond to a `File`
+    /// currently open through this module.
+    ///
+    /// `.plugin` paths are removed through `std.Io`. `.game` paths are
+    /// refused with `error.OperationNotAllowed`: game content is read-only
+    /// by policy and the bound engine `Abi` has no remove method, so there
+    /// is no engine-side delete to call.
+    ///
+    /// Errors: `error.PermissionDenied` when `path` is not writable,
+    /// `error.OperationNotAllowed` for `.game` paths or paths outside the
+    /// configured plugin root, and `error.RemoveFailed` when the host
+    /// refused the deletion.
+    pub fn remove(io: std.Io, path: ZorcererPath) RemoveError!void {
+        return switch (path.scheme) {
+            .game => error.OperationNotAllowed,
+            .plugin => HostFile.remove(io, path),
+        };
     }
 
     /// Reads the next chunk, reporting how many bytes landed in `buffer`
@@ -1071,6 +1109,32 @@ pub const HostFile = struct {
     /// `Writer` buffer must be flushed there first.
     pub fn flush(self: *const HostFile) FlushError!void {
         self.file.sync(self.io) catch return error.FlushFailed;
+    }
+
+    /// Deletes `path` through `std.Io` (the host OS filesystem).
+    ///
+    /// Deleting requires write access, so the path's permission set is
+    /// enforced first; only `.plugin`-scheme paths strictly under the
+    /// configured `zorcerer_root` are accepted (the root itself is not a
+    /// file), everything else is refused so hand-built paths cannot escape
+    /// the plugin tree.
+    ///
+    /// This is a static operation: no file needs to be open. It deletes one
+    /// existing file and does not recurse into directories.
+    ///
+    /// Errors: `error.PermissionDenied` when the path is read-only,
+    /// `error.OperationNotAllowed` for non-`.plugin` or out-of-root paths,
+    /// and `error.RemoveFailed` when the OS refused the deletion (missing
+    /// file, directory, or insufficient OS permission).
+    pub fn remove(io: std.Io, path: ZorcererPath) RemoveError!void {
+        if (path.scheme != .plugin) return error.OperationNotAllowed;
+        try checkPermission(path, .write);
+
+        const root = zorcerer_root orelse return error.OperationNotAllowed;
+        if (relativeUnder(root, path.absolute_path, true) == null)
+            return error.OperationNotAllowed;
+
+        std.Io.Dir.deleteFileAbsolute(io, path.absolute_path) catch return error.RemoveFailed;
     }
 
     /// Streaming, buffered reader borrowing an open host file: `buffer`
@@ -2321,4 +2385,29 @@ test "Directory routes plugin:// through std.Io iteration" {
     }
     try std.testing.expect(found_file);
     try std.testing.expect(found_nested);
+}
+
+test "File.remove deletes a plugin:// file and refuses game:// paths" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const plugin_path = try parsePath(&plugin_ctx, "plugin://removable.dat");
+
+    var file = try File.open(test_io, null, plugin_path, .write);
+    try file.writeAll("temporary");
+    file.close();
+
+    try File.remove(test_io, plugin_path);
+
+    // The file is gone: reopening it for reading now fails.
+    try std.testing.expectError(error.OpenFailed, File.open(test_io, null, plugin_path, .read));
+
+    // game:// is read-only by policy: no engine delete is attempted, and
+    // the bound engine ABI has no remove method either.
+    const saved_game_root = game_root;
+    defer game_root = saved_game_root;
+    setGameRoot(test_game_root);
+    const game_path = try parsePath(&plugin_ctx, "game://materials/readme.txt");
+    try std.testing.expectError(error.OperationNotAllowed, File.remove(test_io, game_path));
 }

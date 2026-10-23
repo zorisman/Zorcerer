@@ -51,6 +51,19 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/PluginContext.zig"),
     });
 
+    // Plugin-facing filesystem API (src/io/FileSystem.zig). Example plugins
+    // live outside src/ and cannot import it by file path for the same
+    // reason as plugin-context, so it is exposed as a module. Resolving
+    // URI schemes needs the same plugin-configuration module the manager
+    // uses, hence the import below.
+    const zorcerer_filesystem = b.addModule("zorcerer-filesystem", .{
+        .root_source_file = b.path("src/io/FileSystem.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    zorcerer_filesystem.addImport("plugin-configuration", plugin_configuration);
+
     const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
         .linkage = .dynamic,
@@ -80,6 +93,7 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     hello_plugin.root_module.addImport("plugin-context", plugin_context);
+    hello_plugin.root_module.addImport("zorcerer-filesystem", zorcerer_filesystem);
     hello_plugin.out_filename = "hello_plugin.so";
 
     const zorcerer_tests = b.addTest(.{
