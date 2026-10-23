@@ -137,14 +137,32 @@ pub const AnalyzerOutput = struct {
     }
 };
 
-const TomlEntry = struct {
+/// One `key = value` pair in a generated `[[...]]` row's body. `value`
+/// is already a TOML literal, classified or quoted by the row builder.
+const TomlField = struct {
     key: []const u8,
     value: []const u8,
 };
 
-const TomlSection = struct {
-    name: []const u8,
-    entries: std.ArrayList(TomlEntry) = .empty,
+/// One generated `[[<header>]]` array-of-tables row of `intoToml`'s
+/// output. Consecutive rows sharing a header accumulate into the same
+/// TOML array element sequence, so output rows never need key-renaming
+/// deduplication.
+///
+/// Rows are typed by the query they were built from:
+/// - class vtable index rows: `usize` value, `[[<class>::<method>]]`.
+/// - constants: `integer`, `boolean`, `float`, or `string` value,
+///   `[[<header-path>::<const-name>]]`.
+/// - enumerators: one row per enumerator under `[[<enum-name>]]`, the
+///   `name` field carrying the enumerator, the value an `integer`.
+const TomlRow = struct {
+    /// Table-array header without brackets, e.g. `CBaseEntity::Spawn`,
+    /// `public/eiface.h::INTERFACEVERSION_VENGINESERVER`, or a plain
+    /// enum type name (`IN_BUTTONS`).
+    header: []const u8,
+    /// Ordered body fields (`type`, `value`, and for enumerators
+    /// `name` first).
+    fields: std.ArrayList(TomlField) = .empty,
 };
 
 
@@ -517,52 +535,74 @@ fn appendTomlBasicString(list: *std.ArrayList(u8), alloc: Allocator, value: []co
     try list.append(alloc, '"');
 }
 
-fn findOrCreateSection(
-    sections: *std.ArrayList(TomlSection),
-    alloc: Allocator,
-    name: []const u8,
-) !*TomlSection {
-    for (sections.items) |*section| {
-        if (std.mem.eql(u8, section.name, name)) return section;
-    }
+/// Representative data types of constant values, as recorded in each
+/// row's `type` field.
+const ConstantKind = enum {
+    integer,
+    boolean,
+    float,
+    string,
+};
 
-    try sections.append(alloc, .{
-        .name = try alloc.dupe(u8, name),
-    });
-    return &sections.items[sections.items.len - 1];
+/// Classifies one analyzer-reported constant literal (`macroValueAsToml`
+/// or `apValueAsToml` output) into its representative data type.
+///
+/// Quoted text is a `string`, `true`/`false` is `boolean`, anything that
+/// parses as an integer (including TOML's `0x`/`0o`/`0b` prefixes) is
+/// `integer`, anything else that parses as a float is `float`.
+///
+/// \param literal the analyzer's RHS text, trimmed.
+/// \returns the kind, or null when the literal is not a recognisable
+///          TOML value (the caller must fail with
+///          `error.UnexpectedAnalyzerOutput`).
+///
+/// Limitation: a whole-number float (e.g. `4.0` printed as `4` by
+/// `apValueAsToml`) is indistinguishable from an integer constant once
+/// printed, and is reported as `integer`.
+fn constantLiteralKind(literal: []const u8) ?ConstantKind {
+    if (literal.len >= 2 and literal[0] == '"' and literal[literal.len - 1] == '"') {
+        return .string;
+    }
+    if (std.mem.eql(u8, literal, "true") or std.mem.eql(u8, literal, "false")) {
+        return .boolean;
+    }
+    if (std.fmt.parseInt(i128, literal, 0)) |parsed_int| {
+        _ = parsed_int;
+        return .integer;
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, literal)) |parsed_float| {
+        _ = parsed_float;
+        return .float;
+    } else |_| {}
+    return null;
 }
 
-fn hasKey(section: *const TomlSection, key: []const u8) bool {
-    for (section.entries.items) |entry| {
-        if (std.mem.eql(u8, entry.key, key)) return true;
-    }
-    return false;
+/// Wraps \p value as a TOML basic string literal.
+///
+/// \returns the quoted text, allocated by \p alloc.
+fn tomlBasicString(alloc: Allocator, value: []const u8) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    try appendTomlBasicString(&list, alloc, value);
+    return list.toOwnedSlice(alloc);
 }
 
-fn addEntry(
-    section: *TomlSection,
+/// Appends one typed row's body field (`\p value_kind` records the
+/// representative data type next to the TOML literal in \p value; both
+/// are emitted as TOML basic strings).
+fn appendTypedRow(
+    rows: *std.ArrayList(TomlRow),
     alloc: Allocator,
-    key: []const u8,
+    header: []const u8,
+    value_kind: []const u8,
     value: []const u8,
 ) !void {
-    var unique_key = key;
-    if (hasKey(section, unique_key)) {
-        var suffix: usize = section.entries.items.len;
-        if (std.fmt.parseInt(usize, value, 0)) |parsed_index| {
-            suffix = parsed_index;
-        } else |_| {}
-
-        while (true) {
-            unique_key = try std.fmt.allocPrint(alloc, "{s}@{d}", .{ key, suffix });
-            if (!hasKey(section, unique_key)) break;
-            suffix += 1;
-        }
-    }
-
-    try section.entries.append(alloc, .{
-        .key = unique_key,
-        .value = value,
+    var row = TomlRow{ .header = header };
+    try row.fields.append(alloc, .{
+        .key = "type",
+        .value = try tomlBasicString(alloc, value_kind),
     });
+    try row.fields.append(alloc, .{ .key = "value", .value = value });
+    try rows.append(alloc, row);
 }
 
 fn stripMethodAnnotation(value: []const u8) []const u8 {
@@ -585,36 +625,101 @@ fn stripMethodAnnotation(value: []const u8) []const u8 {
     return value;
 }
 
-fn addAnalyzerLine(queries: []const QueryInfo, sections: *std.ArrayList(TomlSection), alloc: Allocator, line: []const u8) !void {
+/// Converts one analyzer stdout report line into a typed output row
+/// (see `TomlRow`) and appends it to \p rows.
+///
+/// Routing, first matching query wins:
+/// 1. `const::` queries (`is_const`): a
+///    `<header-path>::<Name> = <literal>` line becomes the row
+///    `[["<header-path>::<Name>"]]` whose `value` is the constant's
+///    TOML literal and whose `type` is its representative data type
+///    (see `constantLiteralKind`).
+/// 2. `enum::<Enum>` queries: `<Enum>::<Enumerator> = <value>` becomes
+///    one `[[<Enum>]]` row per enumerator; the `name` field carries
+///    the enumerator, the `value` an integer (the analyzer reports
+///    signed decimal values). Enumerator rows repeat under the same
+///    header and accumulate as array-of-tables entries.
+/// 3. class queries: `<Class>::<Method> = <index>` becomes
+///    `[["<Class>::<Method>"]]` with `type = "usize"`; destructor
+///    report annotations are stripped, and the analyzer has already
+///    renamed duplicate slot keys with an `@<index>` suffix.
+///
+/// \param queries metadata of the queries the analyzed output belongs
+///                to; a line is routed by the `::`-prefixed forms above.
+/// \param rows destination list, allocated by \p alloc.
+/// \param line one trimmed non-empty analyzer stdout line.
+/// \returns `error.UnrecognizedAnalyzerOutput` when no query owns the
+///          line and `error.UnexpectedAnalyzerOutput` when the owner's
+///          value is not a classifiable TOML value or a report word
+///          is empty.
+fn addAnalyzerLine(
+    queries: []const QueryInfo,
+    rows: *std.ArrayList(TomlRow),
+    alloc: Allocator,
+    line: []const u8,
+) !void {
     const separator = std.mem.indexOf(u8, line, " = ") orelse return error.UnexpectedAnalyzerOutput;
     const lhs = line[0..separator];
     const raw_value = std.mem.trim(u8, line[separator + 3 ..], " \t\r");
     if (lhs.len == 0 or raw_value.len == 0) return error.UnexpectedAnalyzerOutput;
 
+    // 1. Constants: "<header-path>::<Name> = <toml literal>".
     for (queries) |query| {
         if (!query.is_const) continue;
         const prefix = try std.fmt.allocPrint(alloc, "{s}::", .{query.header_path});
         if (!std.mem.startsWith(u8, lhs, prefix)) continue;
 
-        const key = lhs[prefix.len..];
-        if (key.len == 0) return error.UnexpectedAnalyzerOutput;
-        const section_name = try std.fmt.allocPrint(alloc, "const::{s}", .{query.header_path});
-        const section = try findOrCreateSection(sections, alloc, section_name);
-        try addEntry(section, alloc, key, raw_value);
+        const name = lhs[prefix.len..];
+        if (name.len == 0) return error.UnexpectedAnalyzerOutput;
+        const kind = constantLiteralKind(raw_value) orelse
+            return error.UnexpectedAnalyzerOutput;
+        const header = try std.fmt.allocPrint(alloc, "{s}::{s}", .{ query.header_path, name });
+        try appendTypedRow(rows, alloc, header, @tagName(kind), raw_value);
         return;
     }
 
+    // 2. Enumerators: "<Enum>::<Enumerator> = <value>"; one row per
+    //    enumerator, all sharing the plain enum name header.
     for (queries) |query| {
-        if (query.is_const) continue;
+        if (query.is_const or !std.mem.startsWith(u8, query.name, "enum::")) continue;
+        const enum_name = query.name["enum::".len..];
+        if (enum_name.len == 0) return error.UnexpectedAnalyzerOutput;
+        const prefix = try std.fmt.allocPrint(alloc, "{s}::", .{enum_name});
+        if (!std.mem.startsWith(u8, lhs, prefix)) continue;
+
+        const enumerator = lhs[prefix.len..];
+        if (enumerator.len == 0) return error.UnexpectedAnalyzerOutput;
+        // The analyzer prints enumerator values as signed decimals.
+        _ = std.fmt.parseInt(i128, raw_value, 10) catch
+            return error.UnexpectedAnalyzerOutput;
+        var row = TomlRow{ .header = try alloc.dupe(u8, enum_name) };
+        try row.fields.append(alloc, .{
+            .key = "name",
+            .value = try tomlBasicString(alloc, enumerator),
+        });
+        try row.fields.append(alloc, .{
+            .key = "type",
+            .value = try tomlBasicString(alloc, "integer"),
+        });
+        try row.fields.append(alloc, .{ .key = "value", .value = raw_value });
+        try rows.append(alloc, row);
+        return;
+    }
+
+    // 3. Vtable indexes: "<Class>::<Method> = <slot index>".
+    for (queries) |query| {
+        if (query.is_const or std.mem.startsWith(u8, query.name, "enum::")) continue;
         const prefix = try std.fmt.allocPrint(alloc, "{s}::", .{query.name});
         if (!std.mem.startsWith(u8, lhs, prefix)) continue;
 
-        const key = lhs[prefix.len..];
-        if (key.len == 0) return error.UnexpectedAnalyzerOutput;
-        const value = stripMethodAnnotation(raw_value);
-        const section_name = try std.fmt.allocPrint(alloc, "class::{s}", .{query.name});
-        const section = try findOrCreateSection(sections, alloc, section_name);
-        try addEntry(section, alloc, key, value);
+        const method = lhs[prefix.len..];
+        if (method.len == 0) return error.UnexpectedAnalyzerOutput;
+        const index = stripMethodAnnotation(raw_value);
+        // Slot indices are plain decimals.
+        _ = std.fmt.parseInt(u64, index, 10) catch
+            return error.UnexpectedAnalyzerOutput;
+        const header = try std.fmt.allocPrint(alloc, "{s}::{s}", .{ query.name, method });
+        try appendTypedRow(rows, alloc, header, "usize", index);
         return;
     }
 
@@ -622,7 +727,29 @@ fn addAnalyzerLine(queries: []const QueryInfo, sections: *std.ArrayList(TomlSect
 }
 
 /// Converts one analyzer result into TOML and writes it to `toml_path`.
-/// The result and its query metadata are passed explicitly; no global state is used.
+/// The result and its query metadata are passed explicitly; no global
+/// state is used.
+///
+/// Every analyzer line becomes a typed array-of-tables row (see
+/// `TomlRow` and `addAnalyzerLine`):
+///
+///     [["CBaseEntity::~CBaseEntity"]]
+///     type = "usize"
+///     value = 0
+///
+///     [["public/eiface.h::INTERFACEVERSION_VENGINESERVER"]]
+///     type = "string"
+///     value = "VEngineCvar004"
+///
+///     [["IN_BUTTONS"]]
+///     name = "FIRST"
+///     type = "integer"
+///     value = 1
+///
+/// Headers carrying a literal `<class>::<method>` or
+/// `<header-path>::<const-name>` composite are emitted quoted, since
+/// `:` is not a TOML bare-key character. All emitted row names are
+/// unique, so plain `[<name>]` and `[[<name>]]` tables never collide.
 pub fn intoToml(
     io: std.Io,
     toml_path: []const u8,
@@ -634,26 +761,26 @@ pub fn intoToml(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var sections: std.ArrayList(TomlSection) = .empty;
+    var rows: std.ArrayList(TomlRow) = .empty;
     var lines = std.mem.splitScalar(u8, analysis.stdout, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
-        try addAnalyzerLine(analysis.queries, &sections, alloc, line);
+        try addAnalyzerLine(analysis.queries, &rows, alloc, line);
     }
 
-    if (sections.items.len == 0) return error.EmptyAnalyzerOutput;
+    if (rows.items.len == 0) return error.EmptyAnalyzerOutput;
 
     var output: std.ArrayList(u8) = .empty;
-    for (sections.items) |section| {
-        try output.append(alloc, '[');
-        try appendTomlBasicString(&output, alloc, section.name);
-        try appendSlice(&output, alloc, "]\n");
+    for (rows.items) |*row| {
+        try output.appendSlice(alloc, "[[");
+        try appendTomlBasicString(&output, alloc, row.header);
+        try appendSlice(&output, alloc, "]]\n");
 
-        for (section.entries.items) |entry| {
-            try appendTomlBasicString(&output, alloc, entry.key);
+        for (row.fields.items) |field| {
+            try appendSlice(&output, alloc, field.key);
             try appendSlice(&output, alloc, " = ");
-            try appendSlice(&output, alloc, entry.value);
+            try appendSlice(&output, alloc, field.value);
             try output.append(alloc, '\n');
         }
         try output.append(alloc, '\n');
