@@ -119,7 +119,31 @@ Do not restart the entire investigation if the relevant facts are already establ
 - When a check fails, report the relevant output and distinguish the underlying problem from unrelated environment failures.
 - If verification cannot be performed, explain why and state what remains unverified.
 
-## 11. Final Response
+## 11. Commit Message Convention
+
+- Follow the Conventional Commits specification.
+- Use this format: `<type>(<scope>): <description>`.
+  The scope is optional. If omitted, use `<type>: <description>`.
+- Only use the following commit types:
+  - `feat`: introduce a new feature.
+  - `fix`: fix a bug or incorrect behavior.
+  - `docs`: documentation-only changes.
+  - `refactor`: restructure code without intentionally changing behavior.
+  - `perf`: improve performance.
+  - `test`: add or modify tests.
+  - `build`: modify the build system or build configuration.
+  - `ci`: modify CI workflows or automation.
+  - `chore`: maintenance that does not fit a more specific type.
+  - `revert`: revert a previous change.
+- Never invent, abbreviate, or substitute commit types.
+- Do not use a scope as a commit type. For example, use `feat(io): ...`, not `io: ...`, when introducing new I/O functionality.
+- Use only scopes already established by the project. Before introducing a new scope, inspect existing commit messages and project conventions. If no established scope fits, omit it rather than inventing one.
+- Choose the type according to the intent of the change, not merely the files being modified.
+- If a change spans multiple categories, select the primary purpose of the change.
+- If the correct type is genuinely ambiguous, ask the user before creating a commit.
+- Do not create, amend, or otherwise modify Git commits unless explicitly authorized.
+
+## 12. Final Response
 
 For implementation tasks, report:
 
@@ -127,7 +151,7 @@ For implementation tasks, report:
 - Which files were modified.
 - Which checks were actually executed and their results.
 - Any remaining risks, assumptions, or work that requires the user's decision.
-- Make a git commit on changes.
+- Make a git commit on changes, follow the Commit Message Convention that is described in paragraph 11.
 
 Keep the report concise and technically precise. Never claim completion beyond what the evidence supports.
 
