@@ -258,3 +258,48 @@ facts worth back-porting to `docs/references/source-sdk-2013.md`:
 2. `filesystem_init.cpp` is in-tree, engine-independent source, making
    search-path semantics *source-verifiable* rather than binary-only — useful
    for the parent reference's §8/§9 follow-up tables.
+
+## 12. Zorcerer I/O domain policy
+
+Decision record on whether Zorcerer performs I/O through the engine
+filesystem or through Zig's standard `std.Io` (the alternative), based on
+this report. Implementation: `src/io/FileSystem.zig`.
+
+**The policy is a domain split, not a global either/or:**
+
+1. **Engine mandatory — `game://` content.** The `tf` directory is not a
+   plain OS tree: content lives in layered VPKs searched per pathID
+   category (§3), invisible to plain OS I/O. Reads therefore go through
+   pathID `GAME` (no engine state modified).
+2. **Engine by contract — `plugin://` content.** The Zorcerer
+   installation tree is unknown to the engine until Zorcerer adds pathID
+   `ZORCERER_PLUGINS` via `AddSearchPath` (`PATH_ADD_TO_TAIL`); plain
+   `std.Io` would technically work for such a path. The engine FS is
+   chosen contractually: a single I/O path and file type in the
+   plugin-facing API, keeping the zostd contract simpler.
+3. **`std.Io` mandatory — Zorcerer's own core.** Plugin-manager plugin
+   discovery, configuration parsing, logging, and analyzer inputs
+   (§4/§7) — e.g. `/proc/self/maps` — run before/without an engine
+   binding, and the plugin-facing layer rejects all paths outside the
+   two roots by design.
+
+**Rejected alternative:** routing `plugin://` through `std.Io` would
+restore errno-grade diagnostics on that path — engine failures are
+opaque (void `Seek`/`Flush`, null `Open` handles with no cause) — but
+costs a contract rework and a second backend in the zostd-facing API.
+Not done; the decision is revisited only if the §10.5 `[binary]`
+verification fails or the write-path arbitration proves hostile
+(requiring moving `plugin://` semantics to the OS anyway).
+
+**Accepted residual risks** (see §10.2, §10.3, §10.5): unverified vtable
+slots for the dual-inheritance `IFileSystem`, unverified write
+placement under `plugin_path_id`, and the >2 GB `c_int` position /
+`c_int` byte-count limits of the engine ABI. Binding isolation in the
+implementation (resolved function-pointer tables, no hardcoded slots,
+mock ABI for tests) keeps these risks contained to the slot-verification
+step.
+
+Not followed: linking the SDK's prebuilt `vpklib.a`/`filesystem_stdio`
+standalone (§4, §5, §11) to read VPKs without the engine — it would add
+Valve prebuilt libraries to the core and only help Zorcerer itself, not
+the in-game plugin API.
