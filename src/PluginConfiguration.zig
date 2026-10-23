@@ -197,6 +197,14 @@ test "parseConfig parses fully correct TOML" {
 }
 
 test "parseConfig fails on partially implemented keys" {
+    // `parseConfig` warns about every unknown key before failing. That
+    // warning is expected here; raise the log threshold so it does not reach
+    // the test runner's stderr, where the build runner reports child output
+    // even for otherwise successful steps.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+
     // `plugin_id` and `name` are implemented, but `compression` is not a
     // field of `PluginConfiguration`.
     const source =

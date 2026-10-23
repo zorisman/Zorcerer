@@ -126,11 +126,10 @@ testCommit() {
     # Run in background + wait so trapped signals are handled immediately;
     # `exec` makes the subshell become zig itself, so $! is zig's pid.
     #
-    # -Dskip-analyze=true: build.zig runs the analyzer data regeneration at
-    # plan time by spawning zig-out/bin/vtable-index-analyzer, an artifact
-    # that this clean worktree has never had (there is no build step that
-    # produces it before the top-level build script body runs). Skipping the
-    # analyzer data step keeps pushes working; the module tests still run.
+    # -Dskip-analyze=true: skips building the Clang/LLVM-based analyzer and
+    # its configure-time data regeneration. The hook must not require system
+    # Clang/LLVM development packages, and a clean worktree has no analyzer
+    # binary to regenerate with; the module tests still run.
     (
         cd "$worktree" &&
         exec zig build tests -Dskip-analyze=true </dev/null
