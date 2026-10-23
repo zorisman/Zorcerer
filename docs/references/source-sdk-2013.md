@@ -164,17 +164,17 @@ Two boundaries matter, and they are asymmetric.
 
 ### 5.2 Interface version strings present in this checkout
 
-| Interface | Version string | Declared at |
-|---|---|---|
-| `IVEngineServer` (engine → game DLL) | `"VEngineServer023"` | `src/public/eiface.h:78` (`INTERFACEVERSION_VENGINESERVER`), class at `:98`, `IVEngineServer021/022` typedefs at `:459-460` |
-| `IServerGameDLL` (game DLL → engine) | `"ServerGameDLL012"` | `eiface.h:467-468`; `COMPILE_TIME_ASSERT(INTERFACEVERSION_SERVERGAMEDLL_INT == 12)` at `gameinterface.cpp:567` |
-| `IServerGameClients` | `"ServerGameClients005"` (+003, 004 kept exposed) | `eiface.h:690-692`; all three exposed `gameinterface.cpp:2676-2678` |
-| `IServerGameEnts` | `"ServerGameEnts001"` | `eiface.h:660`; exposed `gameinterface.cpp:2416` |
-| `IServerPluginCallbacks` (engine → plugin) | `"ISERVERPLUGINCALLBACKS003"` | `src/public/engine/iserverplugin.h:47-50` |
-| `IGameEventManager2` | `"GAMEEVENTSMANAGER002"` | `src/public/igameevents.h:22` |
-| `ICvar` | `"VEngineCvar004"` | `src/public/icvar.h:190` |
-| `IPlayerInfoManager` / `IBotManager` | `"PlayerInfoManager001"` / `"BotManager001"` | exposed `src/game/server/playerinfomanager.cpp:132-133` |
-| `IServerTools` | `VSERVERTOOLS_INTERFACE_VERSION` | `gameinterface.cpp`-adjacent: `entity_tools_server.cpp:86-88` |
+| Interface                                  | Version string                                    | Declared at                                                                                                                 |
+|--------------------------------------------|---------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `IVEngineServer` (engine → game DLL)       | `"VEngineServer023"`                              | `src/public/eiface.h:78` (`INTERFACEVERSION_VENGINESERVER`), class at `:98`, `IVEngineServer021/022` typedefs at `:459-460` |
+| `IServerGameDLL` (game DLL → engine)       | `"ServerGameDLL012"`                              | `eiface.h:467-468`; `COMPILE_TIME_ASSERT(INTERFACEVERSION_SERVERGAMEDLL_INT == 12)` at `gameinterface.cpp:567`              |
+| `IServerGameClients`                       | `"ServerGameClients005"` (+003, 004 kept exposed) | `eiface.h:690-692`; all three exposed `gameinterface.cpp:2676-2678`                                                         |
+| `IServerGameEnts`                          | `"ServerGameEnts001"`                             | `eiface.h:660`; exposed `gameinterface.cpp:2416`                                                                            |
+| `IServerPluginCallbacks` (engine → plugin) | `"ISERVERPLUGINCALLBACKS003"`                     | `src/public/engine/iserverplugin.h:47-50`                                                                                   |
+| `IGameEventManager2`                       | `"GAMEEVENTSMANAGER002"`                          | `src/public/igameevents.h:22`                                                                                               |
+| `ICvar`                                    | `"VEngineCvar004"`                                | `src/public/icvar.h:190`                                                                                                    |
+| `IPlayerInfoManager` / `IBotManager`       | `"PlayerInfoManager001"` / `"BotManager001"`      | exposed `src/game/server/playerinfomanager.cpp:132-133`                                                                     |
+| `IServerTools`                             | `VSERVERTOOLS_INTERFACE_VERSION`                  | `gameinterface.cpp`-adjacent: `entity_tools_server.cpp:86-88`                                                               |
 
 All version strings above are **declared in this checkout's source**. Whether the
 installed TF2 dedicated server carries the same strings is a binary question (§7).

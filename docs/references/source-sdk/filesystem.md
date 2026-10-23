@@ -41,10 +41,10 @@ TF2 engine binary:
 
 **[checkout]** (`src/public/filesystem.h`)
 
-| Interface | Version string | Role |
-|---|---|---|
+| Interface         | Version string                    | Role                                                                                                                                                                                                                                                                   |
+|-------------------|-----------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `IBaseFileSystem` | `"VBaseFileSystem011"` (line 499) | Minimal contract: `Read/Write/Open/Close/Seek/Tell/Size/Flush/Precache/FileExists/GetFileTime/ReadFile/WriteFile/UnzipFile`. Designed so *other subsystems* (e.g. `CPackedStore`, VMPI) can be implemented against "a named set of files" without needing the full FS. |
-| `IFileSystem` | `"VFileSystem022"` (line 539) | Full engine FS. Declared as `: public IAppSystem, public IBaseFileSystem` (line 541) — **dual inheritance**. |
+| `IFileSystem`     | `"VFileSystem022"` (line 539)     | Full engine FS. Declared as `: public IAppSystem, public IBaseFileSystem` (line 541) — **dual inheritance**.                                                                                                                                                           |
 
 Zorcerer-relevant ABI facts:
 
