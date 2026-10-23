@@ -271,33 +271,41 @@ this report. Implementation: `src/io/FileSystem.zig`.
    plain OS tree: content lives in layered VPKs searched per pathID
    category (§3), invisible to plain OS I/O. Reads therefore go through
    pathID `GAME` (no engine state modified).
-2. **Engine by contract — `plugin://` content.** The Zorcerer
-   installation tree is unknown to the engine until Zorcerer adds pathID
-   `ZORCERER_PLUGINS` via `AddSearchPath` (`PATH_ADD_TO_TAIL`); plain
-   `std.Io` would technically work for such a path. The engine FS is
-   chosen contractually: a single I/O path and file type in the
-   plugin-facing API, keeping the zostd contract simpler.
+2. **`std.Io` — `plugin://` content.** The Zorcerer installation tree is
+   unknown to the engine until Zorcerer adds a custom search path, and it
+   is plain host storage rather than engine content; writing plugin files
+   through the engine's WritePath arbitration was never required.
+   Routed through `std.Io` instead, so the `std.Io` host tooling and the
+   plugin-facing API share one backend for that tree and the host gains
+   real diagnostics; the coarse plugin-facing error contract is kept
+   (backend failures are mapped at the boundary). Decision re-visited by
+   the owner on 2026-10-23, superseding an earlier draft that opened
+   `plugin://` through the engine for a single file-type contract.
 3. **`std.Io` mandatory — Zorcerer's own core.** Plugin-manager plugin
    discovery, configuration parsing, logging, and analyzer inputs
    (§4/§7) — e.g. `/proc/self/maps` — run before/without an engine
    binding, and the plugin-facing layer rejects all paths outside the
-   two roots by design.
+   two roots by design (via `ZorcererPath.scheme` routing).
 
-**Rejected alternative:** routing `plugin://` through `std.Io` would
-restore errno-grade diagnostics on that path — engine failures are
-opaque (void `Seek`/`Flush`, null `Open` handles with no cause) — but
-costs a contract rework and a second backend in the zostd-facing API.
-Not done; the decision is revisited only if the §10.5 `[binary]`
-verification fails or the write-path arbitration proves hostile
-(requiring moving `plugin://` semantics to the OS anyway).
+**Rejected alternative — engine FS for the whole plugin-facing API:**
+opening `plugin://` through the engine's WritePath (engine-by-contract)
+kept one I/O path and file type in the API, but required the
+`AddSearchPath` mount of the Zorcerer root and traded real host
+diagnostics for the engine's opaque failure reporting (void `Seek`/
+`Flush`, cause-less null `Open` handles). The single-type goal is still
+met by a backend-tagged `File`/`Directory` pair over the two distinct
+backends, so the engine FS is limited to what only it can do (§10.5:
+`[binary]` slot verification and WritePath arbitration now only gate
+`game://` access).
 
 **Accepted residual risks** (see §10.2, §10.3, §10.5): unverified vtable
-slots for the dual-inheritance `IFileSystem`, unverified write
-placement under `plugin_path_id`, and the >2 GB `c_int` position /
-`c_int` byte-count limits of the engine ABI. Binding isolation in the
-implementation (resolved function-pointer tables, no hardcoded slots,
-mock ABI for tests) keeps these risks contained to the slot-verification
-step.
+slots for the dual-inheritance `IFileSystem`, the >2 GB `c_int` position
+/ byte-count limits of the engine ABI, and — with engine access now
+read-only — the unverified write arbitration matters only if a future
+feature ever opens writable engine paths; the read path is engine-side
+and unaffected. Binding isolation in the implementation (resolved
+function-pointer tables, no hardcoded slots, mock ABI for tests) keeps
+these risks contained to the slot-verification step.
 
 Not followed: linking the SDK's prebuilt `vpklib.a`/`filesystem_stdio`
 standalone (§4, §5, §11) to read VPKs without the engine — it would add

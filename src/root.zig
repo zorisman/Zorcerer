@@ -20,3 +20,12 @@ pub const Log = @import("io/Log.zig");
 test "src/analyzers/VTableResolver.zig compiles and passes its unit tests" {
     std.testing.refAllDecls(@import("analyzers/VTableResolver.zig"));
 }
+
+// Compile-checks and unit-tests src/io/FileSystem.zig. Nothing in
+// production code references the filesystem layer yet, so this branch of
+// the import graph is the only thing keeping it under the build's
+// purview; it must keep compiling and testing against the real toolchain
+// even before hosting code starts calling it.
+test "src/io/FileSystem.zig compiles and passes its unit tests" {
+    std.testing.refAllDecls(@import("io/FileSystem.zig"));
+}

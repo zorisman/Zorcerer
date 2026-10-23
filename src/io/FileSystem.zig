@@ -1,27 +1,34 @@
 //! Host-side filesystem plumbing for plugins: it converts the virtual
 //! `game://` and `plugin://` URI schemes into validated absolute paths, each
 //! carrying the permission set the host is willing to grant for the
-//! referenced location.
+//! referenced location, and routes the actual I/O by scheme
+//! (docs/references/source-sdk/filesystem.md §12):
 //!
-//! All actual I/O of this module goes through the Source Engine filesystem
-//! (`IFileSystem`/`IBaseFileSystem`, see
-//! docs/references/source-sdk/filesystem.md): the engine resolves names via
-//! its search paths and pack files (VPKs), so files are not touched through
-//! the shell. The engine binding is handed to the module as an interface
-//! pointer plus explicitly resolved ABI method pointers (see
-//! `SourceFilesystem`); vtable slot indices are *not* hardcoded here; slot
-//! resolution belongs to binary verification
-//! (docs/references/source-sdk/filesystem.md §10.2).
+//! - `game://` paths go through the Source Engine filesystem
+//!   (`IFileSystem`/`IBaseFileSystem`): the engine resolves names via its
+//!   search paths and pack files (VPKs), so files are not touched through
+//!   the shell. Files reachable this way resolve under pathID `GAME`.
+//! - `plugin://` paths go through `std.Io` (the host OS filesystem):
+//!   the Zorcerer tree is not engine content; the `std.Io` backend also
+//!   reports failures with real host diagnostics instead of the engine's
+//!   opaque ones.
+//!
+//! The engine binding is handed to the module as an interface pointer plus
+//! explicitly resolved ABI method pointers (see `SourceFilesystem`);
+//! vtable slot indices are *not* hardcoded here; slot resolution belongs to
+//! binary verification (docs/references/source-sdk/filesystem.md §10.2).
 
 const std = @import("std");
 
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 
 /// URI scheme prefix targeting the running game's `tf` directory; the path
-/// tail is relative to that directory.
+/// tail is relative to that directory. Resolved paths are routed to the
+/// Source Engine filesystem.
 pub const game_scheme = "game://";
 /// URI scheme prefix targeting the calling plugin's own root directory; the
-/// path tail is relative to that directory.
+/// path tail is relative to that directory. Resolved paths are routed to
+/// `std.Io`.
 pub const plugin_scheme = "plugin://";
 
 /// The kinds of access a plugin can request for a validated `ZorcererPath`.
@@ -34,12 +41,24 @@ pub const Permission = enum {
     execute,
 };
 
+/// The URI scheme that produced a `ZorcererPath`, and therefore which
+/// backend performs its I/O (see `File`).
+pub const Scheme = enum {
+    /// The running game's `tf` directory; Source Engine filesystem.
+    game,
+    /// The calling plugin's own root directory; `std.Io`.
+    plugin,
+};
+
 /// A validated, host-resolved file location.
 ///
 /// Invariant: `absolute_path` is an absolute filesystem path that resulted
 /// from prefixing a `game://` or `plugin://` URI with the matching
 /// configured root directory, and `permissions` describes the access the
-/// host permits for that path.
+/// host permits for that path. `scheme` records which URI produced the
+/// path so `File.open()`/`Directory.open()` can route I/O to the correct
+/// backend; callers that construct a `ZorcererPath` by hand must set it to
+/// a scheme whose under-root validation they can satisfy.
 ///
 /// Slices: `absolute_path` is allocated inside this module's arena and
 /// remains valid for the rest of the process' lifetime, see
@@ -49,8 +68,9 @@ pub const ZorcererPath = struct {
     absolute_path: []const u8,
     /// Permissions the host allows for `absolute_path`.
     permissions: std.Io.File.Permissions,
+    /// Which backend the path's I/O routes to (see `File`).
+    scheme: Scheme,
 };
-
 /// Placeholder for the runtime context of the plugin that performs the
 /// filesystem query.
 ///
@@ -145,11 +165,13 @@ pub fn setZorcererRoot(path: []const u8) void {
 /// absolute path.
 ///
 /// - `"game://<tail>"` resolves `<tail>` against the configured `tf`
-///   directory (see `setGameRoot`); read-only.
+///   directory (see `setGameRoot`); read-only, routed to the engine
+///   filesystem (`.scheme == .game`).
 /// - `"plugin://<tail>"` resolves `<tail>` against the calling plugin's
 ///   root directory, which is derived from the directory component of
 ///   `ctx.config.lib_path` underneath the configured Zorcerer root (see
-///   `setZorcererRoot`); read and write, no execute.
+///   `setZorcererRoot`); read and write, no execute, routed to `std.Io`
+///   (`.scheme == .plugin`).
 /// - Any other URI format is not a supported scheme.
 ///
 /// Parameters:
@@ -180,6 +202,7 @@ pub fn parsePath(ctx: *PluginContext, path: []const u8) !ZorcererPath {
         return ZorcererPath{
             .absolute_path = try joinRelativeParts(alloc, root, &.{path[game_scheme.len..]}),
             .permissions = read_only_permissions,
+            .scheme = .game,
         };
     }
 
@@ -195,6 +218,7 @@ pub fn parsePath(ctx: *PluginContext, path: []const u8) !ZorcererPath {
                 path[plugin_scheme.len..],
             }),
             .permissions = read_write_permissions,
+            .scheme = .plugin,
         };
     }
 
@@ -269,27 +293,21 @@ pub const SeekFrom = enum(c_int) {
     end = 2,
 };
 
-/// `SearchPathAdd_t`'s `PATH_ADD_TO_TAIL` (filesystem.h:260-264 [checkout]):
-/// the path is searched last. (`PATH_ADD_TO_HEAD` is `0`.)
-pub const search_path_add_to_tail: c_int = 1;
-
 /// The engine pathID of the game's mod directory (the `tf` folder bound by
 /// `game://` above). Game code addresses exactly that directory with this
 /// id [checkout: nav_file.cpp:1241-1245 opens "GAME"].
+///
+/// The engine already mounts the tf directory under this pathID, so opening
+/// `game://` files through it changes no engine state.
 pub const game_path_id = "GAME";
-
-/// Custom pathID Zorcerer adds its own installation tree under via
-/// `Abi.add_search_path` (constructed id, not an engine constant). The
-/// engine resolves it against the configured `zorcerer_root`.
-pub const plugin_path_id = "ZORCERER_PLUGINS";
 
 /// The exact C ABI of the engine filesystem virtuals this module calls,
 /// derived from filesystem.h [checkout]: `IBaseFileSystem` members at
-/// filesystem.h:504-517 and `IFileSystem` members at 548-650. The struct
-/// records *signatures only*: concrete vtable slot indices are a
-/// [binary]-level fact that binary verification must establish; whoever
-/// binds an engine filesystem therefore supplies the already-resolved
-/// function pointers, and no slot numbers live in this module.
+/// filesystem.h:504-517. The struct records *signatures only*: concrete
+/// vtable slot indices are a [binary]-level fact that binary verification
+/// must establish; whoever binds an engine filesystem therefore supplies
+/// the already-resolved function pointers, and no slot numbers live in this
+/// module.
 pub const Abi = struct {
     /// `IBaseFileSystem::Read` (filesystem.h:504): returns the number of
     /// bytes read, negative values signal failure.
@@ -318,14 +336,6 @@ pub const Abi = struct {
     /// `IBaseFileSystem::Flush` (filesystem.h:517): void return, flush
     /// failure is unreportable.
     flush: *const fn (fs: *anyopaque, handle: Handle) callconv(.c) void,
-    /// `IFileSystem::AddSearchPath` (filesystem.h:569); `add_type` is a
-    /// `SearchPathAdd_t` value.
-    add_search_path: *const fn (
-        fs: *anyopaque,
-        path: [*:0]const u8,
-        path_id: [*:0]const u8,
-        add_type: c_int,
-    ) callconv(.c) void,
     /// `IFileSystem::FindFirstEx` (filesystem.h:653): returns the first
     /// matching entry name or null; no result yields
     /// `invalid_find_handle` in `handle`.
@@ -356,16 +366,295 @@ pub const SourceFilesystem = struct {
     abi: Abi,
 };
 
-// --- Source Engine file I/O -------------------------------------------------
+// --- Open modes and shared error sets ----------------------------------------
+
+/// How a file is opened; shared by both backends of `File`.
+///
+/// Engine mapping [checkout usage: nav_file.cpp:1241 "rb";
+/// ai_networkmanager.cpp:351 "wb"; physics.cpp:2910 "ab"]; host mapping in
+/// `HostFile.open()`'s documentation.
+pub const Mode = enum {
+    /// Read-only: `Open` option string `"rb"`.
+    read,
+    /// Write with truncation: `Open` option string `"wb"`.
+    write,
+    /// Write appending past the current end: `Open` option string `"ab"`.
+    append,
+};
+
+/// Unified errors of `File.open()` and of directory opens; both backends
+/// accepted this coarse contract when they shared one engine implementation,
+/// and it is kept so callers do not branch on the backend.
+pub const OpenError = error{
+    /// The path's permission set (see `checkPermission`) does not cover
+    /// the requested mode.
+    PermissionDenied,
+    /// The path belongs to the other scheme's backend (its root does not
+    /// validate), or the requested tree is not configured.
+    OperationNotAllowed,
+    /// An engine-side name or wildcard exceeds `max_engine_name_len`.
+    NameTooLong,
+    /// The backend refused to open the path; the engine does not expose
+    /// the failure cause, and the `std.Io` backend is deliberately mapped
+    /// to this coarse error at the plugin-facing boundary, too.
+    OpenFailed,
+    /// `File.open()` asked for a `.game` path while no `SourceFilesystem`
+    /// binding was supplied.
+    EngineNotBound,
+};
+
+/// Unified errors of file reads: the backend (engine negative byte count or
+/// `std.Io` positional-read failure) is deliberately mapped to one error so
+/// callers do not branch on the backend.
+pub const ReadError = error{
+    /// The backend reported a failed read.
+    ReadFailed,
+};
+
+/// Unified errors of file writes: the backend (engine negative/zero byte
+/// count or `std.Io` positional-write failure) is deliberately mapped to
+/// one error so callers do not branch on the backend.
+pub const WriteError = error{
+    /// The backend reported a failed write or stopped making progress.
+    WriteFailed,
+};
+
+/// Unified errors of seeks.
+pub const SeekError = error{
+    /// The offset does not fit the backend's position ABI (`c_int` for the
+    /// engine, `u64`/`i64` arithmetic overflow for `std.Io`).
+    PositionOverflow,
+    /// `std.Io` only: the computed target position would be negative. The
+    /// engine backend cannot report this (its `Seek` returns void).
+    SeekFailed,
+};
+
+/// Unified errors of `size()`: `std.Io` only (its stat can fail); the
+/// engine never fails this query, but the contract is shared.
+pub const SizeError = error{
+    /// The `std.Io` backend could not stat the file.
+    SizeFailed,
+};
+
+/// Unified errors of `flush()`: `std.Io` only (its sync can fail); the
+/// engine never fails this call, but the contract is shared.
+pub const FlushError = error{
+    /// The `std.Io` backend could not sync the file.
+    FlushFailed,
+};
+
+// --- Unified file ------------------------------------------------------------
+
+/// A file opened through the backend selected by the path's scheme
+/// (docs/references/source-sdk/filesystem.md §12):
+///
+/// - `.game` opens through the Source Engine filesystem (pathID `GAME`;
+///   handled by `SourceFile`), so VPK/search-path resolution applies.
+/// - `.plugin` opens through `std.Io` (handled by `HostFile`), so the
+///   plugin's own tree is touched with plain host I/O and real host
+///   error reporting (mapped to the coarse shared error sets above).
+///
+/// State and semantics: the read/write cursor lives in the engine or in
+/// `HostFile.position`, so this value is a stateful handle, not a plain
+/// value: every method takes `*File` so cursor movement through one file
+/// stays visible on it. Copies of a `File` must not be interleaved with
+/// the original (the `std.Io` backend's cursor would diverge).
+///
+/// Lifecycle: created by `open()`; the backend handle stays valid until
+/// `close()`, after which this file must not be used again, and `close()`
+/// must not be called twice.
+///
+/// `fs` must remain valid for that time too: an `IFileSystem` pointer is
+/// expected to be process-resident, so keeping the binding alive is not a
+/// realistic burden.
+pub const File = union(enum) {
+    /// `game://` content, routed through the engine filesystem.
+    engine: SourceFile,
+    /// `plugin://` content, routed through `std.Io`.
+    host: HostFile,
+
+    /// Opens `path` through the backend its `scheme` selects.
+    ///
+    /// The path's permission set is enforced first (`.read` mode needs read
+    /// bits, `.write`/`.append` need write bits); see
+    /// `SourceFile.open()`/`HostFile.open()` for the per-backend name and
+    /// state handling.
+    ///
+    /// `fs` is only consulted for `.game` paths and must be non-null then
+    /// (otherwise `error.EngineNotBound`); `.plugin` paths may be passed
+    /// `null`.
+    pub fn open(io: std.Io, fs: ?SourceFilesystem, path: ZorcererPath, mode: Mode) OpenError!File {
+        return switch (path.scheme) {
+            .game => .{ .engine = try SourceFile.open(fs orelse return error.EngineNotBound, path, mode) },
+            .plugin => .{ .host = try HostFile.open(io, path, mode) },
+        };
+    }
+
+    /// Closes the backend handle. After this call the file is stale and
+    /// must not be used again, not even `close()` twice.
+    pub fn close(self: *File) void {
+        switch (self.*) {
+            .engine => |*f| f.close(),
+            .host => |*f| f.close(),
+        }
+    }
+
+    /// Reads the next chunk, reporting how many bytes landed in `buffer`
+    /// (may be short); reaching 0 signals end of stream. A single
+    /// engine call reads at most `maxInt(c_int)` bytes (engine ABI); the
+    /// `std.Io` backend has no such cap.
+    pub fn read(self: *File, buffer: []u8) ReadError!usize {
+        return switch (self.*) {
+            inline else => |*f| f.read(buffer),
+        };
+    }
+
+    /// Fills `buffer` as far as the file goes, returning the number of
+    /// bytes read (equal to `buffer.len` unless end of stream was hit).
+    pub fn readAll(self: *File, buffer: []u8) ReadError!usize {
+        return switch (self.*) {
+            inline else => |*f| f.readAll(buffer),
+        };
+    }
+
+    /// Writes what one backend call accepts, returning the number of bytes
+    /// written. A single engine call caps at `maxInt(c_int)` bytes; the
+    /// `std.Io` backend has no such cap.
+    pub fn write(self: *File, buffer: []const u8) WriteError!usize {
+        return switch (self.*) {
+            inline else => |*f| f.write(buffer),
+        };
+    }
+
+    /// Writes the whole `buffer` or fails; zero-progress backend calls are
+    /// reported as `error.WriteFailed` instead of looping.
+    pub fn writeAll(self: *File, buffer: []const u8) WriteError!void {
+        switch (self.*) {
+            inline else => |*f| try f.writeAll(buffer),
+        }
+    }
+
+    /// Moves the read/write pointer: `start` offsets are absolute
+    /// (expected non-negative), `current`/`end` offsets move the pointer
+    /// relative to their anchor and may be negative, which is how back-
+    /// seeks are expressed.
+    ///
+    /// Seek failures cannot be observed for the engine backend (the
+    /// engine's Seek is void; verify with `tell()`); the `std.Io` backend
+    /// reports `error.SeekFailed` when the computed target is negative.
+    pub fn seek(self: *File, offset: i64, from: SeekFrom) SeekError!void {
+        switch (self.*) {
+            inline else => |*f| try f.seek(offset, from),
+        }
+    }
+
+    /// Current read/write pointer as an offset from the file start.
+    pub fn tell(self: *File) usize {
+        return switch (self.*) {
+            inline else => |*f| f.tell(),
+        };
+    }
+
+    /// File size as reported by the backend.
+    pub fn size(self: *File) SizeError!usize {
+        return switch (self.*) {
+            inline else => |*f| try f.size(),
+        };
+    }
+
+    /// Asks the backend to flush its buffers for this file. Flush failures
+    /// are unobservable for the engine backend (the engine's Flush is
+    /// void); the `std.Io` backend syncs and can report failure. Data
+    /// still pending in a `Writer` buffer must be flushed there first.
+    pub fn flush(self: *File) FlushError!void {
+        switch (self.*) {
+            inline else => |*f| try f.flush(),
+        }
+    }
+
+    /// Streaming, buffered reader view onto an open file: `buffer` (which
+    /// must be non-empty) is the caller-owned window the standard
+    /// interface fills from the backend. Short reads between backend
+    /// calls are transparent to the user.
+    ///
+    /// The reader borrows this file, so `self` must remain at a fixed
+    /// (non-moving) address for as long as the reader is used; the engine
+    /// variant snapshots the handle value, the `std.Io` variant shares the
+    /// cursor with `self`. Reader/writer use while this file moves is
+    /// caller error.
+    pub fn reader(self: *File, buffer: []u8) Reader {
+        return switch (self.*) {
+            .engine => |f| .{ .engine = f.reader(buffer) },
+            .host => |*f| .{ .host = HostFile.Reader.init(f, buffer) },
+        };
+    }
+
+    /// Streaming, buffered writer view onto an open file: the caller-owned
+    /// `buffer` (which must be non-empty) accumulates written bytes and is
+    /// drained to the backend once full or on explicit `interface.flush()`
+    /// / `File.flush()`.
+    ///
+    /// The writer borrows this file like `reader()` does.
+    pub fn writer(self: *File, buffer: []u8) Writer {
+        return switch (self.*) {
+            .engine => |f| .{ .engine = f.writer(buffer) },
+            .host => |*f| .{ .host = HostFile.Writer.init(f, buffer) },
+        };
+    }
+
+    /// Streaming reader over an open file, one backend per variant. Both
+    /// variants expose a `.interface` field of the same type
+    /// (`std.Io.Reader`); use `interface()` to address it variant-
+    /// independently.
+    ///
+    /// The backend handle is borrowed, not owned: closing the file while
+    /// readers/writers are active on it is caller error.
+    pub const Reader = union(enum) {
+        /// Engine-backed view (see `SourceFile.Reader`).
+        engine: SourceFile.Reader,
+        /// `std.Io`-backed view (see `HostFile.Reader`).
+        host: HostFile.Reader,
+
+        /// The standard's streaming reader interface; see std.Io.Reader.
+        /// Points into this reader's storage, which must not move while
+        /// the interface is in use (see `File.reader()`).
+        pub fn interface(self: *Reader) *std.Io.Reader {
+            return switch (self.*) {
+                inline else => |*inner| &inner.interface,
+            };
+        }
+    };
+
+    /// Streaming writer over an open file, one backend per variant; see
+    /// `Reader` for the variant-independent `.interface` access and the
+    /// fixed-address requirement (see `File.writer()`).
+    pub const Writer = union(enum) {
+        /// Engine-backed view (see `SourceFile.Writer`).
+        engine: SourceFile.Writer,
+        /// `std.Io`-backed view (see `HostFile.Writer`).
+        host: HostFile.Writer,
+
+        /// The standard's streaming writer interface; see std.Io.Writer.
+        /// Points into this writer's storage, which must not move while
+        /// the interface is in use (see `File.writer()`).
+        pub fn interface(self: *Writer) *std.Io.Writer {
+            return switch (self.*) {
+                inline else => |*inner| &inner.interface,
+            };
+        }
+    };
+};
+
+// --- Source Engine file I/O --------------------------------------------------
 
 /// A file opened through the engine filesystem.
 ///
 /// Lifecycle: created by `SourceFile.open()`; the engine handle stays valid
 /// until `SourceFile.close()`, after which `handle` must not be used.
 ///
-/// `fs` must remain valid for that time too: an `IFileSystem` pointer is
-/// expected to be process-resident, so keeping the binding alive is not a
-/// realistic burden.
+/// Only `.game`-scheme paths may be opened this way: `game://` content
+/// resolves inside the engine's search paths and pack files, which only
+/// the engine can see (docs/references/source-sdk/filesystem.md §12).
 pub const SourceFile = struct {
     /// The engine filesystem binding the handle was created through.
     fs: SourceFilesystem,
@@ -373,66 +662,32 @@ pub const SourceFile = struct {
     /// exact `fs` that produced it.
     handle: Handle,
 
-    /// How the file is opened, mapped onto engine option strings
-    /// [checkout usage: nav_file.cpp:1241 "rb"; ai_networkmanager.cpp:351
-    /// "wb"; physics.cpp:2910 "ab"].
-    pub const Mode = enum {
-        /// Read-only: `Open` option string `"rb"`.
-        read,
-        /// Write with truncation: `Open` option string `"wb"`.
-        write,
-        /// Write appending past the current end: `Open` option string `"ab"`.
-        append,
-    };
-
-    /// Errors of `open()` and of directory opens.
-    pub const OpenError = error{
-        /// The path's permission set (see `checkPermission`) does not cover
-        /// the requested mode.
-        PermissionDenied,
-        /// The path is outside the engine-mediated trees, or the Zorcerer
-        /// installation root is too long to mount.
-        OperationNotAllowed,
-        /// An engine-side name or wildcard exceeds `max_engine_name_len`.
-        NameTooLong,
-        /// The engine refused to open the path; the engine does not expose
-        /// the failure cause, so this error is deliberately coarse.
-        OpenFailed,
-    };
-
     /// Opens `path` through the engine filesystem.
     ///
     /// The path's permission set is enforced first (`.read` mode needs read
     /// bits, `.write`/`.append` need write bits), then the path is
-    /// translated into an engine name + pathID:
-    /// - paths under `game_root` open through pathID `game_path_id` (the
-    ///   engine already mounts the tf directory there, no engine state is
-    ///   changed), and
-    /// - paths under `zorcerer_root` open through pathID `plugin_path_id`,
-    ///   which is added to the engine's search paths on first use.
+    /// translated into an engine name + pathID `GAME` (the engine already
+    /// mounts the tf directory there, no engine state is changed).
     ///
     /// This follows filesystem.md's rule that engine-mediated file use must
     /// go via pathIDs and respect the WritePath instead of absolute paths
     /// (filesystem.md §3, §10.3).
-    ///
-    /// Caveat [binary]: whether a write under `plugin_path_id`
-    /// actually lands in the Zorcerer tree depends on the running engine's
-    /// write-path arbitration; no engine build has been verified for that
-    /// yet.
     pub fn open(fs: SourceFilesystem, path: ZorcererPath, mode: Mode) OpenError!SourceFile {
+        if (path.scheme != .game) return error.OperationNotAllowed;
         try checkPermission(path, switch (mode) {
             .read => Permission.read,
             .write, .append => Permission.write,
         });
 
-        const engine_path = try enginePath(path, true);
-        if (engine_path.needs_plugin_mount) try mountPluginTree(fs);
+        const root = game_root orelse return error.OperationNotAllowed;
+        const engine_name = relativeUnder(root, path.absolute_path, true) orelse
+            return error.OperationNotAllowed;
 
         var name_buf: [max_engine_name_len]u8 = undefined;
-        const engine_name = std.fmt.bufPrintZ(&name_buf, "{s}", .{engine_path.name}) catch
+        const name = std.fmt.bufPrintZ(&name_buf, "{s}", .{engine_name}) catch
             return error.NameTooLong;
 
-        const handle = fs.abi.open(fs.interface, engine_name.ptr, optionsString(mode).ptr, engine_path.path_id) orelse
+        const handle = fs.abi.open(fs.interface, name.ptr, optionsString(mode).ptr, game_path_id) orelse
             return error.OpenFailed;
 
         return SourceFile{ .fs = fs, .handle = handle };
@@ -443,12 +698,6 @@ pub const SourceFile = struct {
     pub fn close(self: *SourceFile) void {
         self.fs.abi.close(self.fs.interface, self.handle);
     }
-
-    /// Errors of reading a file through the engine.
-    pub const ReadError = error{
-        /// The engine reported a failed read (negative byte count).
-        ReadFailed,
-    };
 
     /// Reads the next chunk, reporting how many bytes landed in `buffer`
     /// (may be short); reaching 0 signals end of stream. A single
@@ -473,12 +722,6 @@ pub const SourceFile = struct {
         return filled;
     }
 
-    /// Errors of writing a file through the engine.
-    pub const WriteError = error{
-        /// The engine reported a failed write or stopped making progress.
-        WriteFailed,
-    };
-
     /// Writes what one engine call accepts, capped at `maxInt(c_int)`
     /// bytes (engine ABI), returning the number of bytes written.
     pub fn write(self: *const SourceFile, buffer: []const u8) WriteError!usize {
@@ -500,12 +743,6 @@ pub const SourceFile = struct {
         }
     }
 
-    /// Errors of seeking.
-    pub const SeekError = error{
-        /// The offset does not fit the engine's `c_int` position ABI.
-        PositionOverflow,
-    };
-
     /// Moves the engine read/write pointer: `start` offsets are absolute
     /// (expected non-negative), `current`/`end` offsets move the pointer
     /// relative to their anchor and may be negative, which is how back-
@@ -522,14 +759,14 @@ pub const SourceFile = struct {
     }
 
     /// File size as reported by the engine.
-    pub fn size(self: *const SourceFile) usize {
+    pub fn size(self: *const SourceFile) SizeError!usize {
         return @intCast(self.fs.abi.size(self.fs.interface, self.handle));
     }
 
     /// Asks the engine to flush its buffers for this file. Flush failures
     /// are unobservable (the engine's Flush is void); data still pending in
     /// a `Writer` buffer must be flushed there first.
-    pub fn flush(self: *const SourceFile) void {
+    pub fn flush(self: *const SourceFile) FlushError!void {
         self.fs.abi.flush(self.fs.interface, self.handle);
     }
 
@@ -664,7 +901,304 @@ fn fileWriteToEngine(writer: *SourceFile.Writer, chunk: []const u8) std.Io.Write
     return sent;
 }
 
-// --- Source Engine directory I/O --------------------------------------------
+/// The engine open option strings behind `Mode`'s variants, exact spelling
+/// as used by game code [checkout: nav_file.cpp:1241 "rb",
+/// ai_networkmanager.cpp:351 "wb", physics.cpp:2910 "ab"].
+fn optionsString(mode: Mode) [:0]const u8 {
+    return switch (mode) {
+        .read => "rb",
+        .write => "wb",
+        .append => "ab",
+    };
+}
+
+// --- std.Io file I/O (plugin:// backend) --------------------------------------
+
+/// A file opened through `std.Io` (the host OS filesystem).
+///
+/// This is the backend for `plugin://` content: the Zorcerer installation
+/// tree is plain host storage, not engine content, so it is touched via
+/// `std.Io` and its failures report real host conditions (mapped to the
+/// coarse shared error sets of `File`, docs/references/source-sdk/
+/// filesystem.md §12).
+///
+/// The read/write pointer is tracked in `position` (explicitly, since
+/// `std.Io.File` pairs positional reads/writes with explicit offsets rather
+/// than a shared cursor); the same pointer serves `seek()`/`tell()`.
+pub const HostFile = struct {
+    /// The `std.Io` instance this file performs its I/O through.
+    io: std.Io,
+    /// The host file opened from `path`.
+    file: std.Io.File,
+    /// Current read/write pointer as an offset from the file start.
+    position: u64,
+
+    /// Opens `path` through `std.Io`.
+    ///
+    /// The path's permission set is enforced first (`.read` mode needs read
+    /// bits, `.write`/`.append` need write bits); only `.plugin`-scheme
+    /// paths strictly under the configured `zorcerer_root` are accepted
+    /// (the root itself is not openable as a file), everything else is
+    /// refused so hand-built paths cannot escape the plugin tree.
+    ///
+    /// Mode mapping:
+    /// - `.read`: opens an existing file (`dir.openFileAbsolute`); the
+    ///   pointer starts at 0.
+    /// - `.write`: creates or truncates the file
+    ///   (`dir.createFileAbsolute`, truncate); the pointer starts at 0.
+    /// - `.append`: creates the file or opens it untruncated
+    ///   (`dir.createFileAbsolute`, truncate off); the pointer starts at
+    ///   the current end (`length()`).
+    ///
+    /// Note: unlike the engine mapper, `std.Io` does not create missing
+    /// parent directories; the parent of `path` must already exist for
+    /// write/append modes.
+    pub fn open(io: std.Io, path: ZorcererPath, mode: Mode) OpenError!HostFile {
+        if (path.scheme != .plugin) return error.OperationNotAllowed;
+        try checkPermission(path, switch (mode) {
+            .read => Permission.read,
+            .write, .append => Permission.write,
+        });
+
+        const root = zorcerer_root orelse return error.OperationNotAllowed;
+        if (relativeUnder(root, path.absolute_path, true) == null)
+            return error.OperationNotAllowed;
+
+        const file = switch (mode) {
+            .read => std.Io.Dir.openFileAbsolute(io, path.absolute_path, .{}) catch
+                return error.OpenFailed,
+            .write => std.Io.Dir.createFileAbsolute(io, path.absolute_path, .{}) catch
+                return error.OpenFailed,
+            .append => std.Io.Dir.createFileAbsolute(io, path.absolute_path, .{ .truncate = false }) catch
+                return error.OpenFailed,
+        };
+
+        var position: u64 = 0;
+        if (mode == .append) {
+            position = file.length(io) catch {
+                file.close(io);
+                return error.OpenFailed;
+            };
+        }
+
+        return HostFile{ .io = io, .file = file, .position = position };
+    }
+
+    /// Closes the host file. After this call the file is stale and this
+    /// file must not be used again, not even `close()` twice (closing a
+    /// `std.Io.File` twice is a checked illegal behavior).
+    pub fn close(self: *HostFile) void {
+        self.file.close(self.io);
+    }
+
+    /// Reads the next chunk, reporting how many bytes landed in `buffer`
+    /// (may be short); reaching 0 signals end of stream. The read is
+    /// positional at this file's pointer and advances it by the reported
+    /// byte count.
+    pub fn read(self: *HostFile, buffer: []u8) ReadError!usize {
+        if (buffer.len == 0) return 0;
+        const bytes_read = self.file.readPositional(self.io, &.{buffer}, self.position) catch
+            return error.ReadFailed;
+        self.position += bytes_read;
+        return bytes_read;
+    }
+
+    /// Fills `buffer` as far as the file goes, returning the number of
+    /// bytes read (equal to `buffer.len` unless end of stream was hit).
+    pub fn readAll(self: *HostFile, buffer: []u8) ReadError!usize {
+        var filled: usize = 0;
+        while (filled != buffer.len) {
+            const bytes_read = try self.read(buffer[filled..]);
+            if (bytes_read == 0) break;
+            filled += bytes_read;
+        }
+        return filled;
+    }
+
+    /// Writes what one `std.Io` positional write accepts at this file's
+    /// pointer, advancing the pointer by the reported byte count.
+    pub fn write(self: *HostFile, buffer: []const u8) WriteError!usize {
+        if (buffer.len == 0) return 0;
+        const bytes_written = self.file.writePositional(self.io, &.{buffer}, self.position) catch
+            return error.WriteFailed;
+        self.position += bytes_written;
+        return bytes_written;
+    }
+
+    /// Writes the whole `buffer` or fails; zero-progress write calls are
+    /// reported as `error.WriteFailed` instead of looping.
+    pub fn writeAll(self: *HostFile, buffer: []const u8) WriteError!void {
+        var sent: usize = 0;
+        while (sent != buffer.len) {
+            const bytes_written = try self.write(buffer[sent..]);
+            if (bytes_written == 0) return error.WriteFailed;
+            sent += bytes_written;
+        }
+    }
+
+    /// Moves this file's read/write pointer: `start` offsets are absolute
+    /// (expected non-negative), `current`/`end` offsets move the pointer
+    /// relative to their anchor and may be negative, which is how back-
+    /// seeks are expressed. A computed target below 0 is `error.SeekFailed`;
+    /// arithmetic that cannot represent the target is `PositionOverflow`.
+    ///
+    /// Seeking past the end is allowed (host behavior); the gap reads as
+    /// zero bytes later.
+    pub fn seek(self: *HostFile, offset: i64, from: SeekFrom) SeekError!void {
+        const anchor: i128 = switch (from) {
+            .start => if (offset < 0) return error.SeekFailed else 0,
+            .current, .end => self.position,
+        };
+        const target: i128 = anchor + offset;
+        if (target < 0) return error.SeekFailed;
+        if (target > std.math.maxInt(u64)) return error.PositionOverflow;
+        self.position = @intCast(target);
+    }
+
+    /// Current read/write pointer as an offset from the file start; tracks
+    /// direct `read()`/`write()`/`seek()` calls on this file.
+    pub fn tell(self: *const HostFile) usize {
+        return @intCast(self.position);
+    }
+
+    /// File size as reported by the host (`std.Io` stat).
+    pub fn size(self: *const HostFile) SizeError!usize {
+        return @intCast(self.file.length(self.io) catch return error.SizeFailed);
+    }
+
+    /// Asks the host to flush file data to storage (`sync`); a failure is
+    /// reported instead of being silently dropped. Data still pending in a
+    /// `Writer` buffer must be flushed there first.
+    pub fn flush(self: *const HostFile) FlushError!void {
+        self.file.sync(self.io) catch return error.FlushFailed;
+    }
+
+    /// Streaming, buffered reader borrowing an open host file: `buffer`
+    /// (which must be non-empty) is the caller-owned window the standard
+    /// interface fills from the file via `HostFile.read()`, so reads
+    /// advance the file's shared cursor (`position`).
+    ///
+    /// Lifetime: `file` must outlive this reader and stay at a fixed
+    /// address (the file borrows are created from `File.reader()`, which
+    /// hands out the address of the open `File`).
+    pub const Reader = struct {
+        file: *HostFile,
+        /// The standard's streaming reader interface; see std.Io.Reader.
+        interface: std.Io.Reader,
+
+        /// Builds the adapter around `file`; `buffer.len` must be nonzero.
+        pub fn init(file: *HostFile, buffer: []u8) Reader {
+            std.debug.assert(buffer.len > 0);
+            return .{
+                .file = file,
+                .interface = .{
+                    .vtable = &.{ .stream = streamHostFile },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+    };
+
+    /// Streaming, buffered writer borrowing an open host file: the
+    /// caller-owned `buffer` (which must be non-empty) accumulates written
+    /// bytes and is drained to the file via `HostFile.write()`, so drains
+    /// advance the file's shared cursor (`position`).
+    ///
+    /// Lifetime: same borrow rule as `Reader`.
+    pub const Writer = struct {
+        file: *HostFile,
+        /// The standard's streaming writer interface; see std.Io.Writer.
+        interface: std.Io.Writer,
+
+        /// Builds the adapter around `file`; `buffer.len` must be nonzero.
+        pub fn init(file: *HostFile, buffer: []u8) Writer {
+            std.debug.assert(buffer.len > 0);
+            return .{
+                .file = file,
+                .interface = .{
+                    .vtable = &.{ .drain = drainHostFile },
+                    .buffer = buffer,
+                },
+            };
+        }
+    };
+};
+
+// --- `std.Io` adapters for HostFile --------------------------------------------
+
+/// `std.Io.Reader.VTable.stream` for `HostFile.Reader`: pulls bytes from
+/// the borrowed host file into the sink (or, for small limits, straight
+/// into the sink's buffer). Host end-of-file (`HostFile.read()` returning
+/// 0) surfaces as `error.EndOfStream`, short reads as a short return, host
+/// failures as `error.ReadFailed`.
+fn streamHostFile(
+    self: *std.Io.Reader,
+    w: *std.Io.Writer,
+    limit: std.Io.Limit,
+) std.Io.Reader.StreamError!usize {
+    const reader: *HostFile.Reader = @alignCast(@fieldParentPtr("interface", self));
+
+    if (limit == .nothing) return 0;
+
+    const dest = limit.slice(try w.writableSliceGreedy(1));
+    if (dest.len == 0) return 0;
+
+    const bytes_read = reader.file.read(dest) catch {
+        // The host failed; surface it as the standard's read failure.
+        return error.ReadFailed;
+    };
+    if (bytes_read == 0) return error.EndOfStream;
+
+    w.advance(bytes_read);
+    return bytes_read;
+}
+
+/// `std.Io.Writer.VTable.drain` for `HostFile.Writer`: writes the buffer
+/// content, then each `data` component (the last repeated `splat` times)
+/// through the borrowed host file, consuming what got written. Host
+/// failures surface as `error.WriteFailed`.
+fn drainHostFile(
+    self: *std.Io.Writer,
+    data: []const []const u8,
+    splat: usize,
+) std.Io.Writer.Error!usize {
+    const writer: *HostFile.Writer = @alignCast(@fieldParentPtr("interface", self));
+
+    var written: usize = 0;
+
+    // The interface contract: buffer content is consumed first, followed by
+    // every slice of `data`, then `data[data.len - 1]` repeated `splat`
+    // times.
+    written += try fileWriteToHost(writer, self.buffered());
+    for (data[0 .. data.len - 1]) |chunk| {
+        written += try fileWriteToHost(writer, chunk);
+    }
+    if (splat > 0) {
+        const repeated = data[data.len - 1];
+        var remaining = splat;
+        while (remaining > 0) : (remaining -= 1) {
+            written += try fileWriteToHost(writer, repeated);
+        }
+    }
+
+    return self.consume(written);
+}
+
+/// Writes `chunk` completely through `HostFile.write()`; zero-progress
+/// host responses are a hard failure rather than an infinite loop.
+fn fileWriteToHost(writer: *HostFile.Writer, chunk: []const u8) std.Io.Writer.Error!usize {
+    var sent: usize = 0;
+    while (sent != chunk.len) {
+        const n = writer.file.write(chunk[sent..]) catch return error.WriteFailed;
+        if (n == 0) return error.WriteFailed;
+        sent += n;
+    }
+    return sent;
+}
+
+// --- Source Engine directory I/O ---------------------------------------------
 
 /// A directory enumeration session ("opened directory") in the engine FS.
 ///
@@ -675,6 +1209,8 @@ fn fileWriteToEngine(writer: *SourceFile.Writer, chunk: []const u8) std.Io.Write
 ///
 /// Lifecycle: created by `SourceDirectory.open()`, entries pulled by
 /// `next()`, session terminated by `close()`.
+///
+/// Only `.game`-scheme directories may be opened this way (see `File`).
 pub const SourceDirectory = struct {
     /// The engine filesystem binding the find session was created through.
     fs: SourceFilesystem,
@@ -689,9 +1225,6 @@ pub const SourceDirectory = struct {
     /// Whether `first_name` still has to be reported by `next()`.
     first_pending: bool = false,
 
-    /// Errors of opening a directory session; shared with file opens.
-    pub const OpenError = SourceFile.OpenError;
-
     /// One filesystem entry reported by `next()`.
     pub const Entry = struct {
         /// Entry name relative to the opened directory, sliced from
@@ -701,40 +1234,45 @@ pub const SourceDirectory = struct {
         is_directory: bool,
     };
 
-    /// Errors of entry enumeration.
+    /// Errors of entry enumeration; `error.IoFailed` is unreachable for the
+    /// engine backend but part of the shared contract.
     pub const EntryError = error{
         /// An engine entry name does not fit `next()`'s buffer.
         NameTooLong,
+        /// Host only: the underlying `std.Io` iteration failed.
+        IoFailed,
     };
 
     /// Starts a find session over `path`'s content (the wildcard
-    /// `<path>/*`, or `*` for the tree root itself) in the path's pathID.
+    /// `<path>/*`, or `*` for the tree root itself) in pathID `GAME`.
     /// Read permission is enforced. Opening an unmatchable pattern yields
     /// an empty session instead of an error (the engine reports that
     /// condition via `invalid_find_handle`/null).
     pub fn open(fs: SourceFilesystem, path: ZorcererPath) OpenError!SourceDirectory {
+        if (path.scheme != .game) return error.OperationNotAllowed;
         try checkPermission(path, .read);
 
-        const engine_path = try enginePath(path, false);
-        if (engine_path.needs_plugin_mount) try mountPluginTree(fs);
+        const root = game_root orelse return error.OperationNotAllowed;
+        const engine_name = relativeUnder(root, path.absolute_path, false) orelse
+            return error.OperationNotAllowed;
 
         var pattern_buf: [max_engine_name_len]u8 = undefined;
-        const wildcard: [*:0]const u8 = if (engine_path.name.len == 0)
+        const wildcard: [*:0]const u8 = if (engine_name.len == 0)
             "*"
         else
-            (std.fmt.bufPrintZ(&pattern_buf, "{s}/*", .{engine_path.name}) catch
+            (std.fmt.bufPrintZ(&pattern_buf, "{s}/*", .{engine_name}) catch
                 return error.NameTooLong).ptr;
 
         var find_handle: FindHandle = invalid_find_handle;
-        const first = fs.abi.find_first_ex(fs.interface, wildcard, engine_path.path_id, &find_handle);
+        const first = fs.abi.find_first_ex(fs.interface, wildcard, game_path_id, &find_handle);
 
         var session = SourceDirectory{ .fs = fs, .find_handle = find_handle };
 
-        if (first) |engine_name| {
-            // See through the zero terminator: `engine_name` is a
+        if (first) |engine_first| {
+            // See through the zero terminator: `engine_first` is a
             // `[*:0]const u8`, so a raw `[0..len]` slice would carry no
             // length and fail `@memcpy`'s operand checks.
-            const bytes = std.mem.span(engine_name);
+            const bytes = std.mem.span(engine_first);
             if (bytes.len > max_engine_name_len) return error.NameTooLong;
             @memcpy(session.first_name[0..bytes.len], bytes);
             session.first_name_len = bytes.len;
@@ -749,8 +1287,6 @@ pub const SourceDirectory = struct {
     /// returned `name` slice points into `name_buffer` and is valid until
     /// the next `next()` call.
     pub fn next(self: *SourceDirectory, name_buffer: []u8) EntryError!?Entry {
-        var engine_name: ?[*:0]const u8 = null;
-
         if (self.first_pending) {
             self.first_pending = false;
             // `first_name` already holds the engine-owned copy.
@@ -764,9 +1300,9 @@ pub const SourceDirectory = struct {
         }
 
         if (self.find_handle == invalid_find_handle) return null;
-        engine_name = self.fs.abi.find_next(self.fs.interface, self.find_handle) orelse return null;
+        const engine_name = self.fs.abi.find_next(self.fs.interface, self.find_handle) orelse return null;
 
-        const name = std.mem.span(engine_name.?);
+        const name = std.mem.span(engine_name);
         if (name.len > name_buffer.len) return error.NameTooLong;
         @memcpy(name_buffer[0..name.len], name);
         return Entry{
@@ -785,43 +1321,132 @@ pub const SourceDirectory = struct {
     }
 };
 
-// --- Engine path/state internals --------------------------------------------
+// --- std.Io directory I/O (plugin:// backend) ---------------------------------
 
-/// Where a `ZorcererPath` resolves in the engine filesystem namespace.
-const EnginePath = struct {
-    /// Name relative to the search path identified by `path_id` (may be
-    /// empty for the tree root itself).
-    name: []const u8,
-    /// Zero-terminated engine pathID the name resolves against.
-    path_id: [*:0]const u8,
-    /// Whether `plugin_path_id` must be added to the engine's search paths
-    /// before the name can resolve.
-    needs_plugin_mount: bool = false,
+/// A directory enumeration session over `std.Io` (the host OS filesystem):
+/// this is the backend for `plugin://` directories, wrapped around
+/// `std.Io.Dir.Iterator`.
+///
+/// Lifecycle: created by `HostDirectory.open()`, entries pulled by `next()`,
+/// session terminated by `close()` (which releases the opened directory
+/// handle; dropping the handle without closing it is a checked illegal
+/// behavior).
+pub const HostDirectory = struct {
+    /// The `std.Io` instance this session performs its I/O through.
+    io: std.Io,
+    /// The opened directory handle, released by `close()`.
+    dir: std.Io.Dir,
+    /// The live iterator state; advanced by `next()`.
+    iterator: std.Io.Dir.Iterator,
+
+    /// Opens `path` for enumeration through `std.Io`.
+    ///
+    /// Read permission is enforced; only `.plugin`-scheme paths at or under
+    /// the configured `zorcerer_root` are accepted (opening the root
+    /// itself is allowed), everything else is refused so hand-built paths
+    /// cannot escape the plugin tree.
+    pub fn open(io: std.Io, path: ZorcererPath) OpenError!HostDirectory {
+        if (path.scheme != .plugin) return error.OperationNotAllowed;
+        try checkPermission(path, .read);
+
+        const root = zorcerer_root orelse return error.OperationNotAllowed;
+        if (relativeUnder(root, path.absolute_path, false) == null)
+            return error.OperationNotAllowed;
+
+        const dir = std.Io.Dir.openDirAbsolute(io, path.absolute_path, .{ .iterate = true }) catch
+            return error.OpenFailed;
+
+        // The handle is fresh and its cursor unmodified, so starting from
+        // the reading state is valid per `std.Io.Dir`.
+        return HostDirectory{ .io = io, .dir = dir, .iterator = dir.iterateAssumeFirstIteration() };
+    }
+
+    /// Copies the next entry's name into `name_buffer` and reports it with
+    /// its directory flag; `null` once the session is exhausted. The
+    /// returned `name` slice points into `name_buffer` and is valid until
+    /// the next `next()` call (the host iterator invalidates its entry
+    /// names across calls, same as the engine's find session).
+    pub fn next(self: *HostDirectory, name_buffer: []u8) SourceDirectory.EntryError!?SourceDirectory.Entry {
+        const entry = self.iterator.next(self.io) catch return error.IoFailed;
+        const source_entry = entry orelse return null;
+
+        if (source_entry.name.len > name_buffer.len) return error.NameTooLong;
+        @memcpy(name_buffer[0..source_entry.name.len], source_entry.name);
+        return SourceDirectory.Entry{
+            .name = name_buffer[0..source_entry.name.len],
+            .is_directory = source_entry.kind == .directory,
+        };
+    }
+
+    /// Ends the session and releases the directory handle. This call
+    /// performs exactly one `dir.close()` and must be the last operation
+    /// on this session (`std.Io.Dir` checks dropping opened handles as
+    /// illegal).
+    pub fn close(self: *HostDirectory) void {
+        self.dir.close(self.io);
+    }
 };
 
-/// Translates a `ZorcererPath` into an engine name + pathID.
+// --- Unified directory ---------------------------------------------------------
+
+/// A directory enumeration session over `Directory`'s backend selected by
+/// the path's scheme (see `File`): `.game` through the engine's find
+/// session (`SourceDirectory`), `.plugin` through `std.Io`
+/// (`HostDirectory`).
 ///
-/// - Prefixes resolved against `game_root` map onto `game_path_id`.
-/// - Prefixes resolved against `zorcerer_root` map onto `plugin_path_id`.
-/// - Everything outside these configured roots is refused: the engine can
-///   only see what its search paths mediate.
-///
-/// `require_inside_root` treats the root itself as a file destination (not
-/// openable); `false` allows the empty name (directory opening).
-fn enginePath(path: ZorcererPath, require_inside_root: bool) error{OperationNotAllowed}!EnginePath {
-    if (relativeUnder(game_root orelse "", path.absolute_path, require_inside_root)) |name| {
-        return .{ .name = name, .path_id = game_path_id };
+/// Lifecycle: created by `open()`, entries pulled by `next()`, session
+/// terminated by `close()`.
+pub const Directory = union(enum) {
+    /// `game://` content, enumerated through the engine filesystem.
+    engine: SourceDirectory,
+    /// `plugin://` content, enumerated through `std.Io`.
+    host: HostDirectory,
+
+    /// One filesystem entry reported by `next()`.
+    pub const Entry = SourceDirectory.Entry;
+
+    /// Errors of entry enumeration (see `SourceDirectory.EntryError`).
+    pub const EntryError = SourceDirectory.EntryError;
+
+    /// Starts a session over the directory `path` through the backend its
+    /// `scheme` selects; `fs` is only consulted for `.game` paths (see
+    /// `File.open()` for the `EngineNotBound` contract).
+    pub fn open(io: std.Io, fs: ?SourceFilesystem, path: ZorcererPath) OpenError!Directory {
+        return switch (path.scheme) {
+            .game => .{ .engine = try SourceDirectory.open(fs orelse return error.EngineNotBound, path) },
+            .plugin => .{ .host = try HostDirectory.open(io, path) },
+        };
     }
-    if (relativeUnder(zorcerer_root orelse "", path.absolute_path, require_inside_root)) |name| {
-        return .{ .name = name, .path_id = plugin_path_id, .needs_plugin_mount = true };
+
+    /// Copies the next entry's name into `name_buffer` and reports it with
+    /// its directory flag; `null` once the session is exhausted. The
+    /// returned `name` slice points into `name_buffer` and is valid until
+    /// the next `next()` call.
+    pub fn next(self: *Directory, name_buffer: []u8) EntryError!?Entry {
+        return switch (self.*) {
+            inline else => |*session| try session.next(name_buffer),
+        };
     }
-    return error.OperationNotAllowed;
-}
+
+    /// Ends the session; see the per-backend `close()` documentation.
+    pub fn close(self: *Directory) void {
+        switch (self.*) {
+            inline else => |*session| session.close(),
+        }
+    }
+};
+
+// --- Host path/state internals ------------------------------------------------
 
 /// Returns `absolute` stripped off the `root` prefix, or null when
 /// `absolute` is not strictly under `root` (`require_inside`) resp. not at
 /// or under it. Roots are expected without a trailing separator; a root of
 /// "" means unconfigured and matches nothing.
+///
+/// Both backends use this to refuse hand-built paths outside their
+/// configured tree: the engine cannot resolve names outside its search
+/// paths at all, and the `std.Io` backend must not touch files outside the
+/// plugin tree even though it could.
 fn relativeUnder(
     root: []const u8,
     absolute: []const u8,
@@ -836,40 +1461,14 @@ fn relativeUnder(
     return absolute[root.len + 1 ..];
 }
 
-/// The engine open option strings behind `open()`'s modes, exact spelling
-/// as used by game code [checkout: nav_file.cpp:1241 "rb",
-/// ai_networkmanager.cpp:351 "wb", physics.cpp:2910 "ab"].
-fn optionsString(mode: SourceFile.Mode) [:0]const u8 {
-    return switch (mode) {
-        .read => "rb",
-        .write => "wb",
-        .append => "ab",
-    };
-}
-
-/// Whether `plugin_path_id` was already added to the engine FS' search
-/// paths; the mount is global because the engine FS is process-resident,
-/// tests reset the flag themselves.
-var plugin_tree_mounted: bool = false;
-
-/// Adds the Zorcerer installation root into the engine FS under
-/// `plugin_path_id`. Idempotent per process: the first successful mount
-/// sets `plugin_tree_mounted`, and every later call returns without
-/// touching the engine again.
-fn mountPluginTree(fs: SourceFilesystem) error{OperationNotAllowed}!void {
-    if (plugin_tree_mounted) return;
-    const root = zorcerer_root orelse return error.OperationNotAllowed;
-
-    var buf: [max_engine_name_len]u8 = undefined;
-    const root_z = std.fmt.bufPrintZ(&buf, "{s}", .{root}) catch return error.OperationNotAllowed;
-    fs.abi.add_search_path(fs.interface, root_z.ptr, plugin_path_id, search_path_add_to_tail);
-    plugin_tree_mounted = true;
-}
-
-// --- Tests -----------------------------------------------------------------
+// --- Tests ---------------------------------------------------------------------
 
 const test_zorcerer_root = "/steamapps/zorcerer";
 const test_game_root = "/steamapps/team fortress 2/tf";
+
+/// The `std.Io` instance the test runner owns; used for host-backend tests
+/// and enumerations.
+const test_io = std.testing.io;
 
 /// Returns a mocked plugin context whose configuration resembles a
 /// `hello` plugin living under `plugins/hello/`. Only the fields relevant
@@ -903,6 +1502,7 @@ test "parsePath resolves game:// to the read-only tf directory" {
         "/steamapps/team fortress 2/tf/maps/arena.bsp",
         resolved.absolute_path,
     );
+    try std.testing.expectEqual(Scheme.game, resolved.scheme);
     try std.testing.expect(resolved.permissions.readOnly());
 }
 
@@ -923,6 +1523,7 @@ test "parsePath resolves plugin:// to the writable plugin root" {
         "/steamapps/zorcerer/plugins/hello/settings.cfg",
         resolved.absolute_path,
     );
+    try std.testing.expectEqual(Scheme.plugin, resolved.scheme);
     try std.testing.expect(!resolved.permissions.readOnly());
     // Read and write only: no execute bits may be granted.
     try std.testing.expectEqual(
@@ -1008,7 +1609,7 @@ test "checkPermission rejects execute on plugin:// paths" {
     try checkPermission(resolved, .write);
 }
 
-// --- Mock engine filesystem (tests) -----------------------------------------
+// --- Mock engine filesystem (tests) -------------------------------------------
 
 /// In-memory stand-in for the engine filesystem the mock ABI below works
 /// on: records what was called with what, and serves reads/writes and a
@@ -1035,13 +1636,6 @@ const MockFs = struct {
     closed_calls: usize = 0,
     flushed_calls: usize = 0,
     seek_calls: usize = 0,
-
-    // Search-path mount bookkeeping.
-    mount_calls: usize = 0,
-    mounted_path: [128]u8 = undefined,
-    mounted_path_len: usize = 0,
-    mounted_path_id: [32]u8 = undefined,
-    mounted_path_id_len: usize = 0,
 
     // Find-session bookkeeping.
     entries: []const MockEntry = &.{},
@@ -1142,16 +1736,6 @@ fn mockFlush(fs: *anyopaque, handle: Handle) callconv(.c) void {
     self.flushed_calls += 1;
 }
 
-fn mockAddSearchPath(fs: *anyopaque, path: [*:0]const u8, path_id: [*:0]const u8, add_type: c_int) callconv(.c) void {
-    const self: *MockFs = @ptrCast(@alignCast(fs));
-    self.mount_calls += 1;
-    self.mounted_path_len = spanCopyInto(&self.mounted_path, path);
-    self.mounted_path_id_len = spanCopyInto(&self.mounted_path_id, path_id);
-    // Not `try`: a C-calling-convention mock cannot return an error.
-    std.testing.expectEqual(search_path_add_to_tail, add_type) catch
-        std.process.abort();
-}
-
 fn mockFindFirstEx(fs: *anyopaque, wildcard: [*:0]const u8, path_id: [*:0]const u8, handle: *FindHandle) callconv(.c) ?[*:0]const u8 {
     const self: *MockFs = @ptrCast(@alignCast(fs));
     self.wildcard_len = spanCopyInto(&self.wildcard, wildcard);
@@ -1198,7 +1782,6 @@ const mock_abi = Abi{
     .tell = mockTell,
     .size = mockSize,
     .flush = mockFlush,
-    .add_search_path = mockAddSearchPath,
     .find_first_ex = mockFindFirstEx,
     .find_next = mockFindNext,
     .find_is_directory = mockFindIsDirectory,
@@ -1210,52 +1793,17 @@ fn mockFilesystem(engine: *MockFs) SourceFilesystem {
     return SourceFilesystem{ .interface = @ptrCast(engine), .abi = mock_abi };
 }
 
-// --- Source Engine I/O tests ------------------------------------------------
+// --- Source Engine I/O tests ---------------------------------------------------
 
-test "SourceFile.open translates plugin:// URIs and mounts the plugin tree" {
+test "SourceFile.open resolves game:// into the game pathID" {
     const saved_game_root = game_root;
     const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
     defer {
         game_root = saved_game_root;
         zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
     }
     setGameRoot(test_game_root);
     setZorcererRoot(test_zorcerer_root);
-    plugin_tree_mounted = false;
-
-    var plugin_ctx = mockContext();
-    const path = try parsePath(&plugin_ctx, "plugin://settings.cfg");
-
-    var engine = MockFs{};
-    var file = try SourceFile.open(mockFilesystem(&engine), path, .write);
-    file.close();
-
-    // The plugin tree was mounted exactly once, with the Zorcerer root.
-    try std.testing.expectEqual(@as(usize, 1), engine.mount_calls);
-    try std.testing.expectEqualStrings(test_zorcerer_root, engine.mounted_path[0..engine.mounted_path_len]);
-    try std.testing.expectEqualStrings(plugin_path_id, engine.mounted_path_id[0..engine.mounted_path_id_len]);
-
-    // Open went through the plugin pathID, relative to the Zorcerer root.
-    try std.testing.expectEqual(@as(usize, 1), engine.open_calls);
-    try std.testing.expectEqualStrings("plugins/hello/settings.cfg", engine.opened_name[0..engine.opened_name_len]);
-    try std.testing.expectEqualStrings("wb", engine.opened_options[0..engine.opened_options_len]);
-    try std.testing.expectEqualStrings(plugin_path_id, engine.opened_path_id[0..engine.opened_path_id_len]);
-    try std.testing.expectEqual(@as(usize, 1), engine.closed_calls);
-}
-
-test "SourceFile.open resolves game:// into the game pathID without mounting" {
-    const saved_game_root = game_root;
-    const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
-    defer {
-        game_root = saved_game_root;
-        zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
-    }
-    setGameRoot(test_game_root);
-    plugin_tree_mounted = false;
 
     var plugin_ctx = mockContext();
     const path = try parsePath(&plugin_ctx, "game://maps/arena.bsp");
@@ -1265,26 +1813,22 @@ test "SourceFile.open resolves game:// into the game pathID without mounting" {
     defer file.close();
 
     // The tf directory is already mounted by the engine as GAME; no
-    // engine state changes are needed.
-    try std.testing.expectEqual(@as(usize, 0), engine.mount_calls);
+    // engine state changes are needed, and the open went through pathID GAME.
     try std.testing.expectEqual(@as(usize, 1), engine.open_calls);
     try std.testing.expectEqualStrings("maps/arena.bsp", engine.opened_name[0..engine.opened_name_len]);
     try std.testing.expectEqualStrings("rb", engine.opened_options[0..engine.opened_options_len]);
     try std.testing.expectEqualStrings(game_path_id, engine.opened_path_id[0..engine.opened_path_id_len]);
 }
 
-test "SourceFile.open enforces permissions and engine-foreign paths" {
+test "SourceFile.open enforces permissions and refuses non-game paths" {
     const saved_game_root = game_root;
     const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
     defer {
         game_root = saved_game_root;
         zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
     }
     setGameRoot(test_game_root);
     setZorcererRoot(test_zorcerer_root);
-    plugin_tree_mounted = false;
 
     var plugin_ctx = mockContext();
     const ctx = &plugin_ctx;
@@ -1299,8 +1843,12 @@ test "SourceFile.open enforces permissions and engine-foreign paths" {
     );
     try std.testing.expectEqual(@as(usize, 0), engine_state.open_calls);
 
-    // A manually built path outside both roots must be refused.
-    const foreign = ZorcererPath{ .absolute_path = "/etc/passwd", .permissions = read_write_permissions };
+    // A manually built path outside the game root must be refused.
+    const foreign = ZorcererPath{
+        .absolute_path = "/etc/passwd",
+        .permissions = read_only_permissions,
+        .scheme = .game,
+    };
     var engine_state2 = MockFs{};
     try std.testing.expectError(
         error.OperationNotAllowed,
@@ -1308,159 +1856,20 @@ test "SourceFile.open enforces permissions and engine-foreign paths" {
     );
     try std.testing.expectEqual(@as(usize, 0), engine_state2.open_calls);
 
-    // Unset Zorcerer root: plugin paths cannot get mounted at all.
+    // The engine backend never serves plugin:// paths; those route to
+    // std.Io (see HostFile.open and File.open).
     var engine_state3 = MockFs{};
-    zorcerer_root = null;
     try std.testing.expectError(
         error.OperationNotAllowed,
-        SourceFile.open(mockFilesystem(&engine_state3), plugin_path, .write),
+        SourceFile.open(mockFilesystem(&engine_state3), plugin_path, .read),
     );
     try std.testing.expectEqual(@as(usize, 0), engine_state3.open_calls);
 }
 
-test "SourceFile.read/write/seek round trip through the engine ABI" {
+test "SourceDirectory enumerates game:// entries and closes the find session" {
     const saved_game_root = game_root;
-    const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
-    defer {
-        game_root = saved_game_root;
-        zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
-    }
-    setZorcererRoot(test_zorcerer_root);
-    plugin_tree_mounted = false;
-
-    var plugin_ctx = mockContext();
-    const plugin_path = try parsePath(&plugin_ctx, "plugin://settings.cfg");
-
-    var engine = MockFs{};
-    const fs = mockFilesystem(&engine);
-    var file = try SourceFile.open(fs, plugin_path, .write);
-    try file.writeAll("hello world");
-    file.close();
-
-    // Switch the mock's file content to what was written above.
-    engine.content = engine.write_buffer[0..engine.write_len];
-    file = try SourceFile.open(fs, plugin_path, .read);
-
-    var buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("hello world", buffer[0..try file.readAll(&buffer)]);
-    try std.testing.expectEqual(@as(usize, 11), file.tell());
-    try std.testing.expectEqual(@as(usize, 11), file.size());
-
-    try file.seek(4, .start);
-    try std.testing.expectEqualStrings("o world", buffer[0..try file.readAll(&buffer)]);
-    try std.testing.expectEqual(@as(usize, 11), file.tell());
-
-    // Seeks clamp at the mock file's end.
-    try file.seek(6, .current);
-    try std.testing.expectEqual(@as(usize, 11), file.tell());
-
-    // Negative offsets seek backwards from the end.
-    try file.seek(-5, .end);
-    try std.testing.expectEqual(@as(usize, 6), file.tell());
-    try std.testing.expectEqual(@as(usize, 5), try file.readAll(&buffer));
-    try std.testing.expectEqualStrings("world", buffer[0..5]);
-
-    file.flush();
-    file.close();
-}
-
-test "SourceFile.Reader streams reads across buffer fills" {
-    const saved_game_root = game_root;
-    const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
-    defer {
-        game_root = saved_game_root;
-        zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
-    }
-    setZorcererRoot(test_zorcerer_root);
-    plugin_tree_mounted = false;
-
-    var plugin_ctx = mockContext();
-    const plugin_path = try parsePath(&plugin_ctx, "plugin://settings.cfg");
-
-    var engine = MockFs{ .content = "0123456789" };
-    const fs = mockFilesystem(&engine);
-    var file = try SourceFile.open(fs, plugin_path, .read);
-
-    var window: [6]u8 = undefined;
-    var buffer: [6]u8 = undefined;
-    var r = file.reader(&window);
-
-    try r.interface.readSliceAll(&buffer);
-    try std.testing.expectEqualStrings("012345", buffer[0..6]);
-
-    try r.interface.readSliceAll(buffer[0..4]);
-    try std.testing.expectEqualStrings("6789", buffer[0..4]);
-
-    // Exactly at end of stream now.
-    try std.testing.expectError(error.EndOfStream, r.interface.takeByte());
-
-    file.close();
-}
-
-test "SourceFile.Writer buffers and drains to the engine" {
-    const saved_game_root = game_root;
-    const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
-    defer {
-        game_root = saved_game_root;
-        zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
-    }
-    setZorcererRoot(test_zorcerer_root);
-    plugin_tree_mounted = false;
-
-    var plugin_ctx = mockContext();
-    const plugin_path = try parsePath(&plugin_ctx, "plugin://settings.cfg");
-
-    var engine = MockFs{};
-    const fs = mockFilesystem(&engine);
-    var file = try SourceFile.open(fs, plugin_path, .write);
-
-    var sink: [4]u8 = undefined;
-    var w = file.writer(&sink);
-
-    // "abcd" fills the window exactly: buffered, no engine traffic yet.
-    try w.interface.writeAll("abcd");
-    try std.testing.expectEqual(@as(usize, 4), w.interface.end);
-    try std.testing.expectEqual(@as(usize, 0), engine.write_calls);
-
-    // "e" overflows the window: the drain sends the buffered "abcd" and
-    // then "e" itself to the engine, two separate write calls.
-    try w.interface.writeAll("e");
-    try std.testing.expectEqualStrings("abcde", engine.write_buffer[0..engine.write_len]);
-    try std.testing.expectEqual(@as(usize, 2), engine.write_calls);
-
-    // "fg" fits the emptied window again: buffered, no new engine call.
-    try w.interface.writeAll("fg");
-    try std.testing.expectEqual(@as(usize, 2), engine.write_calls);
-
-    // Flushing the interface drains the remaining buffered bytes.
-    try w.interface.flush();
-    try std.testing.expectEqualStrings("abcdefg", engine.write_buffer[0..engine.write_len]);
-    try std.testing.expectEqual(@as(usize, 3), engine.write_calls);
-
-    // The engine's own buffer is flushed explicitly through the handle.
-    file.flush();
-    try std.testing.expectEqual(@as(usize, 1), engine.flushed_calls);
-
-    file.close();
-}
-
-test "SourceDirectory enumerates entries and closes the find session" {
-    const saved_game_root = game_root;
-    const saved_zorcerer_root = zorcerer_root;
-    const saved_mount = plugin_tree_mounted;
-    defer {
-        game_root = saved_game_root;
-        zorcerer_root = saved_zorcerer_root;
-        plugin_tree_mounted = saved_mount;
-    }
+    defer game_root = saved_game_root;
     setGameRoot(test_game_root);
-    plugin_tree_mounted = false;
 
     var plugin_ctx = mockContext();
     const game_path = try parsePath(&plugin_ctx, "game://maps");
@@ -1499,13 +1908,8 @@ test "SourceDirectory enumerates entries and closes the find session" {
 
 test "SourceDirectory reports an empty session without closing" {
     const saved_game_root = game_root;
-    const saved_mount = plugin_tree_mounted;
-    defer {
-        game_root = saved_game_root;
-        plugin_tree_mounted = saved_mount;
-    }
+    defer game_root = saved_game_root;
     setGameRoot(test_game_root);
-    plugin_tree_mounted = false;
 
     var plugin_ctx = mockContext();
     const game_path = try parsePath(&plugin_ctx, "game://maps");
@@ -1520,4 +1924,401 @@ test "SourceDirectory reports an empty session without closing" {
     // An empty session has no engine handle: closing must not call the engine.
     dir.close();
     try std.testing.expect(!engine.find_closed);
+}
+
+test "SourceFile.read/write/seek round trip through the engine ABI" {
+    const saved_game_root = game_root;
+    defer game_root = saved_game_root;
+    setGameRoot(test_game_root);
+
+    // game:// URIs are read-only by policy, so the URI layer never hands
+    // out a writable engine path; the engine ABI still supports "wb"
+    // opens [checkout: ai_networkmanager.cpp:351], which the mock ABI here
+    // exercises through a path explicitly granted write permission.
+    const game_path = ZorcererPath{
+        .absolute_path = test_game_root ++ "/mockroundtrip/file",
+        .permissions = read_write_permissions,
+        .scheme = .game,
+    };
+
+    var engine = MockFs{};
+    const fs = mockFilesystem(&engine);
+    var file = try SourceFile.open(fs, game_path, .write);
+    try file.writeAll("hello world");
+    file.close();
+
+    // Switch the mock's file content to what was written above.
+    engine.content = engine.write_buffer[0..engine.write_len];
+    file = try SourceFile.open(fs, game_path, .read);
+
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("hello world", buffer[0..try file.readAll(&buffer)]);
+    try std.testing.expectEqual(@as(usize, 11), file.tell());
+    try std.testing.expectEqual(@as(usize, 11), try file.size());
+
+    try file.seek(4, .start);
+    try std.testing.expectEqualStrings("o world", buffer[0..try file.readAll(&buffer)]);
+    try std.testing.expectEqual(@as(usize, 11), file.tell());
+
+    // Seeks clamp at the mock file's end.
+    try file.seek(6, .current);
+    try std.testing.expectEqual(@as(usize, 11), file.tell());
+
+    // Negative offsets seek backwards from the end.
+    try file.seek(-5, .end);
+    try std.testing.expectEqual(@as(usize, 6), file.tell());
+    try std.testing.expectEqual(@as(usize, 5), try file.readAll(&buffer));
+    try std.testing.expectEqualStrings("world", buffer[0..5]);
+
+    try file.flush();
+    file.close();
+}
+
+test "SourceFile.Reader streams reads across buffer fills" {
+    const saved_game_root = game_root;
+    defer game_root = saved_game_root;
+    setGameRoot(test_game_root);
+
+    var plugin_ctx = mockContext();
+    const game_path = try parsePath(&plugin_ctx, "game://mockreader/file");
+
+    var engine = MockFs{ .content = "0123456789" };
+    const fs = mockFilesystem(&engine);
+    var file = try SourceFile.open(fs, game_path, .read);
+
+    var window: [6]u8 = undefined;
+    var buffer: [6]u8 = undefined;
+    var r = file.reader(&window);
+
+    try r.interface.readSliceAll(&buffer);
+    try std.testing.expectEqualStrings("012345", buffer[0..6]);
+
+    try r.interface.readSliceAll(buffer[0..4]);
+    try std.testing.expectEqualStrings("6789", buffer[0..4]);
+
+    // Exactly at end of stream now.
+    try std.testing.expectError(error.EndOfStream, r.interface.takeByte());
+
+    file.close();
+}
+
+test "SourceFile.Writer buffers and drains to the engine" {
+    const saved_game_root = game_root;
+    defer game_root = saved_game_root;
+    setGameRoot(test_game_root);
+
+    // Same grant as the read/write/seek test: writable engine paths do not
+    // come from game:// URIs (read-only), so the test hand-builds one to
+    // exercise the engine write ABI against the mock.
+    const game_path = ZorcererPath{
+        .absolute_path = test_game_root ++ "/mockwriter/file",
+        .permissions = read_write_permissions,
+        .scheme = .game,
+    };
+
+    var engine = MockFs{};
+    const fs = mockFilesystem(&engine);
+    var file = try SourceFile.open(fs, game_path, .write);
+
+    var sink: [4]u8 = undefined;
+    var w = file.writer(&sink);
+
+    // "abcd" fills the window exactly: buffered, no engine traffic yet.
+    try w.interface.writeAll("abcd");
+    try std.testing.expectEqual(@as(usize, 4), w.interface.end);
+    try std.testing.expectEqual(@as(usize, 0), engine.write_calls);
+
+    // "e" overflows the window: the drain sends the buffered "abcd" and
+    // then "e" itself to the engine, two separate write calls.
+    try w.interface.writeAll("e");
+    try std.testing.expectEqualStrings("abcde", engine.write_buffer[0..engine.write_len]);
+    try std.testing.expectEqual(@as(usize, 2), engine.write_calls);
+
+    // "fg" fits the emptied window again: buffered, no new engine call.
+    try w.interface.writeAll("fg");
+    try std.testing.expectEqual(@as(usize, 2), engine.write_calls);
+
+    // Flushing the interface drains the remaining buffered bytes.
+    try w.interface.flush();
+    try std.testing.expectEqualStrings("abcdefg", engine.write_buffer[0..engine.write_len]);
+    try std.testing.expectEqual(@as(usize, 3), engine.write_calls);
+
+    // The engine's own buffer is flushed explicitly through the handle.
+    try file.flush();
+    try std.testing.expectEqual(@as(usize, 1), engine.flushed_calls);
+
+    file.close();
+}
+
+// --- std.Io plugin:// backend tests (real host I/O, via tmpDir) ---------------
+
+/// Per-test fixture for host-backend tests: binds a temp Zorcerer root and
+/// creates the mock context's plugin directory (`plugins/hello`; the
+/// `std.Io` backend does not create parent directories). The caller owns
+/// the returned state and must free `root` and call `tmp.cleanup()` when
+/// done; `setZorcererRoot(null)` restores the module state.
+const TestFixture = struct {
+    /// The temporary dir; `tmp.cleanup()` removes its subtrees.
+    tmp: std.testing.TmpDir,
+    /// Absolute temp Zorcerer root, allocated with `std.testing.allocator`,
+    /// also bound as `zorcerer_root`.
+    root: []u8,
+};
+
+/// Returns the fixture for host-backend tests.
+///
+/// Errors are programmer error (initialization happens exactly once):
+/// failures panic rather than reuse the fixture.
+fn setupPluginRoot() !TestFixture {
+    var tmp = std.testing.tmpDir(.{});
+
+    // Absolute root for `plugin://` URI resolution; allocated because the
+    // module keeps the pointer and uses it after this function returns.
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(test_io, &path_buffer);
+    const root = try std.testing.allocator.dupe(u8, path_buffer[0..root_len]);
+    errdefer std.testing.allocator.free(root);
+    setZorcererRoot(root);
+
+    // Create the mocked plugin's directory (the parent every resolved
+    // plugin:// file lives in) so writes below it succeed.
+    var plugin_dir = try tmp.dir.createDirPathOpen(test_io, "plugins/hello", .{});
+    plugin_dir.close(test_io);
+
+    return .{ .tmp = tmp, .root = root };
+}
+
+/// Frees the fixture and restores the module state.
+fn tearDownPluginRoot(fixture: *TestFixture) void {
+    fixture.tmp.cleanup();
+    std.testing.allocator.free(fixture.root);
+    zorcerer_root = null;
+    fixture.* = undefined;
+}
+
+test "File.open routes plugin:// through std.Io and game:// through the engine" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const plugin_path = try parsePath(&plugin_ctx, "plugin://routing.cfg");
+
+    // plugin:// needs no engine binding.
+    var file = try File.open(test_io, null, plugin_path, .write);
+    try file.writeAll("host");
+    file.close();
+
+    const saved_game_root = game_root;
+    defer game_root = saved_game_root;
+    setGameRoot(test_game_root);
+    const game_path = try parsePath(&plugin_ctx, "game://maps/arena.bsp");
+
+    // game:// without a binding is refused...
+    try std.testing.expectError(error.EngineNotBound, File.open(test_io, null, game_path, .read));
+
+    // ...and with one routes through the engine backend.
+    var engine = MockFs{};
+    var bound = try File.open(test_io, mockFilesystem(&engine), game_path, .read);
+    try std.testing.expectEqual(std.meta.activeTag(bound), .engine);
+    try std.testing.expectEqual(@as(usize, 1), engine.open_calls);
+    try std.testing.expectEqualStrings(game_path_id, engine.opened_path_id[0..engine.opened_path_id_len]);
+    bound.close();
+
+    // Verify the host backend actually created the plugin:// file.
+    var check = try File.open(test_io, null, plugin_path, .read);
+    defer check.close();
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("host", buffer[0..try check.readAll(&buffer)]);
+}
+
+test "HostFile read/write/seek round trip" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const plugin_path = try parsePath(&plugin_ctx, "plugin://roundtrip.cfg");
+
+    var file = try File.open(test_io, null, plugin_path, .write);
+    try file.writeAll("hello world");
+    try std.testing.expectEqual(@as(usize, 11), file.tell());
+    try std.testing.expectEqual(@as(usize, 11), try file.size());
+    try file.flush();
+    file.close();
+
+    file = try File.open(test_io, null, plugin_path, .read);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("hello world", buffer[0..try file.readAll(&buffer)]);
+    try std.testing.expectEqual(@as(usize, 11), file.tell());
+    try std.testing.expectEqual(@as(usize, 11), try file.size());
+
+    // Back-seek by absolute offset.
+    try file.seek(4, .start);
+    try std.testing.expectEqual(@as(usize, 4), file.tell());
+    try std.testing.expectEqualStrings("o world", buffer[0..try file.readAll(&buffer)]);
+
+    // Relative back-seek from the end.
+    try file.seek(-5, .end);
+    try std.testing.expectEqual(@as(usize, 6), file.tell());
+    try std.testing.expectEqualStrings("world", buffer[0..try file.readAll(&buffer)]);
+    file.close();
+}
+
+test "HostFile append keeps existing content and heads writes to the end" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const plugin_path = try parsePath(&plugin_ctx, "plugin://append.log");
+
+    var file = try File.open(test_io, null, plugin_path, .write);
+    try file.writeAll("abc");
+    file.close();
+
+    file = try File.open(test_io, null, plugin_path, .append);
+    try std.testing.expectEqual(@as(usize, 3), file.tell());
+    try file.writeAll("de");
+    try std.testing.expectEqual(@as(usize, 5), file.tell());
+    file.close();
+
+    file = try File.open(test_io, null, plugin_path, .read);
+    defer file.close();
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("abcde", buffer[0..try file.readAll(&buffer)]);
+}
+
+test "HostFile refuses paths outside the configured plugin root" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    var engine = MockFs{};
+
+    // A plugin path pointing at the Zorcerer installation root itself is
+    // not openable as a file.
+    const root_path = ZorcererPath{
+        .absolute_path = zorcerer_root.?,
+        .permissions = read_write_permissions,
+        .scheme = .plugin,
+    };
+    try std.testing.expectError(
+        error.OperationNotAllowed,
+        HostFile.open(test_io, root_path, .write),
+    );
+
+    // Hand-built plugin paths without the configured prefix are refused.
+    const foreign = ZorcererPath{
+        .absolute_path = "/etc/passwd",
+        .permissions = read_write_permissions,
+        .scheme = .plugin,
+    };
+    try std.testing.expectError(
+        error.OperationNotAllowed,
+        File.open(test_io, mockFilesystem(&engine), foreign, .read),
+    );
+
+    // The engine backend refuses plugin:// paths; those route to std.Io.
+    const plugin_path = try parsePath(&plugin_ctx, "plugin://schemes.cfg");
+    try std.testing.expectError(
+        error.OperationNotAllowed,
+        SourceFile.open(mockFilesystem(&engine), plugin_path, .write),
+    );
+    try std.testing.expectEqual(@as(usize, 0), engine.open_calls);
+}
+
+test "HostFile read of a missing file fails coarsely" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const missing = try parsePath(&plugin_ctx, "plugin://no_such_file.cfg");
+
+    try std.testing.expectError(error.OpenFailed, File.open(test_io, null, missing, .read));
+}
+
+test "File.Reader streams plugin:// reads across buffer fills" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const stream_path = try parsePath(&plugin_ctx, "plugin://streamed.dat");
+
+    // Seed content through the same backend.
+    var file = try File.open(test_io, null, stream_path, .write);
+    try file.writeAll("0123456789");
+    file.close();
+
+    file = try File.open(test_io, null, stream_path, .read);
+    var window: [6]u8 = undefined;
+    var buffer: [6]u8 = undefined;
+    var r = file.reader(&window);
+    defer file.close();
+
+    try r.interface().readSliceAll(&buffer);
+    try std.testing.expectEqualStrings("012345", buffer[0..6]);
+
+    try r.interface().readSliceAll(buffer[0..4]);
+    try std.testing.expectEqualStrings("6789", buffer[0..4]);
+
+    // Exactly at end of stream now.
+    try std.testing.expectError(error.EndOfStream, r.interface().takeByte());
+}
+
+test "File.Writer buffers plugin:// writes and drains on overflow and flush" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const sink_path = try parsePath(&plugin_ctx, "plugin://buffered.dat");
+
+    var file = try File.open(test_io, null, sink_path, .write);
+    var sink: [4]u8 = undefined;
+    var w = file.writer(&sink);
+
+    try w.interface().writeAll("abcde");
+    try w.interface().writeAll("fg");
+    try w.interface().flush();
+    file.close();
+
+    file = try File.open(test_io, null, sink_path, .read);
+    defer file.close();
+    var buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("abcdefg", buffer[0..try file.readAll(&buffer)]);
+}
+
+test "Directory routes plugin:// through std.Io iteration" {
+    var fixture = try setupPluginRoot();
+    defer tearDownPluginRoot(&fixture);
+
+    var plugin_ctx = mockContext();
+    const dir_path = try parsePath(&plugin_ctx, "plugin://content");
+    // The `std.Io` backend does not create parent directories: make the
+    // directory under test exist first, then fill it directly.
+    try fixture.tmp.dir.createDirPath(test_io, "plugins/hello/content");
+    var content_dir = try std.Io.Dir.openDirAbsolute(
+        test_io,
+        dir_path.absolute_path,
+        .{ .iterate = true },
+    );
+    defer content_dir.close(test_io);
+
+    const file = try content_dir.createFile(test_io, "unit.dat", .{ .read = true });
+    file.close(test_io);
+    try content_dir.createDirPath(test_io, "nested");
+    var dir = try Directory.open(test_io, null, dir_path);
+    defer dir.close();
+
+    var found_file = false;
+    var found_nested = false;
+    var name_buffer: [64]u8 = undefined;
+    while (try dir.next(&name_buffer)) |entry| {
+        if (std.mem.eql(u8, entry.name, "unit.dat")) {
+            found_file = true;
+            try std.testing.expect(!entry.is_directory);
+        } else if (std.mem.eql(u8, entry.name, "nested")) {
+            found_nested = true;
+            try std.testing.expect(entry.is_directory);
+        }
+    }
+    try std.testing.expect(found_file);
+    try std.testing.expect(found_nested);
 }
