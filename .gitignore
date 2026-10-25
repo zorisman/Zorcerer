@@ -14,3 +14,6 @@ zig-out/
 # Codegen
 src/codegen_generated/*
 !src/codegen_generated/engine_indexes.zig
+
+# Agents
+prompt.md
