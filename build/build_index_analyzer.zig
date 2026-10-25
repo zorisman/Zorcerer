@@ -94,7 +94,15 @@ pub fn addIndexAnalyzer(b: *std.Build) void {
     command.addArg(llvm_config);
     command.addArg(cxx);
     const analyzer = command.addOutputFileArg("vtable-index-analyzer");
-    command.expectExitCode(0);
+
+    // Zig 0.16 treats any stderr output from a Run step that produces output
+    // files as a failure diagnostic, even when the command exits successfully.
+    // The compiler and the informational printf calls above write to stderr,
+    // so without capturing it a successful fresh build prints a misleading
+    // "failed command" report. Capturing stderr keeps successful runs quiet;
+    // on a nonzero exit Zig still forwards the captured output and fails the
+    // step through the default exit-status check.
+    _ = command.captureStdErr(.{});
 
     const install_file = b.addInstallFileWithDir(
         analyzer,
