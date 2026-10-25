@@ -156,6 +156,241 @@ test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
     try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
 }
 
+/// Message the forked child sends to its parent once it has initialized.
+const greeting_text = "Hello from ancestors!";
+
+/// First byte of the child's report. Its presence tells the parent that the
+/// child finished initializing before it started sending the greeting; the
+/// greeting bytes alone are not treated as an initialization signal.
+const child_ready_marker: u8 = 0xA5;
+
+/// State the child establishes for itself after the fork. The parent cannot
+/// inspect this directly (fork copies memory rather than sharing it), so the
+/// child communicates the fact that this state became initialized over the
+/// Unix socket.
+const ChildState = struct {
+    /// Whether the child completed its initialization step. Only an
+    /// initialized state is allowed to send the readiness marker and greeting.
+    initialized: bool,
+};
+
+/// Performs the child's initialization step.
+///
+/// Returns the initialized child state. The implementation is deliberately
+/// allocation-free and lock-free so it remains safe to call in a child that
+/// was forked from a multi-threaded process.
+fn initializeChild() ChildState {
+    return .{ .initialized = true };
+}
+
+/// Everything the parent observed while running `forkGreeting()`.
+pub const ForkGreeting = struct {
+    /// True only when the parent received `child_ready_marker`, which the
+    /// child writes after `initializeChild()` reports success.
+    child_initialized: bool = false,
+
+    /// True when at least one greeting payload byte arrived after the
+    /// readiness marker. This distinguishes "some message arrived" from the
+    /// stronger exact-content check in `matchesMessage()`.
+    message_received: bool = false,
+
+    /// Bytes of the greeting received from the child. Only the first
+    /// `message_len` entries are meaningful.
+    message: [greeting_text.len]u8 = undefined,
+
+    /// Number of valid bytes in `message`; never exceeds `message.len`.
+    message_len: usize = 0,
+
+    /// Returns the received greeting bytes.
+    ///
+    /// The returned slice borrows this result and remains valid for as long
+    /// as the result does.
+    pub fn text(self: *const ForkGreeting) []const u8 {
+        return self.message[0..self.message_len];
+    }
+
+    /// Reports whether the received greeting equals `expected`.
+    ///
+    /// Returns false when fewer than `expected.len` bytes arrived.
+    pub fn matchesMessage(self: *const ForkGreeting, expected: []const u8) bool {
+        return std.mem.eql(u8, self.text(), expected);
+    }
+};
+
+/// Reads from `fd` until `buffer` is full or the peer closes its end.
+///
+/// Returns the number of bytes read. Retries interrupted reads. Returns
+/// `error.ReadFailed` for any non-`EINTR` read failure.
+fn readAtMost(fd: std.os.linux.fd_t, buffer: []u8) !usize {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const rc = std.os.linux.read(fd, buffer[total..].ptr, buffer.len - total);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) break;
+                total += rc;
+            },
+            .INTR => continue,
+            else => return error.ReadFailed,
+        }
+    }
+    return total;
+}
+
+/// Writes all of `buffer` to `fd`, retrying interrupted and partial writes.
+///
+/// Returns `error.WriteFailed` when the peer closes the socket or any other
+/// write error occurs.
+fn writeAll(fd: std.os.linux.fd_t, buffer: []const u8) !void {
+    var written: usize = 0;
+    while (written < buffer.len) {
+        const rc = std.os.linux.write(fd, buffer[written..].ptr, buffer.len - written);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.WriteFailed;
+                written += rc;
+            },
+            .INTR => continue,
+            else => return error.WriteFailed,
+        }
+    }
+}
+
+/// Body of the forked child. Never returns.
+///
+/// Closes the parent's socket end, initializes the child state, sends the
+/// readiness marker followed by `greeting_text`, and exits. The child uses
+/// only raw Linux syscalls here: after a fork from a multi-threaded process it
+/// must not touch allocators, locks, or the test runner's `std.Io` state.
+fn childGreeting(fds: [2]std.os.linux.fd_t) noreturn {
+    _ = std.os.linux.close(fds[0]);
+
+    const state = initializeChild();
+    if (!state.initialized) std.os.linux.exit_group(1);
+
+    writeAll(fds[1], &[_]u8{child_ready_marker}) catch std.os.linux.exit_group(1);
+    writeAll(fds[1], greeting_text) catch std.os.linux.exit_group(1);
+
+    _ = std.os.linux.close(fds[1]);
+    std.os.linux.exit_group(0);
+}
+
+/// Waits for `pid` to exit and verifies a successful exit status.
+///
+/// Retries interrupted waits. Returns `error.WaitFailed` when the wait itself
+/// fails and `error.ChildFailed` when the child exited abnormally or with a
+/// non-zero status.
+fn waitForChild(pid: std.os.linux.pid_t) !void {
+    var status: u32 = undefined;
+    while (true) {
+        const rc = std.os.linux.waitpid(pid, &status, 0);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (!std.os.linux.W.IFEXITED(status) or
+                    std.os.linux.W.EXITSTATUS(status) != 0)
+                {
+                    return error.ChildFailed;
+                }
+                return;
+            },
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
+}
+
+/// Forks a child that initializes itself and sends `"Hello from ancestors!"`
+/// to the parent over a Unix-domain socket pair.
+///
+/// The parent creates a connected `AF_UNIX`/`SOCK_STREAM` pair before forking,
+/// then reads the child's readiness marker and greeting from its end. The
+/// child is always reaped before this function returns.
+///
+/// On success, returns the flags and greeting bytes observed by the parent.
+/// They are not all-or-nothing: a child that died after reporting readiness
+/// can yield `child_initialized == true` with no greeting.
+///
+/// Possible errors are `error.SocketPairFailed`, `error.ForkUnsupported`,
+/// `error.ForkFailed`, `error.ReadFailed`, `error.WaitFailed`, and
+/// `error.ChildFailed`. The fork itself is the only process-level side
+/// effect; the child exits instead of returning into the caller.
+pub fn forkGreeting() !ForkGreeting {
+    var fds: [2]std.os.linux.fd_t = undefined;
+    switch (std.os.linux.errno(std.os.linux.socketpair(
+        std.os.linux.AF.UNIX,
+        std.os.linux.SOCK.STREAM,
+        0,
+        &fds,
+    ))) {
+        .SUCCESS => {},
+        else => return error.SocketPairFailed,
+    }
+
+    const fork_result = std.os.linux.fork();
+    switch (std.os.linux.errno(fork_result)) {
+        .SUCCESS => {},
+        .NOSYS => {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.close(fds[1]);
+            return error.ForkUnsupported;
+        },
+        else => {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.close(fds[1]);
+            return error.ForkFailed;
+        },
+    }
+
+    const pid: std.os.linux.pid_t = @intCast(fork_result);
+    if (pid == 0) childGreeting(fds);
+
+    _ = std.os.linux.close(fds[1]);
+
+    var result = ForkGreeting{};
+    const read_result = read: {
+        var marker: [1]u8 = undefined;
+        const marker_len = readAtMost(fds[0], &marker) catch |err| break :read err;
+        result.child_initialized = marker_len == 1 and marker[0] == child_ready_marker;
+
+        result.message_len = readAtMost(fds[0], &result.message) catch |err| break :read err;
+        result.message_received = result.message_len > 0;
+        break :read {};
+    };
+    _ = std.os.linux.close(fds[0]);
+
+    try waitForChild(pid);
+    try read_result;
+    return result;
+}
+
+test "P: forked child reports that it initialized" {
+    const result = try forkGreeting();
+
+    try std.testing.expect(result.child_initialized);
+}
+
+test "Q: parent receives a message from the forked child" {
+    const result = try forkGreeting();
+
+    try std.testing.expect(result.message_received);
+}
+
+test "R: child message equals \"Hello from ancestors!\"" {
+    const result = try forkGreeting();
+
+    try std.testing.expect(result.matchesMessage(greeting_text));
+}
+
+test "X*: child initialized and parent received the exact greeting" {
+    const result = try forkGreeting();
+
+    const p = result.child_initialized;
+    const q = result.message_received;
+    const r = result.matchesMessage(greeting_text);
+
+    try std.testing.expect(p and q and r);
+}
+
 fn load(
     this: *anyopaque,
     interface_factory: CreateInterfaceFn,
