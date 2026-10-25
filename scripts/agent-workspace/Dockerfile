@@ -1,6 +1,6 @@
 # Zorcerer isolated development image.
 #
-# Toolchain: Debian 13 (trixie), Zig 0.16.0, LLVM/Clang 21, OpenCode.
+# Toolchain: Debian 13 (trixie), Zig 0.16.0, LLVM/Clang 21, OpenCode 2.
 #
 # The repository is intentionally not baked into the image. Mount it at
 # /workspace so edits and build artifacts stay on the host:
@@ -63,9 +63,9 @@ RUN set -eux; \
     /opt/zig/zig version
 
 # ---------------------------------------------------------------------------
-# OpenCode, installed by its official installer into /opt/opencode. Only the
+# OpenCode 2, installed by its official installer into /opt/opencode. Only the
 # resulting binary is copied into the runtime image. The installer tracks the
-# latest OpenCode release at image build time.
+# latest OpenCode 2 release at image build time.
 # ---------------------------------------------------------------------------
 FROM debian:13-slim AS opencode
 
@@ -78,7 +78,7 @@ RUN set -eux; \
         curl \
         unzip; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    curl -fsSL https://opencode.ai/install -o /tmp/opencode-install.sh; \
+    curl -fsSL https://opencode.ai/v2/install -o /tmp/opencode-install.sh; \
     OPENCODE_INSTALL_DIR=/opt/opencode bash /tmp/opencode-install.sh; \
     if [ ! -x /opt/opencode/opencode ]; then \
         found="$(command -v opencode || true)"; \
@@ -88,12 +88,17 @@ RUN set -eux; \
         test -n "$found"; \
         install -Dm0755 "$found" /opt/opencode/opencode; \
     fi; \
-    HOME=/tmp /opt/opencode/opencode --version; \
+    version="$(HOME=/tmp /opt/opencode/opencode --version)"; \
+    echo "$version"; \
+    if ! printf '%s\n' "$version" | grep -Eq '(^|[^0-9])2\.'; then \
+        echo "error: expected OpenCode 2, got: $version" >&2; \
+        exit 1; \
+    fi; \
     rm -rf /root/.opencode /tmp/opencode-install.sh
 
 # ---------------------------------------------------------------------------
 # Runtime image: Debian 13, LLVM/Clang 21 development packages, Zig 0.16.0,
-# OpenCode, and an unprivileged development user.
+# OpenCode 2, and an unprivileged development user.
 # ---------------------------------------------------------------------------
 FROM debian:13-slim AS runtime
 
