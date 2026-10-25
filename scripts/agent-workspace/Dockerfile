@@ -155,7 +155,12 @@ RUN set -eux; \
         useradd --uid "${USER_UID}" --gid dev --create-home --shell /bin/bash dev; \
     fi; \
     install -d -o dev -g dev /workspace; \
-    install -d -o dev -g dev /home/dev/.cache /home/dev/.config /home/dev/.local/share; \
+    install -d -o dev -g dev \
+        /home/dev/.cache \
+        /home/dev/.config \
+        /home/dev/.local \
+        /home/dev/.local/share \
+        /home/dev/.local/state; \
     printf '%s\n' \
         '#!/bin/sh' \
         'set -eu' \
