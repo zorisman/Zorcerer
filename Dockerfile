@@ -177,6 +177,7 @@ RUN set -eux; \
 ENV HOME=/home/dev
 ENV USER=dev
 ENV SHELL=/bin/bash
+ENV TERM=xterm-256color
 ENV LANG=C.UTF-8
 ENV ZIG_GLOBAL_CACHE_DIR=/home/dev/.cache/zig
 
