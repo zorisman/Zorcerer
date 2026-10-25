@@ -99,6 +99,7 @@ FROM debian:13-slim AS runtime
 
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG ZIG_VERSION
 
 COPY --from=zig /opt/zig /opt/zig
 COPY --from=opencode /opt/opencode/opencode /usr/local/bin/opencode
@@ -185,7 +186,7 @@ WORKDIR /workspace
 USER dev
 
 RUN set -eux; \
-    test "$(zig version)" = "0.16.0"; \
+    test "$(zig version)" = "${ZIG_VERSION}"; \
     test "$(llvm-config --version | cut -d. -f1)" = "21"; \
     clang++ --version; \
     opencode --version
