@@ -4,6 +4,71 @@ const index_analyzer = @import("build/build_index_analyzer.zig");
 const codegen = @import("build/EngineIndexesGenerator.zig");
 const DataAdapter = @import("build/analyzers/AnalyzerDataAdapter.zig");
 
+/// Describes one compiled example plugin that is installed as its own
+/// directory under `zig-out/lib/plugins/`.
+const ExamplePluginInstall = struct {
+    /// Directory name under `example-plugins/`. Used to locate the optional
+    /// `manifest.toml` that belongs to this plugin.
+    source_dir: []const u8,
+    /// Directory name created under `zig-out/lib/plugins/`.
+    install_dir: []const u8,
+    /// File name of the installed shared library inside `install_dir`.
+    library_name: []const u8,
+    /// Compiled plugin artifact whose emitted library is installed.
+    artifact: *std.Build.Step.Compile,
+};
+
+/// Installs one example plugin as `zig-out/lib/plugins/<install_dir>/`.
+///
+/// The artifact's emitted shared library is copied under `library_name`. If
+/// `example-plugins/<source_dir>/manifest.toml` exists, it is copied next to
+/// the library as `manifest.toml`; a missing manifest is allowed because not
+/// every example plugin is managed through one.
+///
+/// `tests_step` is made a dependency of the install steps so that the default
+/// install target never packages a plugin unless the project's tests passed.
+///
+/// Errors: propagates filesystem errors other than `error.FileNotFound` from
+/// the manifest existence check (for example `error.AccessDenied`).
+fn installExamplePlugin(
+    b: *std.Build,
+    tests_step: *std.Build.Step,
+    plugin: ExamplePluginInstall,
+) !void {
+    const plugin_dir = b.pathJoin(&.{ "lib", "plugins", plugin.install_dir });
+
+    const install_library = b.addInstallFileWithDir(
+        plugin.artifact.getEmittedBin(),
+        .{ .custom = plugin_dir },
+        plugin.library_name,
+    );
+    install_library.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_library.step);
+
+    const manifest_path = b.pathJoin(&.{
+        "example-plugins",
+        plugin.source_dir,
+        "manifest.toml",
+    });
+    const has_manifest = manifest: {
+        std.Io.Dir.cwd().access(b.graph.io, manifest_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :manifest false,
+            else => return err,
+        };
+        break :manifest true;
+    };
+
+    if (has_manifest) {
+        const install_manifest = b.addInstallFileWithDir(
+            b.path(manifest_path),
+            .{ .custom = plugin_dir },
+            "manifest.toml",
+        );
+        install_manifest.step.dependOn(tests_step);
+        b.getInstallStep().dependOn(&install_manifest.step);
+    }
+}
+
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{
         .default_target = .{
@@ -192,8 +257,12 @@ pub fn build(b: *std.Build) !void {
     install_zorcerer.step.dependOn(tests_step);
     b.getInstallStep().dependOn(&install_zorcerer.step);
 
-    // Same tests gate for the example plugin (mirrors the comment above).
-    const install_hello_plugin = b.addInstallArtifact(hello_plugin, .{});
-    install_hello_plugin.step.dependOn(tests_step);
-    b.getInstallStep().dependOn(&install_hello_plugin.step);
+    // Example plugins get one directory each so the deploy script can copy
+    // `zig-out/lib/plugins/` as a complete plugin tree.
+    try installExamplePlugin(b, tests_step, .{
+        .source_dir = "hello",
+        .install_dir = "hello-plugin",
+        .library_name = "hello.so",
+        .artifact = hello_plugin,
+    });
 }

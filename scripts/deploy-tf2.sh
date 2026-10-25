@@ -11,6 +11,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
 source_lib="${repo_root}/zig-out/lib/zorcerer.so"
+source_plugins="${repo_root}/zig-out/lib/plugins"
 
 if [[ -z "${ZORCERER_SSH_HOST:-}" ]]; then
     echo "error: ZORCERER_SSH_HOST is unset or empty" >&2
@@ -27,4 +28,10 @@ if [[ ! -f "${source_lib}" ]]; then
     exit 1
 fi
 
+if [[ ! -d "${source_plugins}" ]]; then
+    echo "error: plugins directory not found: ${source_plugins} (build the project first)" >&2
+    exit 1
+fi
+
 rsync --verbose --checksum "${source_lib}" "${ZORCERER_SSH_HOST}:${ZORCERER_REMOTE_DIR}/"
+rsync --recursive --verbose --checksum "${source_plugins}/" "${ZORCERER_SSH_HOST}:${ZORCERER_REMOTE_DIR}/zorcerer/plugins/"
