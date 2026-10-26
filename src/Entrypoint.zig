@@ -21,10 +21,15 @@
 //! The plugin manager itself runs in a forked child process. `load` forks it
 //! through `forkChild`, the child loads the plugins (`pluginManagerChild`) and
 //! reports over a socket pair, and this process consumes that report through
-//! `jsonListener`. Reports are JSON objects: `{"operation": "stderr",
-//! "message": "..."}` currently means "write message to stderr". `unload`
-//! closes the parent's socket end, which tells the child to unload its plugins
-//! and exit, then reaps it.
+//! `jsonListener`. The child then serves VSP callback events through the
+//! manager's own listener (`PluginManager.listenForEvents`).
+//!
+//! Messages are JSON frames (see src/Ipc.zig). Reports are
+//! `{"operation": "stderr", "message": "..."}`, which means "write message to
+//! stderr". The callbacks send `{"event": "X"}` and receive
+//! `{"operation": "stderr", "message": "Event is X"}`. `unload` closes the
+//! parent's socket end, which tells the child to unload its plugins and exit,
+//! then reaps it.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -71,6 +76,7 @@
 //! earlier) - the .vdf route is what actually loads this on a live server.
 
 const std = @import("std");
+const Ipc = @import("Ipc.zig");
 const VTableHooks = @import("hooks").VTableHook;
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
@@ -116,10 +122,11 @@ var plugin_instance = PluginObject{ .vptr = &vtable };
 var engine: ?*anyopaque = null;
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
-/// discover/cache the plugin .so files under tf/addons/zorcerer/plugins/ and
-/// run each plugin's load() hook. The parent only wires the engine logger into
-/// its copy before forking and keeps the manifests from `readConfig()`; the
-/// child's own copy is released when it exits (see src/PluginManager.zig).
+/// discover/cache the plugin .so files under tf/addons/zorcerer/plugins/, run
+/// each plugin's load() hook, and serve callback events through
+/// `Manager.listenForEvents`. The parent only wires the engine logger into its
+/// copy before forking and keeps the manifests from `readConfig()`; the child's
+/// own copy is released when it exits (see src/PluginManager.zig).
 var plugin_manager = Manager.Manager.init();
 
 /// The forked plugin-manager process, or null while none runs.
@@ -166,148 +173,6 @@ test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
     var fake = extern struct { vptr: [*]const Slot }{ .vptr = &slots };
 
     try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
-}
-
-/// First byte of a child's report. Its presence tells the parent that the
-/// child reached the point where it reports; the payload bytes alone are not
-/// treated as an initialization signal.
-const child_ready_marker: u8 = 0xA5;
-
-/// Maximum payload size, in bytes, that one report can carry.
-///
-/// Reports are length-framed, so the receiver can reject an oversized frame
-/// instead of blocking on a corrupt length.
-pub const max_payload_len: usize = 4096;
-
-/// Everything the parent observed while reading one child report.
-///
-/// The flags are not all-or-nothing: a child that reported readiness and then
-/// died can yield `child_initialized == true` with no payload.
-pub const ChildReport = struct {
-    /// True only when the report started with `child_ready_marker`.
-    child_initialized: bool = false,
-
-    /// True when the report carried at least one payload byte. This
-    /// distinguishes "some message arrived" from the stronger exact-content
-    /// check in `matchesMessage()`.
-    message_received: bool = false,
-
-    /// Raw payload bytes. Only the first `message_len` entries are meaningful.
-    message: [max_payload_len]u8 = undefined,
-
-    /// Number of valid payload bytes; never exceeds `message.len`.
-    message_len: usize = 0,
-
-    /// Returns the received payload.
-    ///
-    /// The returned slice borrows this report and remains valid for as long as
-    /// the report does.
-    pub fn text(self: *const ChildReport) []const u8 {
-        return self.message[0..self.message_len];
-    }
-
-    /// Reports whether the received payload equals `expected`.
-    ///
-    /// Returns false when a payload of a different length arrived.
-    pub fn matchesMessage(self: *const ChildReport, expected: []const u8) bool {
-        return std.mem.eql(u8, self.text(), expected);
-    }
-};
-
-/// Reads exactly `buffer.len` bytes from `fd`.
-///
-/// Errors: `error.PeerClosed` when the peer closed the socket first;
-/// `error.ReadFailed` for any other read failure (see `readAtMost`).
-fn readExact(fd: std.os.linux.fd_t, buffer: []u8) !void {
-    const read_len = try readAtMost(fd, buffer);
-    if (read_len != buffer.len) return error.PeerClosed;
-}
-
-/// Reads one framed report: the readiness marker, a little-endian `u32`
-/// payload length, and exactly that many payload bytes.
-///
-/// The returned report owns its payload bytes. A marker that does not match
-/// `child_ready_marker` yields `child_initialized == false` and stops reading,
-/// because the rest of the frame cannot be interpreted without the marker.
-///
-/// Errors: `error.PeerClosed` for a truncated frame,
-/// `error.PayloadTooLarge` when the announced length exceeds
-/// `max_payload_len`, and the read errors documented on `readExact`.
-fn readReport(fd: std.os.linux.fd_t) !ChildReport {
-    var report = ChildReport{};
-
-    var marker: [1]u8 = undefined;
-    try readExact(fd, &marker);
-    report.child_initialized = marker[0] == child_ready_marker;
-    if (!report.child_initialized) return report;
-
-    var length_bytes: [4]u8 = undefined;
-    try readExact(fd, &length_bytes);
-    const payload_len: usize = std.mem.readInt(u32, &length_bytes, .little);
-    if (payload_len > max_payload_len) return error.PayloadTooLarge;
-
-    try readExact(fd, report.message[0..payload_len]);
-    report.message_len = payload_len;
-    report.message_received = payload_len > 0;
-    return report;
-}
-
-/// Writes one framed report to `fd`: the readiness marker, a little-endian
-/// `u32` payload length, and the payload itself.
-///
-/// Writing this frame is the child's signal that it finished initializing, so
-/// it must only be called once the child is ready to be observed.
-///
-/// Errors: `error.PayloadTooLarge` when `payload` exceeds `max_payload_len`,
-/// and `error.WriteFailed` (see `writeAll`).
-fn writeReport(fd: std.os.linux.fd_t, payload: []const u8) !void {
-    if (payload.len > max_payload_len) return error.PayloadTooLarge;
-
-    var header: [5]u8 = undefined;
-    header[0] = child_ready_marker;
-    std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
-
-    try writeAll(fd, &header);
-    try writeAll(fd, payload);
-}
-
-/// Reads from `fd` until `buffer` is full or the peer closes its end.
-///
-/// Returns the number of bytes read. Retries interrupted reads. Returns
-/// `error.ReadFailed` for any non-`EINTR` read failure.
-fn readAtMost(fd: std.os.linux.fd_t, buffer: []u8) !usize {
-    var total: usize = 0;
-    while (total < buffer.len) {
-        const rc = std.os.linux.read(fd, buffer[total..].ptr, buffer.len - total);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) break;
-                total += rc;
-            },
-            .INTR => continue,
-            else => return error.ReadFailed,
-        }
-    }
-    return total;
-}
-
-/// Writes all of `buffer` to `fd`, retrying interrupted and partial writes.
-///
-/// Returns `error.WriteFailed` when the peer closes the socket or any other
-/// write error occurs.
-fn writeAll(fd: std.os.linux.fd_t, buffer: []const u8) !void {
-    var written: usize = 0;
-    while (written < buffer.len) {
-        const rc = std.os.linux.write(fd, buffer[written..].ptr, buffer.len - written);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return error.WriteFailed;
-                written += rc;
-            },
-            .INTR => continue,
-            else => return error.WriteFailed,
-        }
-    }
 }
 
 /// Waits for `pid` to exit and verifies a successful exit status.
@@ -426,78 +291,45 @@ pub fn forkChild(child_main: ChildMain) !ForkedChild {
     return .{ .pid = pid, .socket = fds[0] };
 }
 
-/// Operations the parent's IPC listener understands.
-const Operation = enum {
-    /// Write `message` to the process' standard error stream.
-    stderr,
-};
-
-/// One request sent by a child over the IPC socket.
-///
-/// This is the JSON schema spoken over the socket:
-///
-///     {"operation": "stderr", "message": "Hello from fork"}
-const Request = struct {
-    /// What the parent should do with `message`.
-    operation: Operation,
-    /// Payload for `operation`; for `.stderr` it is printed verbatim.
-    message: []const u8,
-};
-
-/// Parses one JSON request.
-///
-/// Unknown operations and unknown keys are rejected, so a typo in the schema
-/// cannot silently turn into a no-op. The returned value borrows `allocator`
-/// until `deinit()`.
-fn parseRequest(allocator: std.mem.Allocator, text: []const u8) !std.json.Parsed(Request) {
-    return std.json.parseFromSlice(Request, allocator, text, .{});
-}
-
-/// Executes one request received from a child.
-fn handleRequest(request: Request) void {
+/// Executes one request received from the plugin manager.
+fn handleRequest(request: Ipc.Request) void {
     switch (request.operation) {
         .stderr => std.debug.print("{s}", .{request.message}),
     }
 }
 
-/// Parent-side listener: reads one framed report from `socket`, decodes the
-/// JSON request it carries, and executes it.
+/// Listener for the manager's reports: reads one framed JSON message from
+/// `socket` and executes it.
 ///
-/// Errors: the framing errors of `readReport`, `error.ChildNotInitialized`
-/// when the child never reached its report, `error.EmptyMessage` for a
-/// zero-length report, and the JSON errors of `parseRequest`.
+/// The same listener handles the initial readiness report ("Hello from fork")
+/// and every "Event is X" response to a callback event.
+///
+/// Errors: `error.InvalidFrame` when the frame marker is missing,
+/// `error.EmptyMessage` for a zero-length payload, the framing errors of
+/// `Ipc.readFrame`, and the JSON errors of `Ipc.parseRequest`.
 fn jsonListener(socket: std.os.linux.fd_t) !void {
-    const report = try readReport(socket);
-    if (!report.child_initialized) return error.ChildNotInitialized;
-    if (!report.message_received) return error.EmptyMessage;
+    const frame = try Ipc.readFrame(socket);
+    if (!frame.framed) return error.InvalidFrame;
+    if (!frame.received) return error.EmptyMessage;
 
-    const request = try parseRequest(std.heap.page_allocator, report.text());
+    const request = try Ipc.parseRequest(std.heap.page_allocator, frame.text());
     defer request.deinit();
     handleRequest(request.value);
-}
-
-/// Serializes `request` to JSON and sends it to the parent as one framed
-/// report.
-///
-/// Errors: `error.PayloadTooLarge` or `error.WriteFailed` from `writeReport`,
-/// and `error.WriteFailed` when the request does not fit the stack buffer.
-fn sendRequest(fd: std.os.linux.fd_t, request: Request) !void {
-    var buffer: [max_payload_len]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try std.json.Stringify.value(request, .{}, &writer);
-    try writeReport(fd, writer.buffered());
 }
 
 /// Message the plugin-manager child reports once it has loaded its plugins.
 const manager_ready_message = "Hello from fork";
 
 /// Child body: loads the plugin manager, reports readiness to the parent, and
-/// waits for the parent to close the socket before unloading the plugins.
+/// then serves callback events until the parent closes the channel.
 ///
 /// The report is sent after the load attempt finishes, whether or not any
 /// plugins were found: it is a readiness signal for the parent, not a success
 /// report. A failed attempt is appended to the same message so the parent sees
 /// both the readiness line and the reason the plugin set may be empty.
+///
+/// The listener runs even when loading failed, so the Entrypoint's synchronous
+/// event exchange never blocks on a process that has already stopped reading.
 ///
 /// Unlike a minimal reporting child, this one allocates and performs file and
 /// dynamic-library I/O while loading plugins. That is safe only as long as the
@@ -517,47 +349,35 @@ fn pluginManagerChild(fd: std.os.linux.fd_t) void {
         break :load manager_ready_message;
     };
 
-    sendRequest(fd, .{ .operation = .stderr, .message = message }) catch {};
-    waitForShutdown(fd);
+    Ipc.sendRequest(fd, .{ .operation = .stderr, .message = message }) catch {};
+    Manager.listenForEvents(fd);
     plugin_manager.deinit();
-}
-
-/// Blocks until the parent closes its end of the socket pair.
-///
-/// Anything the parent sends is discarded for now; the supported direction of
-/// the protocol is child to parent.
-fn waitForShutdown(fd: std.os.linux.fd_t) void {
-    var scratch: [64]u8 = undefined;
-    while (true) {
-        const received = readAtMost(fd, &scratch) catch return;
-        if (received == 0) return;
-    }
 }
 
 /// Child used by the IPC tests: sends the same JSON request the plugin-manager
 /// child sends once it is ready.
 fn testReportChild(fd: std.os.linux.fd_t) void {
-    sendRequest(fd, .{ .operation = .stderr, .message = manager_ready_message }) catch {};
+    Ipc.sendRequest(fd, .{ .operation = .stderr, .message = manager_ready_message }) catch {};
 }
 
 test "forked child reports that it initialized" {
     var child = try forkChild(testReportChild);
     defer child.finish() catch {};
 
-    const report = try readReport(child.socket);
-    try std.testing.expect(report.child_initialized);
+    const frame = try Ipc.readFrame(child.socket);
+    try std.testing.expect(frame.framed);
 }
 
 test "parent receives a JSON message from the child" {
     var child = try forkChild(testReportChild);
     defer child.finish() catch {};
 
-    const report = try readReport(child.socket);
-    try std.testing.expect(report.message_received);
+    const frame = try Ipc.readFrame(child.socket);
+    try std.testing.expect(frame.received);
 
-    const request = try parseRequest(std.testing.allocator, report.text());
+    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
     defer request.deinit();
-    try std.testing.expectEqual(Operation.stderr, request.value.operation);
+    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
     try std.testing.expectEqualStrings(manager_ready_message, request.value.message);
 }
 
@@ -565,38 +385,118 @@ test "child payload matches the serialized request" {
     var child = try forkChild(testReportChild);
     defer child.finish() catch {};
 
-    const report = try readReport(child.socket);
-    try std.testing.expect(report.matchesMessage(
+    const frame = try Ipc.readFrame(child.socket);
+    try std.testing.expect(frame.matches(
         "{\"operation\":\"stderr\",\"message\":\"Hello from fork\"}",
     ));
 }
 
 test "listener schema decodes the stderr operation" {
-    const request = try parseRequest(
+    const request = try Ipc.parseRequest(
         std.testing.allocator,
         "{\"operation\": \"stderr\", \"message\": \"Hello from fork\"}",
     );
     defer request.deinit();
 
-    try std.testing.expectEqual(Operation.stderr, request.value.operation);
+    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
     try std.testing.expectEqualStrings("Hello from fork", request.value.message);
 }
 
 test "listener schema rejects an unknown operation" {
     try std.testing.expectError(
         error.InvalidEnumTag,
-        parseRequest(std.testing.allocator, "{\"operation\": \"stdout\", \"message\": \"x\"}"),
+        Ipc.parseRequest(std.testing.allocator, "{\"operation\": \"stdout\", \"message\": \"x\"}"),
     );
 }
 
 test "listener schema rejects an unknown field" {
     try std.testing.expectError(
         error.UnknownField,
-        parseRequest(
+        Ipc.parseRequest(
             std.testing.allocator,
             "{\"operation\": \"stderr\", \"message\": \"x\", \"unexpected\": 1}",
         ),
     );
+}
+
+test "event JSON matches the schema" {
+    const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
+        .{ .event = .pause, .name = "pause" },
+        .{ .event = .unpause, .name = "unpause" },
+        .{ .event = .levelInit, .name = "levelInit" },
+        .{ .event = .serverActivate, .name = "serverActivate" },
+        .{ .event = .levelShutdown, .name = "levelShutdown" },
+    };
+
+    var buffer: [128]u8 = undefined;
+    for (cases) |case| {
+        const text = try Ipc.encodeEvent(&buffer, case.event);
+
+        var expected_buffer: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buffer,
+            "{{\"event\":\"{s}\"}}",
+            .{case.name},
+        );
+        try std.testing.expectEqualStrings(expected, text);
+
+        const parsed = try Ipc.parseEvent(std.testing.allocator, text);
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.event, parsed.value.event);
+    }
+}
+
+test "event schema rejects an unknown callback" {
+    try std.testing.expectError(
+        error.InvalidEnumTag,
+        Ipc.parseEvent(std.testing.allocator, "{\"event\": \"bogus\"}"),
+    );
+}
+
+test "manager answers every Entrypoint event with the stderr schema" {
+    var child = try forkChild(Manager.listenForEvents);
+    defer child.finish() catch {};
+
+    const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
+        .{ .event = .pause, .name = "pause" },
+        .{ .event = .unpause, .name = "unpause" },
+        .{ .event = .levelInit, .name = "levelInit" },
+        .{ .event = .serverActivate, .name = "serverActivate" },
+        .{ .event = .levelShutdown, .name = "levelShutdown" },
+    };
+
+    for (cases) |case| {
+        try Ipc.sendEvent(child.socket, case.event);
+
+        const frame = try Ipc.readFrame(child.socket);
+        try std.testing.expect(frame.received);
+
+        const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
+        defer request.deinit();
+        try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+
+        var expected_buffer: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buffer,
+            "Event is {s}",
+            .{case.name},
+        );
+        try std.testing.expectEqualStrings(expected, request.value.message);
+    }
+}
+
+test "manager answers an unknown event instead of stalling" {
+    var child = try forkChild(Manager.listenForEvents);
+    defer child.finish() catch {};
+
+    try Ipc.writeFrame(child.socket, "{\"event\":\"bogus\"}");
+
+    const frame = try Ipc.readFrame(child.socket);
+    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
+    defer request.deinit();
+
+    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqualStrings("Event is invalid", request.value.message);
 }
 
 fn load(
@@ -698,7 +598,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
     Log.logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
 
     if (manager_child) |*child| {
-        // Closing our end is the shutdown signal: the child's waitForShutdown
+        // Closing our end is the shutdown signal: the child's event listener
         // sees EOF, unloads its plugins and exits, so finish() can reap it.
         child.finish() catch |err| {
             Log.logLine("[MyLoader] plugin manager shutdown failed: {s}\n", .{@errorName(err)});
@@ -715,12 +615,46 @@ fn unload(this: *anyopaque) callconv(.c) void {
     // plugin_load/reload re-captures it in load() anyway.
 }
 
+/// Reports one VSP callback to the forked plugin manager and executes its
+/// reply.
+///
+/// Does nothing while no manager process is running (before `load` succeeds or
+/// after `unload`). The exchange is synchronous: the manager answers every
+/// event with exactly one frame, which `jsonListener` prints, so "Event is X"
+/// reaches stderr before the callback returns.
+///
+/// The engine invokes VSP callbacks from one thread at a time; this function
+/// is not reentrant and must not be called concurrently.
+///
+/// Errors are logged rather than propagated: the engine callbacks have no way
+/// to report failure, and `unload` owns the manager's lifetime.
+fn sendManagerEvent(event: Ipc.Event) void {
+    const child = if (manager_child) |*running| running else return;
+
+    Ipc.sendEvent(child.socket, event) catch |err| {
+        Log.logLine(
+            "[MyLoader] sending the {s} event to the plugin manager failed: {s}\n",
+            .{ @tagName(event), @errorName(err) },
+        );
+        return;
+    };
+
+    jsonListener(child.socket) catch |err| {
+        Log.logLine(
+            "[MyLoader] handling the plugin manager's reply to {s} failed: {s}\n",
+            .{ @tagName(event), @errorName(err) },
+        );
+    };
+}
+
 fn pause(this: *anyopaque) callconv(.c) void {
     _ = this;
+    sendManagerEvent(.pause);
 }
 
 fn unpause(this: *anyopaque) callconv(.c) void {
     _ = this;
+    sendManagerEvent(.unpause);
 }
 
 fn getPluginDescription(this: *anyopaque) callconv(.c) [*:0]const u8 {
@@ -731,6 +665,7 @@ fn getPluginDescription(this: *anyopaque) callconv(.c) [*:0]const u8 {
 fn levelInit(this: *anyopaque, map_name: [*:0]const u8) callconv(.c) void {
     _ = this;
     Log.logLine("[MyLoader] LevelInit: {s}\n", .{std.mem.span(map_name)});
+    sendManagerEvent(.levelInit);
 }
 
 fn serverActivate(
@@ -742,6 +677,7 @@ fn serverActivate(
     _ = this;
     _ = edict_list;
     Log.logLine("[MyLoader] ServerActivate: {d} edicts, {d} max clients\n", .{ edict_count, client_max });
+    sendManagerEvent(.serverActivate);
 }
 
 fn gameFrame(this: *anyopaque, simulating: bool) callconv(.c) void {
@@ -752,6 +688,7 @@ fn gameFrame(this: *anyopaque, simulating: bool) callconv(.c) void {
 fn levelShutdown(this: *anyopaque) callconv(.c) void {
     _ = this;
     Log.logLine("[MyLoader] LevelShutdown\n", .{});
+    sendManagerEvent(.levelShutdown);
 }
 
 /// Placeholder for every method this foundation doesn't implement yet.

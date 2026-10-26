@@ -1,4 +1,5 @@
 const std = @import("std");
+const Ipc = @import("Ipc.zig");
 const toml = @import("toml");
 const abi = @import("root.zig").abi;
 const Log = @import("root.zig").Log;
@@ -341,3 +342,86 @@ pub const Manager = struct {
         self.plugins.clearRetainingCapacity();
     }
 };
+
+/// Serves the Entrypoint's callback events on the manager's end of the IPC
+/// channel until the Entrypoint closes it.
+///
+/// The channel is the socket pair created for the fork; after the fork, the
+/// manager process owns this end and turns it into its JSON listener. The
+/// Entrypoint holds the other end.
+///
+/// Each received frame must carry `{"event":"X"}`, where `X` is one of
+/// `Ipc.Event`'s callbacks. Every framed message is answered with exactly one
+/// `{"operation":"stderr","message":...}` frame, so the Entrypoint's
+/// synchronous event exchange never waits for a reply that will not come. A
+/// message that cannot be decoded is answered with `"Event is invalid"`.
+///
+/// A frame that cannot be read, or whose marker is wrong, ends the listener:
+/// the stream can no longer be resynchronized. The caller keeps ownership of
+/// the manager and must still call `deinit()`.
+///
+/// Precondition: `fd` is the manager process' end of the socket pair created
+/// for the fork. This runs in the forked child, not in the engine process.
+pub fn listenForEvents(fd: std.os.linux.fd_t) void {
+    while (true) {
+        const frame = Ipc.readFrame(fd) catch |err| {
+            if (err != error.PeerClosed) {
+                Log.logLine(
+                    "[zorcerer] event listener stopped: {s}\n",
+                    .{@errorName(err)},
+                );
+            }
+            return;
+        };
+
+        if (!frame.framed) {
+            Log.logLine("[zorcerer] event listener: frame marker mismatch\n", .{});
+            return;
+        }
+
+        if (!frame.received) {
+            Log.logLine("[zorcerer] event listener: empty event frame\n", .{});
+            if (!respondInvalidEvent(fd)) return;
+            continue;
+        }
+
+        const parsed = Ipc.parseEvent(std.heap.page_allocator, frame.text()) catch |err| {
+            Log.logLine(
+                "[zorcerer] event listener: invalid event ({s})\n",
+                .{@errorName(err)},
+            );
+            if (!respondInvalidEvent(fd)) return;
+            continue;
+        };
+        defer parsed.deinit();
+
+        Ipc.sendEventResponse(fd, parsed.value.event) catch |err| {
+            Log.logLine(
+                "[zorcerer] event listener: replying to {s} failed: {s}\n",
+                .{ @tagName(parsed.value.event), @errorName(err) },
+            );
+            return;
+        };
+    }
+}
+
+/// Answers an event that could not be decoded.
+///
+/// Keeping the answer count at exactly one per received frame is what lets the
+/// Entrypoint stay synchronous even when a peer sends a malformed event.
+///
+/// Returns true when the reply was sent. Returns false when the write failed,
+/// which means the channel is gone and the listener should stop.
+fn respondInvalidEvent(fd: std.os.linux.fd_t) bool {
+    Ipc.sendRequest(fd, .{
+        .operation = .stderr,
+        .message = "Event is invalid",
+    }) catch |err| {
+        Log.logLine(
+            "[zorcerer] event listener: sending the invalid-event reply failed: {s}\n",
+            .{@errorName(err)},
+        );
+        return false;
+    };
+    return true;
+}
