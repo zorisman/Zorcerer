@@ -4,3 +4,14 @@
 [submodule "extern/source/source-sdk-2013"]
 	path = extern/source/source-sdk-2013
 	url = https://github.com/ValveSoftware/source-sdk-2013.git
+[submodule "extern/zig-toml"]
+	path = extern/zig-toml
+	url = https://github.com/zorisman/zig-toml.git
+	branch = zig-0.16
+[submodule "extern/zig-luajit"]
+	path = extern/zig-luajit
+	url = https://github.com/sackosoft/zig-luajit.git
+	branch = v0.16.1
+[submodule "extern/zigjr"]
+	path = extern/zigjr
+	url = https://github.com/zorisman/zigjr.git
