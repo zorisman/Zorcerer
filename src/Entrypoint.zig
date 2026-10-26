@@ -18,6 +18,14 @@
 //! reduced to "which string answered" - the part the removed module used
 //! to own.
 //!
+//! The plugin manager itself runs in a forked child process. `load` forks it
+//! through `forkChild`, the child loads the plugins (`pluginManagerChild`) and
+//! reports over a socket pair, and this process consumes that report through
+//! `jsonListener`. Reports are JSON objects: `{"operation": "stderr",
+//! "message": "..."}` currently means "write message to stderr". `unload`
+//! closes the parent's socket end, which tells the child to unload its plugins
+//! and exit, then reaps it.
+//!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
 //! Developer Wiki (https://developer.valvesoftware.com/wiki/IServerPluginCallbacks)
@@ -107,11 +115,15 @@ const PluginObject = extern struct {
 var plugin_instance = PluginObject{ .vptr = &vtable };
 var engine: ?*anyopaque = null;
 
-/// Plugin manager singleton. load() wires the engine logger into it, then
-/// discovers/caches the plugin .so files under tf/addons/zorcerer/plugins/
-/// and runs each plugin's load() hook; unload() runs the unload() hooks
-/// again and releases everything (see src/PluginManager.zig).
+/// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
+/// discover/cache the plugin .so files under tf/addons/zorcerer/plugins/ and
+/// run each plugin's load() hook. The parent only wires the engine logger into
+/// its copy before forking and keeps the manifests from `readConfig()`; the
+/// child's own copy is released when it exits (see src/PluginManager.zig).
 var plugin_manager = Manager.Manager.init();
+
+/// The forked plugin-manager process, or null while none runs.
+var manager_child: ?ForkedChild = null;
 
 /// Pulls the engine's Source SDK console logging function out of a live
 /// IVEngineServer instance. `engine_interface` is the interface pointer
@@ -156,66 +168,108 @@ test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
     try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
 }
 
-/// Message the forked child sends to its parent once it has initialized.
-const greeting_text = "Hello from ancestors!";
-
-/// First byte of the child's report. Its presence tells the parent that the
-/// child finished initializing before it started sending the greeting; the
-/// greeting bytes alone are not treated as an initialization signal.
+/// First byte of a child's report. Its presence tells the parent that the
+/// child reached the point where it reports; the payload bytes alone are not
+/// treated as an initialization signal.
 const child_ready_marker: u8 = 0xA5;
 
-/// State the child establishes for itself after the fork. The parent cannot
-/// inspect this directly (fork copies memory rather than sharing it), so the
-/// child communicates the fact that this state became initialized over the
-/// Unix socket.
-const ChildState = struct {
-    /// Whether the child completed its initialization step. Only an
-    /// initialized state is allowed to send the readiness marker and greeting.
-    initialized: bool,
-};
-
-/// Performs the child's initialization step.
+/// Maximum payload size, in bytes, that one report can carry.
 ///
-/// Returns the initialized child state. The implementation is deliberately
-/// allocation-free and lock-free so it remains safe to call in a child that
-/// was forked from a multi-threaded process.
-fn initializeChild() ChildState {
-    return .{ .initialized = true };
-}
+/// Reports are length-framed, so the receiver can reject an oversized frame
+/// instead of blocking on a corrupt length.
+pub const max_payload_len: usize = 4096;
 
-/// Everything the parent observed while running `forkGreeting()`.
-pub const ForkGreeting = struct {
-    /// True only when the parent received `child_ready_marker`, which the
-    /// child writes after `initializeChild()` reports success.
+/// Everything the parent observed while reading one child report.
+///
+/// The flags are not all-or-nothing: a child that reported readiness and then
+/// died can yield `child_initialized == true` with no payload.
+pub const ChildReport = struct {
+    /// True only when the report started with `child_ready_marker`.
     child_initialized: bool = false,
 
-    /// True when at least one greeting payload byte arrived after the
-    /// readiness marker. This distinguishes "some message arrived" from the
-    /// stronger exact-content check in `matchesMessage()`.
+    /// True when the report carried at least one payload byte. This
+    /// distinguishes "some message arrived" from the stronger exact-content
+    /// check in `matchesMessage()`.
     message_received: bool = false,
 
-    /// Bytes of the greeting received from the child. Only the first
-    /// `message_len` entries are meaningful.
-    message: [greeting_text.len]u8 = undefined,
+    /// Raw payload bytes. Only the first `message_len` entries are meaningful.
+    message: [max_payload_len]u8 = undefined,
 
-    /// Number of valid bytes in `message`; never exceeds `message.len`.
+    /// Number of valid payload bytes; never exceeds `message.len`.
     message_len: usize = 0,
 
-    /// Returns the received greeting bytes.
+    /// Returns the received payload.
     ///
-    /// The returned slice borrows this result and remains valid for as long
-    /// as the result does.
-    pub fn text(self: *const ForkGreeting) []const u8 {
+    /// The returned slice borrows this report and remains valid for as long as
+    /// the report does.
+    pub fn text(self: *const ChildReport) []const u8 {
         return self.message[0..self.message_len];
     }
 
-    /// Reports whether the received greeting equals `expected`.
+    /// Reports whether the received payload equals `expected`.
     ///
-    /// Returns false when fewer than `expected.len` bytes arrived.
-    pub fn matchesMessage(self: *const ForkGreeting, expected: []const u8) bool {
+    /// Returns false when a payload of a different length arrived.
+    pub fn matchesMessage(self: *const ChildReport, expected: []const u8) bool {
         return std.mem.eql(u8, self.text(), expected);
     }
 };
+
+/// Reads exactly `buffer.len` bytes from `fd`.
+///
+/// Errors: `error.PeerClosed` when the peer closed the socket first;
+/// `error.ReadFailed` for any other read failure (see `readAtMost`).
+fn readExact(fd: std.os.linux.fd_t, buffer: []u8) !void {
+    const read_len = try readAtMost(fd, buffer);
+    if (read_len != buffer.len) return error.PeerClosed;
+}
+
+/// Reads one framed report: the readiness marker, a little-endian `u32`
+/// payload length, and exactly that many payload bytes.
+///
+/// The returned report owns its payload bytes. A marker that does not match
+/// `child_ready_marker` yields `child_initialized == false` and stops reading,
+/// because the rest of the frame cannot be interpreted without the marker.
+///
+/// Errors: `error.PeerClosed` for a truncated frame,
+/// `error.PayloadTooLarge` when the announced length exceeds
+/// `max_payload_len`, and the read errors documented on `readExact`.
+fn readReport(fd: std.os.linux.fd_t) !ChildReport {
+    var report = ChildReport{};
+
+    var marker: [1]u8 = undefined;
+    try readExact(fd, &marker);
+    report.child_initialized = marker[0] == child_ready_marker;
+    if (!report.child_initialized) return report;
+
+    var length_bytes: [4]u8 = undefined;
+    try readExact(fd, &length_bytes);
+    const payload_len: usize = std.mem.readInt(u32, &length_bytes, .little);
+    if (payload_len > max_payload_len) return error.PayloadTooLarge;
+
+    try readExact(fd, report.message[0..payload_len]);
+    report.message_len = payload_len;
+    report.message_received = payload_len > 0;
+    return report;
+}
+
+/// Writes one framed report to `fd`: the readiness marker, a little-endian
+/// `u32` payload length, and the payload itself.
+///
+/// Writing this frame is the child's signal that it finished initializing, so
+/// it must only be called once the child is ready to be observed.
+///
+/// Errors: `error.PayloadTooLarge` when `payload` exceeds `max_payload_len`,
+/// and `error.WriteFailed` (see `writeAll`).
+fn writeReport(fd: std.os.linux.fd_t, payload: []const u8) !void {
+    if (payload.len > max_payload_len) return error.PayloadTooLarge;
+
+    var header: [5]u8 = undefined;
+    header[0] = child_ready_marker;
+    std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
+
+    try writeAll(fd, &header);
+    try writeAll(fd, payload);
+}
 
 /// Reads from `fd` until `buffer` is full or the peer closes its end.
 ///
@@ -256,25 +310,6 @@ fn writeAll(fd: std.os.linux.fd_t, buffer: []const u8) !void {
     }
 }
 
-/// Body of the forked child. Never returns.
-///
-/// Closes the parent's socket end, initializes the child state, sends the
-/// readiness marker followed by `greeting_text`, and exits. The child uses
-/// only raw Linux syscalls here: after a fork from a multi-threaded process it
-/// must not touch allocators, locks, or the test runner's `std.Io` state.
-fn childGreeting(fds: [2]std.os.linux.fd_t) noreturn {
-    _ = std.os.linux.close(fds[0]);
-
-    const state = initializeChild();
-    if (!state.initialized) std.os.linux.exit_group(1);
-
-    writeAll(fds[1], &[_]u8{child_ready_marker}) catch std.os.linux.exit_group(1);
-    writeAll(fds[1], greeting_text) catch std.os.linux.exit_group(1);
-
-    _ = std.os.linux.close(fds[1]);
-    std.os.linux.exit_group(0);
-}
-
 /// Waits for `pid` to exit and verifies a successful exit status.
 ///
 /// Retries interrupted waits. Returns `error.WaitFailed` when the wait itself
@@ -299,22 +334,60 @@ fn waitForChild(pid: std.os.linux.pid_t) !void {
     }
 }
 
-/// Forks a child that initializes itself and sends `"Hello from ancestors!"`
-/// to the parent over a Unix-domain socket pair.
+/// Entry point of a forked child. `fd` is the child's end of the IPC socket
+/// pair; the parent holds the other end.
 ///
-/// The parent creates a connected `AF_UNIX`/`SOCK_STREAM` pair before forking,
-/// then reads the child's readiness marker and greeting from its end. The
-/// child is always reaped before this function returns.
+/// Returning from a child entry point is allowed: `forkChild` exits the child
+/// process afterwards, so the child never returns into the parent's stack.
+pub const ChildMain = *const fn (fd: std.os.linux.fd_t) void;
+
+/// A forked child plus the parent's end of the IPC socket pair.
+pub const ForkedChild = struct {
+    /// Process id of the child.
+    pid: std.os.linux.pid_t,
+    /// Parent's end of the socket pair; see `close`.
+    socket: std.os.linux.fd_t,
+    /// Whether `socket` is still open; keeps `close` idempotent.
+    socket_open: bool = true,
+
+    /// Closes the parent's end of the socket pair, if still open.
+    ///
+    /// Closing is also how the parent asks a long-lived child to shut down:
+    /// the child's read returns EOF and it exits.
+    pub fn close(self: *ForkedChild) void {
+        if (!self.socket_open) return;
+        _ = std.os.linux.close(self.socket);
+        self.socket_open = false;
+    }
+
+    /// Waits for the child to exit and verifies a zero exit status.
+    ///
+    /// Does not close `socket`. Use `finish` for the usual shutdown order.
+    pub fn wait(self: ForkedChild) !void {
+        try waitForChild(self.pid);
+    }
+
+    /// Closes the socket (signalling shutdown) and waits for the child.
+    ///
+    /// The socket is closed even when waiting fails.
+    ///
+    /// Errors: see `wait`.
+    pub fn finish(self: *ForkedChild) !void {
+        self.close();
+        try waitForChild(self.pid);
+    }
+};
+
+/// Forks a child that runs `child_main` and returns the parent's handle to it.
 ///
-/// On success, returns the flags and greeting bytes observed by the parent.
-/// They are not all-or-nothing: a child that died after reporting readiness
-/// can yield `child_initialized == true` with no greeting.
+/// The parent creates a connected `AF_UNIX`/`SOCK_STREAM` pair before forking;
+/// the child gets one end, the parent keeps the other in the returned handle.
+/// The child exits once `child_main` returns, so a child that should stay alive
+/// must block in `child_main`.
 ///
-/// Possible errors are `error.SocketPairFailed`, `error.ForkUnsupported`,
-/// `error.ForkFailed`, `error.ReadFailed`, `error.WaitFailed`, and
-/// `error.ChildFailed`. The fork itself is the only process-level side
-/// effect; the child exits instead of returning into the caller.
-pub fn forkGreeting() !ForkGreeting {
+/// Errors: `error.SocketPairFailed`, `error.ForkUnsupported`, and
+/// `error.ForkFailed`. No child exists when one of these is returned.
+pub fn forkChild(child_main: ChildMain) !ForkedChild {
     var fds: [2]std.os.linux.fd_t = undefined;
     switch (std.os.linux.errno(std.os.linux.socketpair(
         std.os.linux.AF.UNIX,
@@ -342,53 +415,188 @@ pub fn forkGreeting() !ForkGreeting {
     }
 
     const pid: std.os.linux.pid_t = @intCast(fork_result);
-    if (pid == 0) childGreeting(fds);
+    if (pid == 0) {
+        _ = std.os.linux.close(fds[0]);
+        child_main(fds[1]);
+        _ = std.os.linux.close(fds[1]);
+        std.os.linux.exit_group(0);
+    }
 
     _ = std.os.linux.close(fds[1]);
+    return .{ .pid = pid, .socket = fds[0] };
+}
 
-    var result = ForkGreeting{};
-    const read_result = read: {
-        var marker: [1]u8 = undefined;
-        const marker_len = readAtMost(fds[0], &marker) catch |err| break :read err;
-        result.child_initialized = marker_len == 1 and marker[0] == child_ready_marker;
+/// Operations the parent's IPC listener understands.
+const Operation = enum {
+    /// Write `message` to the process' standard error stream.
+    stderr,
+};
 
-        result.message_len = readAtMost(fds[0], &result.message) catch |err| break :read err;
-        result.message_received = result.message_len > 0;
-        break :read {};
+/// One request sent by a child over the IPC socket.
+///
+/// This is the JSON schema spoken over the socket:
+///
+///     {"operation": "stderr", "message": "Hello from fork"}
+const Request = struct {
+    /// What the parent should do with `message`.
+    operation: Operation,
+    /// Payload for `operation`; for `.stderr` it is printed verbatim.
+    message: []const u8,
+};
+
+/// Parses one JSON request.
+///
+/// Unknown operations and unknown keys are rejected, so a typo in the schema
+/// cannot silently turn into a no-op. The returned value borrows `allocator`
+/// until `deinit()`.
+fn parseRequest(allocator: std.mem.Allocator, text: []const u8) !std.json.Parsed(Request) {
+    return std.json.parseFromSlice(Request, allocator, text, .{});
+}
+
+/// Executes one request received from a child.
+fn handleRequest(request: Request) void {
+    switch (request.operation) {
+        .stderr => std.debug.print("{s}", .{request.message}),
+    }
+}
+
+/// Parent-side listener: reads one framed report from `socket`, decodes the
+/// JSON request it carries, and executes it.
+///
+/// Errors: the framing errors of `readReport`, `error.ChildNotInitialized`
+/// when the child never reached its report, `error.EmptyMessage` for a
+/// zero-length report, and the JSON errors of `parseRequest`.
+fn jsonListener(socket: std.os.linux.fd_t) !void {
+    const report = try readReport(socket);
+    if (!report.child_initialized) return error.ChildNotInitialized;
+    if (!report.message_received) return error.EmptyMessage;
+
+    const request = try parseRequest(std.heap.page_allocator, report.text());
+    defer request.deinit();
+    handleRequest(request.value);
+}
+
+/// Serializes `request` to JSON and sends it to the parent as one framed
+/// report.
+///
+/// Errors: `error.PayloadTooLarge` or `error.WriteFailed` from `writeReport`,
+/// and `error.WriteFailed` when the request does not fit the stack buffer.
+fn sendRequest(fd: std.os.linux.fd_t, request: Request) !void {
+    var buffer: [max_payload_len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try std.json.Stringify.value(request, .{}, &writer);
+    try writeReport(fd, writer.buffered());
+}
+
+/// Message the plugin-manager child reports once it has loaded its plugins.
+const manager_ready_message = "Hello from fork";
+
+/// Child body: loads the plugin manager, reports readiness to the parent, and
+/// waits for the parent to close the socket before unloading the plugins.
+///
+/// The report is sent after the load attempt finishes, whether or not any
+/// plugins were found: it is a readiness signal for the parent, not a success
+/// report. A failed attempt is appended to the same message so the parent sees
+/// both the readiness line and the reason the plugin set may be empty.
+///
+/// Unlike a minimal reporting child, this one allocates and performs file and
+/// dynamic-library I/O while loading plugins. That is safe only as long as the
+/// parent is effectively single-threaded when `forkChild` is called, which
+/// holds for the engine's VSP `Load` call.
+fn pluginManagerChild(fd: std.os.linux.fd_t) void {
+    // `message` borrows `failure`, so the buffer lives until the send below.
+    var failure: [256]u8 = undefined;
+    const message: []const u8 = load: {
+        plugin_manager.loadPlugins() catch |err| {
+            break :load std.fmt.bufPrint(
+                &failure,
+                "Hello from fork\nplugin loading failed: {s}",
+                .{@errorName(err)},
+            ) catch manager_ready_message;
+        };
+        break :load manager_ready_message;
     };
-    _ = std.os.linux.close(fds[0]);
 
-    try waitForChild(pid);
-    try read_result;
-    return result;
+    sendRequest(fd, .{ .operation = .stderr, .message = message }) catch {};
+    waitForShutdown(fd);
+    plugin_manager.deinit();
 }
 
-test "P: forked child reports that it initialized" {
-    const result = try forkGreeting();
-
-    try std.testing.expect(result.child_initialized);
+/// Blocks until the parent closes its end of the socket pair.
+///
+/// Anything the parent sends is discarded for now; the supported direction of
+/// the protocol is child to parent.
+fn waitForShutdown(fd: std.os.linux.fd_t) void {
+    var scratch: [64]u8 = undefined;
+    while (true) {
+        const received = readAtMost(fd, &scratch) catch return;
+        if (received == 0) return;
+    }
 }
 
-test "Q: parent receives a message from the forked child" {
-    const result = try forkGreeting();
-
-    try std.testing.expect(result.message_received);
+/// Child used by the IPC tests: sends the same JSON request the plugin-manager
+/// child sends once it is ready.
+fn testReportChild(fd: std.os.linux.fd_t) void {
+    sendRequest(fd, .{ .operation = .stderr, .message = manager_ready_message }) catch {};
 }
 
-test "R: child message equals \"Hello from ancestors!\"" {
-    const result = try forkGreeting();
+test "forked child reports that it initialized" {
+    var child = try forkChild(testReportChild);
+    defer child.finish() catch {};
 
-    try std.testing.expect(result.matchesMessage(greeting_text));
+    const report = try readReport(child.socket);
+    try std.testing.expect(report.child_initialized);
 }
 
-test "X*: child initialized and parent received the exact greeting" {
-    const result = try forkGreeting();
+test "parent receives a JSON message from the child" {
+    var child = try forkChild(testReportChild);
+    defer child.finish() catch {};
 
-    const p = result.child_initialized;
-    const q = result.message_received;
-    const r = result.matchesMessage(greeting_text);
+    const report = try readReport(child.socket);
+    try std.testing.expect(report.message_received);
 
-    try std.testing.expect(p and q and r);
+    const request = try parseRequest(std.testing.allocator, report.text());
+    defer request.deinit();
+    try std.testing.expectEqual(Operation.stderr, request.value.operation);
+    try std.testing.expectEqualStrings(manager_ready_message, request.value.message);
+}
+
+test "child payload matches the serialized request" {
+    var child = try forkChild(testReportChild);
+    defer child.finish() catch {};
+
+    const report = try readReport(child.socket);
+    try std.testing.expect(report.matchesMessage(
+        "{\"operation\":\"stderr\",\"message\":\"Hello from fork\"}",
+    ));
+}
+
+test "listener schema decodes the stderr operation" {
+    const request = try parseRequest(
+        std.testing.allocator,
+        "{\"operation\": \"stderr\", \"message\": \"Hello from fork\"}",
+    );
+    defer request.deinit();
+
+    try std.testing.expectEqual(Operation.stderr, request.value.operation);
+    try std.testing.expectEqualStrings("Hello from fork", request.value.message);
+}
+
+test "listener schema rejects an unknown operation" {
+    try std.testing.expectError(
+        error.InvalidEnumTag,
+        parseRequest(std.testing.allocator, "{\"operation\": \"stdout\", \"message\": \"x\"}"),
+    );
+}
+
+test "listener schema rejects an unknown field" {
+    try std.testing.expectError(
+        error.UnknownField,
+        parseRequest(
+            std.testing.allocator,
+            "{\"operation\": \"stderr\", \"message\": \"x\", \"unexpected\": 1}",
+        ),
+    );
 }
 
 fn load(
@@ -454,8 +662,25 @@ fn load(
     Log.logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{engine_version});
 
     plugin_manager.setLogger(engine.?, print_fn);
-    plugin_manager.loadPlugins() catch |err| {
-        Log.logLine("[MyLoader] plugin loading failed: {s}\n", .{@errorName(err)});
+
+    if (manager_child != null) {
+        Log.logLine("[MyLoader] plugin manager is already running; refusing a second one\n", .{});
+        return false;
+    }
+
+    manager_child = forkChild(pluginManagerChild) catch |err| {
+        Log.logLine("[MyLoader] forking the plugin manager failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+
+    // Reads the child's first report and executes the JSON request it carries.
+    // The child keeps running (and the socket open) afterwards; unload() is
+    // what closes the socket and reaps it.
+    jsonListener(manager_child.?.socket) catch |err| {
+        Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{@errorName(err)});
+        if (manager_child) |*child| child.finish() catch {};
+        manager_child = null;
+        return false;
     };
 
     const manifests: ?[]const Manager.Manifest = plugin_manager.readConfig() catch null;
@@ -471,8 +696,18 @@ fn load(
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
     Log.logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
-    // Runs every active plugin's unload() and releases the caches; the
-    // manager itself stays reusable for a plugin_load/reload of ours.
+
+    if (manager_child) |*child| {
+        // Closing our end is the shutdown signal: the child's waitForShutdown
+        // sees EOF, unloads its plugins and exits, so finish() can reap it.
+        child.finish() catch |err| {
+            Log.logLine("[MyLoader] plugin manager shutdown failed: {s}\n", .{@errorName(err)});
+        };
+        manager_child = null;
+    }
+
+    // Releases the manifests the parent parsed in load(). The child's plugin
+    // state lived in its own copy of the manager and is already gone.
     plugin_manager.deinit();
     engine = null;
     // The Log module keeps the captured sink: the engine interface stays
