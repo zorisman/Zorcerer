@@ -22,6 +22,25 @@
 - Do not assume that permission to inspect a resource also grants permission to modify or execute it.
 - Use .tmp directory in the repository root for temporary files instead of /tmp.
 
+### Tool Denial and Restriction Handling
+
+- Treat every denied, blocked, or policy-rejected operation as a hard boundary.
+- Never retry a prohibited operation through another tool, shell command, pipeline, interpreter, subprocess, symbolic link, or alternative syntax.
+- Do not use shell commands to bypass restrictions enforced on file-reading or search tools.
+- Before executing a command, verify that all filesystem paths it may access are within the authorized repository or worktree.
+- Do not access files outside the authorized workspace, even when an alternative tool appears to permit the operation.
+- A failed permission check does not grant authorization to use another method.
+- If a task cannot proceed within the authorized scope, stop and report the exact blocker. Ask the user for authorization only when access outside the current scope is genuinely necessary.
+- Never weaken, override, or work around a restriction merely to make a command succeed.
+
+### Trusted System Libraries
+
+- Read-only access may be granted to explicitly approved system library directories when required for the task.
+- Access only the specific files needed to verify APIs, headers, or toolchain behavior.
+- Never modify, delete, or execute files in system library directories unless explicitly authorized.
+- Do not access other external paths merely because a trusted library directory is accessible.
+- If a required file is outside the approved paths, stop and report the access restriction instead of attempting another access method.
+
 ## 3. Change Authorization
 
 - Read and search relevant project files without requesting approval for each individual read operation, provided the configured tools permit it.
@@ -107,7 +126,7 @@ For any task that inspects or changes project files, create and verify a dedicat
 3. Create a new task branch and a sibling worktree, for example:
 
    ```sh
-   git worktree add -b agent/<task-slug> ../<repo-name>-<task-slug> <base-ref>
+   git worktree add -b agent/<task-slug> .agent-worktrees/<repo-name>-<task-slug> <base-ref>
    ```
 
    Replace the placeholders with safe, unique values. Check branch names and paths first; if either exists, choose a unique suffix. Never reuse an active branch, overwrite a path, or remove an existing worktree to make room.
@@ -180,7 +199,7 @@ For implementation tasks, report:
 - Which files were modified.
 - Which checks were actually executed and their results.
 - Any remaining risks, assumptions, or work that requires the user's decision.
-- Write a git commit suggestion in file `.tmp/git-commits.md`, follow the Commit Message Convention that is described in paragraph 11. Do not erase any other records inside the file.
+- Write a git commit suggestion, follow the Commit Message Convention that is described in paragraph 11.
 
 Keep the report concise and technically precise. Never claim completion beyond what the evidence supports.
 
