@@ -95,6 +95,20 @@ pub fn build(b: *std.Build) !void {
         .pic = true
     });
 
+    const zjr = b.addModule("zjr", .{
+        .root_source_file = b.path("extern/zigjr/src/zigjr.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
+    const luajit = b.addModule("luajit", .{
+        .root_source_file = b.path("extern/zig-luajit/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
     // Configuration of a single plugin's TOML manifest
     // (src/PluginConfiguration.zig), later shared between the manager and
     // the file access API in src/io/FileSystem.zig.
@@ -143,6 +157,8 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.root_module.addImport("plugin-configuration", plugin_configuration);
+    zorcerer.root_module.addImport("zjr", zjr);
+    zorcerer.root_module.addImport("luajit", luajit);
     zorcerer.out_filename = "zorcerer.so";
 
     // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed
