@@ -204,7 +204,7 @@ Confirmed by source plus test evidence:
    (which requires `txt[10] == 'T'`, `datetime.zig:168`).
    Treat `toml.serialize` + `DateTime` as non-round-trippable. Use
    parse-into-memory, serialize `Date`/`Time` alone, or write datetimes
-   manually (Zorcerer's analyzer `intoToml` already builds TOML by hand).
+   manually (or write TOML by hand for the required subset).
 2. **Negative UTC offsets in the serializer likely panic** in Debug/ReleaseSafe:
    `@intCast(@divFloor(om, 60))` casts a negative value to `u16`
    (`serialize/root.zig:58`). Source-inspected only; the runtime panic was not
@@ -249,8 +249,8 @@ Not verified (requires network):
   (arena-scoped; 74 passing tests with release-mode CI coverage).
 - For generating TOML, it is safe only for basic types and `Date`/`Time`
   without offsets. Avoid serializing `DateTime` with non-zero offsets and
-  structs containing null-optional fields; hand-rolled TOML output
-  (as the analyzer's `intoToml` does) is the reliable path.
+  structs containing null-optional fields;
+  hand-rolled TOML output for the required subset is the reliable path.
 - Optional follow-ups requiring a decision:
   - Re-enable `run_toml_tests` in the `tests` step of `build.zig` (its blocker
     appears stale), and delete the outdated doc-comment in

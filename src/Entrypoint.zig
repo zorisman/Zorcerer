@@ -4,10 +4,11 @@
 //! LD_PRELOAD-wrapping server.so/engine.so.
 //!
 //! Engine-side indices and version strings come from exactly one place:
-//! codegen_generated/engine_indexes.zig. That file is committed by hand;
-//! its producer, build/EngineIndexesGenerator.zig, is not wired into the
-//! build yet. Nothing in this file hand-maintains an index or a version
-//! string of its own.
+//! codegen_generated/engine_indexes.zig. Its producer,
+//! build/EngineIndexesGenerator.zig, runs during the build: the analyzer
+//! adapter feeds it the C++ analyzer's stdout, and it writes the generated
+//! file directly. Nothing in this file hand-maintains an index or a
+//! version string of its own.
 //!
 //! Engine version handling in `load` no longer needs the removed
 //! src/analyzers/EngineVersions.zig: the engine server interface is

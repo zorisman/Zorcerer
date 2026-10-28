@@ -32,7 +32,7 @@ I hope we can forget about these times. There will be a module called "zostd". I
 This is just the LuaJIT runtime that comes with Zorcerer. That's where its names comes from: Zig + Lua = ZLua. It uses zostd to speak with the plugin manager.
 
 ## Breaking updates
-I try to prevent breaking plugins after updates as far as I guess how to do it. Currently, the Magnum Opus of preventing the breaks is the C++ code analyzer. Check build/analyzers/ files. They read raw_data.toml, containing, what do we want to analyze inside the SDK, then LLVM analyze the Source SDK headers, generates .toml file that contains all the values, including VTable indexes, and codegens it into .zig format.
+I try to prevent breaking plugins after updates as far as I guess how to do it. Currently, the Magnum Opus of preventing the breaks is the C++ code analyzer. Check build/analyzers/ files. They read raw_data.toml, containing what we want to analyze inside the SDK, and send those queries to the analyzer over standard input. LLVM analyzes the Source SDK headers and reports the resolved values, including VTable indexes, on standard output. The Zig adapter consumes that output directly and passes it to EngineIndexesGenerator, which writes src/codegen_generated/engine_indexes.zig; no intermediate .toml file is produced.
 
 There's some other, not-fully implemented things that also run in runtime.
 
