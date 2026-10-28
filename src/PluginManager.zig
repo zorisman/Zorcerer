@@ -187,6 +187,17 @@ pub const Manager = struct {
         Log.setup(self.logger.?);
     }
 
+    /// Replaces the engine logger with the IPC channel to the parent.
+    ///
+    /// Intended for the forked plugin-manager process before loadPlugins():
+    /// manager and plugin messages then travel to the parent as `stderr`
+    /// notifications instead of calling the inherited engine LogPrint after
+    /// the fork. `fd` is the child's end of the fork's socket pair.
+    pub fn setIpcLogger(self: *@This(), fd: std.os.linux.fd_t) void {
+        Log.setupIpc(fd);
+        self.logger = .{ .context = self, .print = Log.pluginPrint };
+    }
+
     /// Builds the HostApi handed to plugin entry points. The returned
     /// value borrows self.logger and is only valid while self lives.
     fn hostApi(self: *@This()) abi.HostApi {
@@ -237,12 +248,9 @@ pub const Manager = struct {
             // through its .so file(s).
             const manifest_name = "manifest.toml";
 
-            const manifest_toml = plugin_dir.readFileAlloc(io, manifest_name, self.allocator, .unlimited) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                else => {
-                    Log.logLine("[zorcerer] {s}/{s}: reading {s} failed ({s}), skipping\n", .{ plugins_directory, dir.name, manifest_name, @errorName(err) });
-                    continue;
-                },
+            const manifest_toml = plugin_dir.readFileAlloc(io, manifest_name, self.allocator, .unlimited) catch {
+                Log.logLine("[Zorcerer] Failed to load manifest for {s}, skipping.\n", .{dir.name});
+                continue;
             };
             defer self.allocator.free(manifest_toml);
 
@@ -352,11 +360,12 @@ pub const Manager = struct {
 ///
 /// Each received frame must carry a JSON-RPC request whose method is one of
 /// `Ipc.Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
-/// "id":1}`. Every framed message is answered with exactly one JSON-RPC result
-/// or error response carrying the request ID, so the Entrypoint's synchronous
-/// event exchange never waits for a reply that will not come. A message that
-/// cannot be decoded is answered with a JSON-RPC error and the message
-/// "Event is invalid".
+/// "id":1}`. Every request carrying an ID is answered with exactly one
+/// JSON-RPC result or error response carrying that ID, so the Entrypoint's
+/// synchronous event exchange never waits for a reply that will not come.
+/// Notifications (requests without an ID) are served without a response,
+/// as JSON-RPC requires. A message that cannot be decoded is answered with a
+/// JSON-RPC error and the message "Event is invalid".
 ///
 /// A frame that cannot be read, or whose marker is wrong, ends the listener:
 /// the stream can no longer be resynchronized. The caller keeps ownership of
@@ -397,7 +406,10 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
         };
         defer parsed.deinit();
 
-        Ipc.sendEventResponse(fd, parsed.value.event, parsed.id()) catch |err| {
+        const request_id = parsed.id();
+        if (request_id.isNotification()) continue;
+
+        Ipc.sendEventResponse(fd, parsed.value.event, request_id) catch |err| {
             Log.logLine(
                 "[zorcerer] event listener: replying to {s} failed: {s}\n",
                 .{ @tagName(parsed.value.event), @errorName(err) },

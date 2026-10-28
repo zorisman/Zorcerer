@@ -170,19 +170,27 @@ fn writeAll(fd: std.os.linux.fd_t, buffer: []const u8) !void {
 
 /// Operations the Entrypoint's JSON-RPC listener understands.
 pub const Operation = enum {
-    /// Write `message` to the process' standard error stream.
+    /// Write `message` to the parent's log sink.
     stderr,
+    /// Report that the plugin-manager child finished its load attempt.
+    ///
+    /// The message is the child's readiness text. The Entrypoint treats its
+    /// expected readiness text as success and any other text as a startup
+    /// failure.
+    ready,
 };
 
 /// Parameters of one operation notification.
 ///
-/// Schema:
+/// Schemas:
 ///
 ///     {"jsonrpc": "2.0", "method": "stderr", "params": {"message": "..."}}
+///     {"jsonrpc": "2.0", "method": "ready", "params": {"message": "..."}}
 pub const Request = struct {
     /// What the receiver should do with `message`.
     operation: Operation,
-    /// Payload for `operation`; for `.stderr` it is printed verbatim.
+    /// Payload for `operation`; for `.stderr` it is logged verbatim, for
+    /// `.ready` it is the child's readiness text.
     message: []const u8,
 };
 
@@ -253,6 +261,15 @@ pub fn sendRequest(fd: std.os.linux.fd_t, request: Request) !void {
     );
     defer allocator.free(payload);
     try writeFrame(fd, payload);
+}
+
+/// Reports the child's readiness state with a `ready` notification.
+///
+/// `message` is the child's readiness text. The Entrypoint treats its expected
+/// readiness text as success and any other text as a failed startup.
+/// Errors are those of `sendRequest`.
+pub fn sendReady(fd: std.os.linux.fd_t, message: []const u8) !void {
+    try sendRequest(fd, .{ .operation = .ready, .message = message });
 }
 
 /// Callbacks whose occurrence the Entrypoint reports to the plugin manager.
@@ -359,6 +376,23 @@ pub fn eventResponseText(buffer: []u8, event: Event) ![]const u8 {
     return std.fmt.bufPrint(buffer, "Event is {s}", .{@tagName(event)});
 }
 
+/// Sends one successful JSON-RPC response.
+///
+/// `id` is the ID of the request being answered. `result_json` is the
+/// already-serialized JSON value of the result, not a plain string, so callers
+/// control whether the result is a string, object, or null.
+///
+/// Errors: `error.NoResponseForNotification` when `id` is not a valid request
+/// ID, plus allocation and framing errors from message composition and
+/// `writeFrame`.
+pub fn sendResultResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, result_json: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    const response_json = try zjr.composer.makeResponseJson(allocator, id, result_json);
+    const payload = response_json orelse return error.NoResponseForNotification;
+    defer allocator.free(payload);
+    try writeFrame(fd, payload);
+}
+
 /// Sends the successful JSON-RPC response for one event request.
 ///
 /// `id` is the ID of the request being answered. The result is the string
@@ -376,10 +410,7 @@ pub fn sendEventResponse(fd: std.os.linux.fd_t, event: Event, id: zjr.RpcId) !vo
     const result_json = try std.json.Stringify.valueAlloc(allocator, message, .{});
     defer allocator.free(result_json);
 
-    const response_json = try zjr.composer.makeResponseJson(allocator, id, result_json);
-    const payload = response_json orelse return error.NoResponseForNotification;
-    defer allocator.free(payload);
-    try writeFrame(fd, payload);
+    try sendResultResponse(fd, id, result_json);
 }
 
 /// Sends a JSON-RPC error response.
@@ -400,7 +431,8 @@ pub fn sendErrorResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, code: zjr.ErrorCo
 /// The request ID is recovered when `request_json` is structurally a
 /// JSON-RPC request, so the caller's synchronous exchange still receives a
 /// matching error response. Unknown methods produce `MethodNotFound`;
-/// malformed envelopes use their own parse/validation code.
+/// malformed envelopes use their own parse/validation code. Notifications
+/// (requests without an ID) are not answered, matching JSON-RPC.
 ///
 /// Errors are the allocation and framing errors from message composition and
 /// `writeFrame`.
@@ -414,6 +446,7 @@ pub fn sendInvalidEventResponse(fd: std.os.linux.fd_t, request_json: []const u8)
     if (rpc.isRequest()) {
         const request = rpc.request_msg.request;
         id = request.id;
+        if (id.isNotification()) return;
         if (request.hasError()) {
             code = request.err().code;
         } else if (eventFromMethod(request.method) == null) {
@@ -455,6 +488,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, text: []const u8) ParsedRespo
 /// Returns the operation named by a JSON-RPC method, or null.
 fn operationFromMethod(method: []const u8) ?Operation {
     if (std.mem.eql(u8, method, "stderr")) return .stderr;
+    if (std.mem.eql(u8, method, "ready")) return .ready;
     return null;
 }
 

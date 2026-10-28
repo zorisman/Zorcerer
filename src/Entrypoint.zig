@@ -26,11 +26,11 @@
 //! manager's own listener (`PluginManager.listenForEvents`).
 //!
 //! Messages are framed JSON-RPC 2.0 messages (see src/Ipc.zig). The manager's
-//! readiness report is a `stderr` notification whose `params.message` is
-//! written to stderr. The callbacks send a request named after the event and
-//! receive a JSON-RPC result `"Event is X"` (or an error response). `unload`
-//! closes the parent's socket end, which tells the child to unload its plugins
-//! and exit, then reaps it.
+//! readiness report is a `ready` notification whose `params.message` is the
+//! child's readiness text. The callbacks send a request named after the event
+//! and receive a JSON-RPC result `"Event is X"` (or an error response).
+//! `unload` closes the parent's socket end, which tells the child to unload
+//! its plugins and exit, then reaps it.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -298,10 +298,36 @@ pub fn forkChild(child_main: ChildMain) !ForkedChild {
     return .{ .pid = pid, .socket = fds[0] };
 }
 
+/// Message the plugin-manager child reports once it has loaded its plugins.
+const manager_ready_message = "Hello from fork";
+
+/// What the listener should do after executing one operation notification.
+const RequestOutcome = enum {
+    /// Keep serving the channel.
+    continue_listening,
+    /// The child reported successful readiness.
+    ready,
+};
+
 /// Executes one operation notification received from the plugin manager.
-fn handleRequest(request: Ipc.Request) void {
+///
+/// `.stderr` messages are forwarded to the parent's log sink. `.ready` with
+/// `manager_ready_message` reports success. Any other readiness text means the
+/// child could not load its plugins: it is logged as a startup failure and
+/// returned as `error.PluginLoadFailed`, so `load()` refuses the plugin set.
+fn handleRequest(request: Ipc.Request) !RequestOutcome {
     switch (request.operation) {
-        .stderr => std.debug.print("{s}", .{request.message}),
+        .stderr => {
+            Log.logLine("{s}", .{request.message});
+            return .continue_listening;
+        },
+        .ready => {
+            if (std.mem.eql(u8, request.message, manager_ready_message)) {
+                return .ready;
+            }
+            Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{request.message});
+            return error.PluginLoadFailed;
+        },
     }
 }
 
@@ -327,44 +353,72 @@ fn handleResponse(response: zjr.RpcResponse) !void {
     }
 }
 
-/// Listener for the manager's messages: reads one framed JSON-RPC message from
-/// `socket` and executes it.
+/// Verifies that a response answers the request the listener is waiting for.
 ///
-/// The same listener handles the initial readiness notification ("Hello from
-/// fork") and every result or error response to a callback event.
-///
-/// Errors: `error.InvalidFrame` when the frame marker is missing,
-/// `error.EmptyMessage` for a zero-length payload, the framing errors of
-/// `Ipc.readFrame`, the JSON errors of `Ipc.parseRequest`/`Ipc.parseResponse`,
-/// and the response-shape errors of `handleResponse`.
-fn jsonListener(socket: std.os.linux.fd_t) !void {
-    const frame = try Ipc.readFrame(socket);
-    if (!frame.framed) return error.InvalidFrame;
-    if (!frame.received) return error.EmptyMessage;
-
-    const request = Ipc.parseRequest(std.heap.page_allocator, frame.text()) catch |err| switch (err) {
-        error.NotRpcRequest => {
-            var response = Ipc.parseResponse(std.heap.page_allocator, frame.text());
-            defer response.deinit();
-            try handleResponse(try response.value());
-            return;
-        },
-        else => return err,
-    };
-    defer request.deinit();
-    handleRequest(request.value);
+/// Errors: `error.UnexpectedResponseId` when no response is expected yet or
+/// when the response carries a different ID.
+fn validateResponseId(actual: zjr.RpcId, expected_response_id: ?i64) !void {
+    const expected = expected_response_id orelse return error.UnexpectedResponseId;
+    if (!actual.eql(expected)) return error.UnexpectedResponseId;
 }
 
-/// Message the plugin-manager child reports once it has loaded its plugins.
-const manager_ready_message = "Hello from fork";
+/// Listener for the manager's messages: reads framed JSON-RPC messages from
+/// `socket` until the expected response or readiness arrives.
+///
+/// Notifications (`.stderr` log lines and `.ready`) are executed without a
+/// reply, so child logging cannot terminate the listener or satisfy a pending
+/// event exchange. Requests carrying an ID are answered with a JSON-RPC
+/// result, and responses are matched against `expected_response_id`.
+///
+/// `expected_response_id` is null while waiting for readiness: the listener
+/// returns after a successful `.ready` and fails with `error.PluginLoadFailed`
+/// on a failed readiness text. For event exchanges it is
+/// `Ipc.event_request_id`: the listener returns after handling that response.
+///
+/// Errors: `error.InvalidFrame` when the frame marker is missing,
+/// `error.EmptyMessage` for a zero-length payload, `error.UnexpectedResponseId`
+/// for a response that does not match a pending event, the framing errors of
+/// `Ipc.readFrame`, the JSON errors of `Ipc.parseRequest`/`Ipc.parseResponse`,
+/// and the response-shape errors of `handleResponse`.
+fn jsonListener(socket: std.os.linux.fd_t, expected_response_id: ?i64) !void {
+    const allocator = std.heap.page_allocator;
+
+    while (true) {
+        const frame = try Ipc.readFrame(socket);
+        if (!frame.framed) return error.InvalidFrame;
+        if (!frame.received) return error.EmptyMessage;
+
+        const request = Ipc.parseRequest(allocator, frame.text()) catch |err| switch (err) {
+            error.NotRpcRequest => {
+                var response = Ipc.parseResponse(allocator, frame.text());
+                defer response.deinit();
+                const rpc_response = try response.value();
+                try validateResponseId(rpc_response.id, expected_response_id);
+                try handleResponse(rpc_response);
+                return;
+            },
+            else => return err,
+        };
+        defer request.deinit();
+
+        const request_id = request.id();
+        const outcome = try handleRequest(request.value);
+
+        if (!request_id.isNotification()) {
+            try Ipc.sendResultResponse(socket, request_id, "\"OK\"");
+        }
+
+        if (outcome == .ready and expected_response_id == null) return;
+    }
+}
 
 /// Child body: loads the plugin manager, reports readiness to the parent, and
 /// then serves callback events until the parent closes the channel.
 ///
-/// The report is sent after the load attempt finishes, whether or not any
-/// plugins were found: it is a readiness signal for the parent, not a success
-/// report. A failed attempt is appended to the same message so the parent sees
-/// both the readiness line and the reason the plugin set may be empty.
+/// Readiness is sent after the load attempt finishes, whether or not any
+/// plugins were found. A successful attempt sends `manager_ready_message`; a
+/// failed one sends the failure text, which the parent treats as a failed
+/// startup instead of ignoring it.
 ///
 /// The listener runs even when loading failed, so the Entrypoint's synchronous
 /// event exchange never blocks on a process that has already stopped reading.
@@ -374,28 +428,50 @@ const manager_ready_message = "Hello from fork";
 /// parent is effectively single-threaded when `forkChild` is called, which
 /// holds for the engine's VSP `Load` call.
 fn pluginManagerChild(fd: std.os.linux.fd_t) void {
+    // The engine sink captured before the fork must not be called from here.
+    plugin_manager.setIpcLogger(fd);
+
     // `message` borrows `failure`, so the buffer lives until the send below.
     var failure: [256]u8 = undefined;
     const message: []const u8 = load: {
         plugin_manager.loadPlugins() catch |err| {
             break :load std.fmt.bufPrint(
                 &failure,
-                "Hello from fork\nplugin loading failed: {s}",
+                "plugin loading failed: {s}",
                 .{@errorName(err)},
-            ) catch manager_ready_message;
+            ) catch "plugin loading failed";
         };
         break :load manager_ready_message;
     };
 
-    Ipc.sendRequest(fd, .{ .operation = .stderr, .message = message }) catch {};
+    Ipc.sendReady(fd, message) catch {};
     Manager.listenForEvents(fd);
     plugin_manager.deinit();
 }
 
-/// Child used by the IPC tests: sends the same JSON request the plugin-manager
-/// child sends once it is ready.
+/// Child used by the IPC tests: sends the same readiness message the
+/// plugin-manager child sends once it is ready.
 fn testReportChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendRequest(fd, .{ .operation = .stderr, .message = manager_ready_message }) catch {};
+    Ipc.sendReady(fd, manager_ready_message) catch {};
+}
+
+/// Child used by the logging test: forwards a plugin print over IPC.
+fn testLogChild(fd: std.os.linux.fd_t) void {
+    Log.setupIpc(fd);
+    Log.pluginPrint(undefined, "plugin log line\n");
+}
+
+test "child logging is sent over IPC" {
+    var child = try forkChild(testLogChild);
+    defer child.finish() catch {};
+
+    const frame = try Ipc.readFrame(child.socket);
+    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
+    defer request.deinit();
+
+    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqualStrings("plugin log line\n", request.value.message);
+    try std.testing.expect(request.id().isNone());
 }
 
 test "forked child reports that it initialized" {
@@ -415,7 +491,7 @@ test "parent receives a JSON message from the child" {
 
     const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
     defer request.deinit();
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
     try std.testing.expectEqualStrings(manager_ready_message, request.value.message);
     try std.testing.expect(request.id().isNone());
 }
@@ -426,19 +502,59 @@ test "child payload matches the serialized request" {
 
     const frame = try Ipc.readFrame(child.socket);
     try std.testing.expect(frame.matches(
-        "{\"jsonrpc\": \"2.0\", \"method\": \"stderr\", \"params\": {\"message\":\"Hello from fork\"}}",
+        "{\"jsonrpc\": \"2.0\", \"method\": \"ready\", \"params\": {\"message\":\"Hello from fork\"}}",
     ));
+}
+
+test "listener schema decodes the ready operation" {
+    const request = try Ipc.parseRequest(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"ready\",\"params\":{\"message\":\"Hello from fork\"}}",
+    );
+    defer request.deinit();
+
+    try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
+    try std.testing.expectEqualStrings("Hello from fork", request.value.message);
 }
 
 test "listener schema decodes the stderr operation" {
     const request = try Ipc.parseRequest(
         std.testing.allocator,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"Hello from fork\"}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"a log line\"}}",
     );
     defer request.deinit();
 
     try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
-    try std.testing.expectEqualStrings("Hello from fork", request.value.message);
+    try std.testing.expectEqualStrings("a log line", request.value.message);
+}
+
+test "successful readiness is accepted" {
+    try std.testing.expectEqual(
+        RequestOutcome.ready,
+        try handleRequest(.{ .operation = .ready, .message = manager_ready_message }),
+    );
+}
+
+test "failed readiness is rejected" {
+    try std.testing.expectError(
+        error.PluginLoadFailed,
+        handleRequest(.{
+            .operation = .ready,
+            .message = "plugin loading failed: OutOfMemory",
+        }),
+    );
+}
+
+test "unexpected response IDs are rejected" {
+    try std.testing.expectError(
+        error.UnexpectedResponseId,
+        validateResponseId(zjr.RpcId.of(2), Ipc.event_request_id),
+    );
+    try std.testing.expectError(
+        error.UnexpectedResponseId,
+        validateResponseId(zjr.RpcId.of(Ipc.event_request_id), null),
+    );
+    try validateResponseId(zjr.RpcId.of(Ipc.event_request_id), Ipc.event_request_id);
 }
 
 test "listener schema rejects an unknown operation" {
@@ -532,6 +648,27 @@ test "manager answers every Entrypoint event with a JSON-RPC result" {
         );
         try std.testing.expectEqualStrings(expected, rpc_response.result.string);
     }
+}
+
+test "manager ignores event notifications" {
+    var child = try forkChild(Manager.listenForEvents);
+    defer child.finish() catch {};
+
+    // Neither a valid event notification nor an invalid one may produce a
+    // reply; only the following request is answered.
+    try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}");
+    try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}");
+    try Ipc.sendEvent(child.socket, .unpause);
+
+    const frame = try Ipc.readFrame(child.socket);
+    try std.testing.expect(frame.received);
+
+    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+    defer response.deinit();
+    const rpc_response = try response.value();
+    try std.testing.expect(!rpc_response.hasErr());
+    try std.testing.expect(rpc_response.id.eql(Ipc.event_request_id));
+    try std.testing.expectEqualStrings("Event is unpause", rpc_response.result.string);
 }
 
 test "manager answers an unknown event instead of stalling" {
@@ -631,11 +768,15 @@ fn load(
         return false;
     };
 
-    // Reads the child's first report and executes the JSON request it carries.
-    // The child keeps running (and the socket open) afterwards; unload() is
-    // what closes the socket and reaps it.
-    jsonListener(manager_child.?.socket) catch |err| {
-        Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{@errorName(err)});
+    // Waits for the child's readiness report, forwarding any log lines it sends
+    // on the way. A failed plugin load is reported as a failed readiness text,
+    // so it refuses the startup instead of returning a successful load. The
+    // child keeps running (and the socket open) afterwards; unload() is what
+    // closes the socket and reaps it.
+    jsonListener(manager_child.?.socket, null) catch |err| {
+        if (err != error.PluginLoadFailed) {
+            Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{@errorName(err)});
+        }
         if (manager_child) |*child| child.finish() catch {};
         manager_child = null;
         return false;
@@ -678,8 +819,10 @@ fn unload(this: *anyopaque) callconv(.c) void {
 ///
 /// Does nothing while no manager process is running (before `load` succeeds or
 /// after `unload`). The exchange is synchronous: the manager answers every
-/// event with exactly one frame, which `jsonListener` prints, so "Event is X"
-/// reaches stderr before the callback returns.
+/// event with exactly one response frame, which `jsonListener` prints, so
+/// "Event is X" reaches stderr before the callback returns. Log notifications
+/// sent by the child meanwhile are forwarded instead of being mistaken for the
+/// response.
 ///
 /// The engine invokes VSP callbacks from one thread at a time; this function
 /// is not reentrant and must not be called concurrently.
@@ -697,7 +840,7 @@ fn sendManagerEvent(event: Ipc.Event) void {
         return;
     };
 
-    jsonListener(child.socket) catch |err| {
+    jsonListener(child.socket, Ipc.event_request_id) catch |err| {
         Log.logLine(
             "[MyLoader] handling the plugin manager's reply to {s} failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
