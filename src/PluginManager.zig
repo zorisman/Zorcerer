@@ -1,4 +1,5 @@
 const std = @import("std");
+const zjr = @import("zjr");
 const Ipc = @import("Ipc.zig");
 const toml = @import("toml");
 const abi = @import("root.zig").abi;
@@ -351,21 +352,30 @@ pub const Manager = struct {
     }
 };
 
-/// Serves the Entrypoint's callback events on the manager's end of the IPC
+/// Serves the Entrypoint's JSON-RPC calls on the manager's end of the IPC
 /// channel until the Entrypoint closes it.
 ///
 /// The channel is the socket pair created for the fork; after the fork, the
 /// manager process owns this end and turns it into its JSON listener. The
 /// Entrypoint holds the other end.
 ///
-/// Each received frame must carry a JSON-RPC request whose method is one of
-/// `Ipc.Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
-/// "id":1}`. Every request carrying an ID is answered with exactly one
-/// JSON-RPC result or error response carrying that ID, so the Entrypoint's
-/// synchronous event exchange never waits for a reply that will not come.
-/// Notifications (requests without an ID) are served without a response,
-/// as JSON-RPC requires. A message that cannot be decoded is answered with a
-/// JSON-RPC error and the message "Event is invalid".
+/// Two kinds of requests are served:
+///
+///   * VSP callback events, for example `{"jsonrpc":"2.0","method":"pause",
+///     "id":1}`. They are answered with the `"Event is X"` result.
+///   * The test `serverCommand` engine-call request. Until real plugins exist,
+///     this function itself decides that `"zorcerer ping"` must make the
+///     Entrypoint execute `echo "Pong!"`.
+///
+/// Every request carrying an ID is answered with exactly one JSON-RPC result
+/// or error response carrying that ID, so the Entrypoint's synchronous
+/// exchange never waits for a reply that will not come. Notifications
+/// (requests without an ID) are served without a response, as JSON-RPC
+/// requires. A message that cannot be decoded is answered with a JSON-RPC
+/// error.
+///
+/// JSON request and response text is printed with `std.debug.print` so the
+/// test exchange is visible in the server console.
 ///
 /// A frame that cannot be read, or whose marker is wrong, ends the listener:
 /// the stream can no longer be resynchronized. The caller keeps ownership of
@@ -396,9 +406,9 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
             continue;
         }
 
-        const parsed = Ipc.parseEvent(std.heap.page_allocator, frame.text()) catch |err| {
+        var parsed = Ipc.parseManagerRequest(std.heap.page_allocator, frame.text()) catch |err| {
             Log.logLine(
-                "[zorcerer] event listener: invalid event ({s})\n",
+                "[zorcerer] event listener: invalid request ({s})\n",
                 .{@errorName(err)},
             );
             if (!respondInvalidEvent(fd, frame.text())) return;
@@ -409,14 +419,99 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
         const request_id = parsed.id();
         if (request_id.isNotification()) continue;
 
-        Ipc.sendEventResponse(fd, parsed.value.event, request_id) catch |err| {
-            Log.logLine(
-                "[zorcerer] event listener: replying to {s} failed: {s}\n",
-                .{ @tagName(parsed.value.event), @errorName(err) },
-            );
-            return;
-        };
+        switch (parsed) {
+            .event => |event| {
+                Ipc.sendEventResponse(fd, event.value.event, request_id) catch |err| {
+                    Log.logLine(
+                        "[zorcerer] event listener: replying to {s} failed: {s}\n",
+                        .{ @tagName(event.value.event), @errorName(err) },
+                    );
+                    return;
+                };
+            },
+            .server_command => |request| {
+                std.debug.print("[zorcerer] JSON-RPC request: {s}\n", .{frame.text()});
+                if (!serveServerCommandTest(fd, request_id, request.command)) return;
+            },
+        }
     }
+}
+
+/// Console command name the test scenario registers with the engine.
+///
+/// Source console command names cannot contain whitespace, so the engine
+/// looks up `zorcerer` and passes `ping` as its first argument.
+pub const test_command_name = "zorcerer";
+
+/// First argument that selects the ping scenario on `test_command_name`.
+pub const test_ping_argument = "ping";
+
+/// RCON line the ServerCommand test scenario reacts to.
+///
+/// Real plugin dispatch will replace this hard-coded decision; the entrypoint
+/// uses the same constants so the trigger cannot drift between both processes.
+/// The test at the end of this file keeps this literal in sync with the name
+/// and argument above.
+pub const test_ping_command = "zorcerer ping";
+
+/// Command the Entrypoint executes in response to `test_ping_command`.
+pub const test_ping_reply = "echo \"Pong!\"";
+
+/// Returns the command the Entrypoint must execute for a test ServerCommand
+/// request, or null when the request is not part of the test scenario.
+///
+/// Kept separate from the listener so the hard-coded test decision is
+/// unit-testable without a socket.
+fn testServerCommandReply(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, test_ping_command)) return test_ping_reply;
+    return null;
+}
+
+/// Answers one test `serverCommand` request.
+///
+/// Prints the composed JSON-RPC response with `std.debug.print` and sends it
+/// as one frame. Returns false when the channel failed and the listener must
+/// stop.
+fn serveServerCommandTest(
+    fd: std.os.linux.fd_t,
+    request_id: zjr.RpcId,
+    command: []const u8,
+) bool {
+    const reply = testServerCommandReply(command) orelse {
+        Ipc.sendErrorResponse(
+            fd,
+            request_id,
+            .InvalidParams,
+            "unsupported ServerCommand test command",
+        ) catch |err| {
+            Log.logLine(
+                "[zorcerer] event listener: replying to serverCommand failed: {s}\n",
+                .{@errorName(err)},
+            );
+            return false;
+        };
+        return true;
+    };
+
+    const allocator = std.heap.page_allocator;
+    const response_json = Ipc.makeServerCommandResponse(allocator, request_id, reply) catch |err| {
+        Log.logLine(
+            "[zorcerer] event listener: composing the serverCommand reply failed: {s}\n",
+            .{@errorName(err)},
+        );
+        return false;
+    };
+    defer allocator.free(response_json);
+
+    std.debug.print("[zorcerer] JSON-RPC response: {s}\n", .{response_json});
+    Ipc.writeFrame(fd, response_json) catch |err| {
+        Log.logLine(
+            "[zorcerer] event listener: sending the serverCommand reply failed: {s}\n",
+            .{@errorName(err)},
+        );
+        return false;
+    };
+    return true;
 }
 
 /// Answers an event that could not be decoded.
@@ -438,4 +533,22 @@ fn respondInvalidEvent(fd: std.os.linux.fd_t, request_json: []const u8) bool {
         return false;
     };
     return true;
+}
+
+test "the test ServerCommand bridge answers ping with echo" {
+    try std.testing.expectEqualStrings(
+        test_ping_reply,
+        testServerCommandReply(test_ping_command).?,
+    );
+    try std.testing.expect(testServerCommandReply("something else") == null);
+}
+
+test "the test ping command is composed from its name and argument" {
+    var buffer: [32]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &buffer,
+        "{s} {s}",
+        .{ test_command_name, test_ping_argument },
+    );
+    try std.testing.expectEqualStrings(test_ping_command, expected);
 }

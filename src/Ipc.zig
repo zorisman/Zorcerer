@@ -33,6 +33,19 @@ const frame_marker: u8 = 0xA5;
 /// fixed positive ID is sufficient and lets the listener match the response.
 pub const event_request_id: i64 = 1;
 
+/// Request ID used by the `serverCommand` test round trip.
+///
+/// It differs from `event_request_id` so a response can never be mistaken
+/// for the reply to a VSP callback event.
+pub const server_command_request_id: i64 = 2;
+
+/// JSON-RPC method name of the test ServerCommand engine call.
+///
+/// The Entrypoint sends this request to the plugin manager; the manager
+/// answers with the command the Entrypoint should execute through the
+/// engine's original `IVEngineServer::ServerCommand` implementation.
+pub const server_command_method = "serverCommand";
+
 /// One frame read from the channel.
 ///
 /// The flags describe what arrived, not what was expected: a peer that sent a
@@ -220,6 +233,10 @@ pub const ParsedRequest = struct {
 /// parameters are rejected. The returned value owns the parsed JSON until
 /// `deinit()`.
 ///
+/// A frame without a `method` member is not a request: it is either a
+/// response or an object that cannot be served, and `error.NotRpcRequest`
+/// lets the caller try the response parser instead.
+///
 /// Errors: `error.NotRpcRequest` when `text` is a response or batch,
 /// `error.InvalidRpcRequest` for an invalid JSON-RPC envelope,
 /// `error.UnknownMethod` for an operation this module does not implement,
@@ -230,6 +247,10 @@ pub fn parseRequest(allocator: std.mem.Allocator, text: []const u8) !ParsedReque
 
     if (rpc.isMissingMethod() or !rpc.isRequest()) return error.NotRpcRequest;
     const request = rpc.request_msg.request;
+    // ZigJR fills a missing `method` with its empty default, so the parsed
+    // envelope alone does not say whether this was a request. An empty
+    // method cannot name an operation, and responses land here.
+    if (request.method.len == 0) return error.NotRpcRequest;
     if (request.hasError()) return error.InvalidRpcRequest;
 
     const operation = operationFromMethod(request.method) orelse return error.UnknownMethod;
@@ -330,6 +351,9 @@ pub fn parseEvent(allocator: std.mem.Allocator, text: []const u8) !ParsedEvent {
 
     if (rpc.isMissingMethod() or !rpc.isRequest()) return error.NotRpcRequest;
     const request = rpc.request_msg.request;
+    // ZigJR's empty `method` default also covers response frames; see
+    // `parseRequest`.
+    if (request.method.len == 0) return error.NotRpcRequest;
     if (request.hasError()) return error.InvalidRpcRequest;
 
     const event = eventFromMethod(request.method) orelse return error.UnknownMethod;
@@ -426,12 +450,13 @@ pub fn sendErrorResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, code: zjr.ErrorCo
     try writeFrame(fd, payload);
 }
 
-/// Answers an event frame that could not be decoded.
+/// Answers a frame that could not be decoded.
 ///
 /// The request ID is recovered when `request_json` is structurally a
 /// JSON-RPC request, so the caller's synchronous exchange still receives a
 /// matching error response. Unknown methods produce `MethodNotFound`;
-/// malformed envelopes use their own parse/validation code. Notifications
+/// malformed envelopes use their own parse/validation code, and a malformed
+/// `serverCommand` request is reported as `InvalidParams`. Notifications
 /// (requests without an ID) are not answered, matching JSON-RPC.
 ///
 /// Errors are the allocation and framing errors from message composition and
@@ -443,19 +468,216 @@ pub fn sendInvalidEventResponse(fd: std.os.linux.fd_t, request_json: []const u8)
 
     var id = zjr.RpcId.ofNull();
     var code: zjr.ErrorCode = .InvalidRequest;
+    var message: []const u8 = "Event is invalid";
     if (rpc.isRequest()) {
         const request = rpc.request_msg.request;
         id = request.id;
         if (id.isNotification()) return;
+        const is_server_command = std.mem.eql(u8, request.method, server_command_method);
         if (request.hasError()) {
             code = request.err().code;
-        } else if (eventFromMethod(request.method) == null) {
+        } else if (!is_server_command and eventFromMethod(request.method) == null) {
             code = .MethodNotFound;
         } else {
             code = .InvalidParams;
+            if (is_server_command) message = "ServerCommand is invalid";
         }
     }
-    try sendErrorResponse(fd, id, code, "Event is invalid");
+    try sendErrorResponse(fd, id, code, message);
+}
+
+/// Parameters of the test `serverCommand` request.
+///
+/// Wire form:
+///
+///     {"jsonrpc":"2.0","method":"serverCommand",
+///      "params":{"command":"zorcerer ping"},"id":2}
+pub const ServerCommandParams = struct {
+    /// Command line the Entrypoint intercepted from the engine.
+    command: []const u8,
+};
+
+/// Result of the test `serverCommand` request.
+///
+/// The Entrypoint executes `command` through the engine's original
+/// `IVEngineServer::ServerCommand` implementation after receiving it.
+pub const ServerCommandResult = struct {
+    /// Command to issue to the engine.
+    command: []const u8,
+};
+
+/// A `serverCommand` request parsed from a JSON-RPC request.
+///
+/// `command` borrows the JSON owned by `rpc`; both stay valid until
+/// `deinit()`.
+pub const ParsedServerCommand = struct {
+    /// Parsed JSON-RPC request whose params hold the intercepted command.
+    rpc: zjr.RpcRequestResult,
+    /// Command the Entrypoint sent to the manager.
+    command: []const u8,
+
+    /// Releases the JSON storage owned by `rpc`.
+    pub fn deinit(self: *const ParsedServerCommand) void {
+        self.rpc.deinit();
+    }
+
+    /// Returns the request ID, which is `.none` for a notification.
+    pub fn id(self: *const ParsedServerCommand) zjr.RpcId {
+        return if (self.rpc.isRequest()) self.rpc.request_msg.request.id else .ofNone();
+    }
+};
+
+/// One JSON-RPC call the plugin manager's listener understands.
+///
+/// Events are triggered by VSP callbacks; `serverCommand` is the test engine
+/// call path that lets the manager decide which command the Entrypoint should
+/// execute. Keeping both in one union lets the listener parse each frame
+/// exactly once.
+pub const ManagerRequest = union(enum) {
+    /// A VSP callback event such as `pause` or `levelInit`.
+    event: ParsedEvent,
+    /// A test ServerCommand engine-call request.
+    server_command: ParsedServerCommand,
+
+    /// Releases the JSON storage owned by the active variant.
+    pub fn deinit(self: *ManagerRequest) void {
+        switch (self.*) {
+            .event => |*parsed| parsed.deinit(),
+            .server_command => |*parsed| parsed.deinit(),
+        }
+    }
+
+    /// Returns the request ID, which is `.none` for a notification.
+    pub fn id(self: *const ManagerRequest) zjr.RpcId {
+        return switch (self.*) {
+            .event => |parsed| parsed.id(),
+            .server_command => |parsed| parsed.id(),
+        };
+    }
+};
+
+/// Serializes a test `serverCommand` request as a JSON-RPC 2.0 request.
+///
+/// The caller owns the returned slice and frees it with `allocator.free`.
+/// Errors: `error.OutOfMemory` and ZigJR's composition errors.
+pub fn makeServerCommandRequest(
+    allocator: std.mem.Allocator,
+    command: []const u8,
+) ![]const u8 {
+    return zjr.composer.makeRequestJson(
+        allocator,
+        server_command_method,
+        ServerCommandParams{ .command = command },
+        zjr.RpcId.of(server_command_request_id),
+    );
+}
+
+/// Serializes a `serverCommand` result as a JSON-RPC 2.0 response.
+///
+/// The caller owns the returned slice and frees it with `allocator.free`.
+/// Errors: `error.NoResponseForNotification` when `id` is a notification,
+/// plus allocation and composition errors.
+pub fn makeServerCommandResponse(
+    allocator: std.mem.Allocator,
+    id: zjr.RpcId,
+    command: []const u8,
+) ![]const u8 {
+    const result_json = try std.json.Stringify.valueAlloc(
+        allocator,
+        ServerCommandResult{ .command = command },
+        .{},
+    );
+    defer allocator.free(result_json);
+
+    return try zjr.composer.makeResponseJson(allocator, id, result_json) orelse
+        error.NoResponseForNotification;
+}
+
+/// Sends a test `serverCommand` request as one frame.
+///
+/// Errors: the composition errors of `makeServerCommandRequest` and the
+/// framing errors of `writeFrame`.
+pub fn sendServerCommandRequest(fd: std.os.linux.fd_t, command: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    const payload = try makeServerCommandRequest(allocator, command);
+    defer allocator.free(payload);
+    try writeFrame(fd, payload);
+}
+
+/// Sends a test `serverCommand` response as one frame.
+///
+/// Errors: those of `makeServerCommandResponse` and `writeFrame`.
+pub fn sendServerCommandResponse(
+    fd: std.os.linux.fd_t,
+    id: zjr.RpcId,
+    command: []const u8,
+) !void {
+    const allocator = std.heap.page_allocator;
+    const payload = try makeServerCommandResponse(allocator, id, command);
+    defer allocator.free(payload);
+    try writeFrame(fd, payload);
+}
+
+/// Parses one JSON-RPC call received by the plugin manager.
+///
+/// The JSON-RPC method selects the variant: `serverCommand` becomes
+/// `.server_command`, every name in `Event` becomes `.event`. The returned
+/// value owns the parsed JSON until `deinit()`.
+///
+/// Errors: `error.NotRpcRequest` when `text` is a response or batch,
+/// `error.InvalidRpcRequest` for an invalid JSON-RPC envelope,
+/// `error.UnknownMethod` for a method the manager does not implement, and
+/// `error.InvalidParams`/`error.MissingCommand` for malformed
+/// `serverCommand` parameters.
+pub fn parseManagerRequest(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) !ManagerRequest {
+    var rpc = zjr.parseRpcRequest(allocator, text);
+    errdefer rpc.deinit();
+
+    if (rpc.isMissingMethod() or !rpc.isRequest()) return error.NotRpcRequest;
+    const request = rpc.request_msg.request;
+    // As in `parseRequest`, ZigJR's empty `method` default also covers
+    // response frames, which are not manager calls.
+    if (request.method.len == 0) return error.NotRpcRequest;
+    if (request.hasError()) return error.InvalidRpcRequest;
+
+    if (std.mem.eql(u8, request.method, server_command_method)) {
+        const params = request.objectParams() orelse return error.InvalidParams;
+        const command_value = params.get("command") orelse return error.MissingCommand;
+        const command = switch (command_value) {
+            .string => |value| value,
+            else => return error.InvalidParams,
+        };
+        return .{ .server_command = .{ .rpc = rpc, .command = command } };
+    }
+
+    const event = eventFromMethod(request.method) orelse return error.UnknownMethod;
+    return .{ .event = .{ .rpc = rpc, .value = .{ .event = event } } };
+}
+
+/// Extracts the command from a successful `serverCommand` response.
+///
+/// The returned slice borrows `response` and the JSON storage behind it; it
+/// remains valid only while the parsed response is alive.
+///
+/// Errors: `error.ServerCommandFailed` for a JSON-RPC error response,
+/// `error.UnexpectedResultType` when the result is not an object,
+/// `error.MissingCommand` when the object has no `command`, and
+/// `error.InvalidCommand` when `command` is not a string.
+pub fn serverCommandFromResponse(response: zjr.RpcResponse) ![]const u8 {
+    if (response.hasErr()) return error.ServerCommandFailed;
+
+    const result = switch (response.result) {
+        .object => |object| object,
+        else => return error.UnexpectedResultType,
+    };
+    const command_value = result.get("command") orelse return error.MissingCommand;
+    return switch (command_value) {
+        .string => |command| command,
+        else => return error.InvalidCommand,
+    };
 }
 
 /// A JSON-RPC response parsed from one IPC payload.
@@ -661,4 +883,98 @@ test "mock JSON-RPC request/response flow" {
     const read_result = read.result.string;
     std.debug.print("mockReadStruct result: {s}\n", .{read_result});
     try std.testing.expectEqualStrings("Hello", read_result);
+}
+
+test "serverCommand request is a JSON-RPC 2.0 request the manager understands" {
+    const allocator = std.testing.allocator;
+    const text = try makeServerCommandRequest(allocator, "zorcerer ping");
+    defer allocator.free(text);
+
+    var rpc = zjr.parseRpcRequest(allocator, text);
+    defer rpc.deinit();
+    try std.testing.expect(rpc.isRequest());
+
+    const request = rpc.request_msg.request;
+    try std.testing.expectEqualStrings("2.0", request.jsonrpc[0..]);
+    try std.testing.expectEqualStrings(server_command_method, request.method);
+    try std.testing.expect(request.id.eql(server_command_request_id));
+
+    const params = request.objectParams() orelse return error.MissingParams;
+    const command = switch (params.get("command") orelse return error.MissingCommand) {
+        .string => |value| value,
+        else => return error.InvalidCommand,
+    };
+    try std.testing.expectEqualStrings("zorcerer ping", command);
+
+    var parsed = try parseManagerRequest(allocator, text);
+    defer parsed.deinit();
+    switch (parsed) {
+        .server_command => |call| try std.testing.expectEqualStrings("zorcerer ping", call.command),
+        .event => return error.UnexpectedEvent,
+    }
+    try std.testing.expect(parsed.id().eql(server_command_request_id));
+}
+
+test "serverCommand response carries the command the Entrypoint must execute" {
+    const allocator = std.testing.allocator;
+    const text = try makeServerCommandResponse(
+        allocator,
+        zjr.RpcId.of(server_command_request_id),
+        "echo \"Pong!\"",
+    );
+    defer allocator.free(text);
+
+    var response = parseResponse(allocator, text);
+    defer response.deinit();
+    const rpc = try response.value();
+
+    try std.testing.expect(!rpc.hasErr());
+    try std.testing.expect(rpc.id.eql(server_command_request_id));
+    try std.testing.expectEqualStrings("echo \"Pong!\"", try serverCommandFromResponse(rpc));
+}
+
+test "parseRequest treats a response frame as not a request" {
+    try std.testing.expectError(
+        error.NotRpcRequest,
+        parseRequest(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":2}",
+        ),
+    );
+}
+
+test "manager request parsing keeps events and serverCommand apart" {
+    const allocator = std.testing.allocator;
+
+    var event = try parseManagerRequest(
+        allocator,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"pause\",\"id\":1}",
+    );
+    defer event.deinit();
+    switch (event) {
+        .event => |parsed| try std.testing.expectEqual(Event.pause, parsed.value.event),
+        .server_command => return error.UnexpectedServerCommand,
+    }
+
+    try std.testing.expectError(
+        error.UnknownMethod,
+        parseManagerRequest(
+            allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":1}",
+        ),
+    );
+    try std.testing.expectError(
+        error.MissingCommand,
+        parseManagerRequest(
+            allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"serverCommand\",\"params\":{},\"id\":2}",
+        ),
+    );
+    try std.testing.expectError(
+        error.NotRpcRequest,
+        parseManagerRequest(
+            allocator,
+            "{\"jsonrpc\":\"2.0\",\"result\":{},\"id\":2}",
+        ),
+    );
 }

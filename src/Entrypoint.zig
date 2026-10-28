@@ -85,9 +85,11 @@ const Manager = @import("PluginManager.zig");
 const Log = @import("root.zig").Log;
 const abi = @import("root.zig").abi;
 
-// Include Ipc.zig's in-process JSON-RPC tests in this module's test build.
+// Include Ipc.zig's and PluginManager.zig's in-process tests in this module's
+// test build.
 test {
     _ = @import("Ipc.zig");
+    _ = @import("PluginManager.zig");
 }
 
 pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
@@ -127,6 +129,252 @@ const PluginObject = extern struct {
 
 var plugin_instance = PluginObject{ .vptr = &vtable };
 var engine: ?*anyopaque = null;
+
+/// Command line the test ServerCommand scenario listens for.
+const test_ping_command = Manager.test_ping_command;
+
+/// Command name the engine actually parses out of `test_ping_command`.
+///
+/// Source console command names cannot contain whitespace, so `zorcerer ping`
+/// is the command `zorcerer` with the argument `ping`. The command object
+/// registered with `ICvar` therefore carries this name, and the dispatch
+/// callback checks the argument itself.
+const test_command_name = Manager.test_command_name;
+
+/// Argument that selects the ping scenario on `test_command_name`.
+const test_ping_argument = Manager.test_ping_argument;
+
+/// The `CCommand` object the engine passes to `ConCommand::Dispatch`.
+///
+/// The layout is copied from `CCommand` in the Source SDK's
+/// `public/tier1/convar.h` for the Itanium C++ ABI used by the Linux
+/// dedicated server. Dispatch only reads `argc` and the first entries of
+/// `argv`; the token buffers are part of the struct because they determine
+/// the offsets of those fields.
+const CCommand = extern struct {
+    /// Number of tokens in the command line, including the command name.
+    argc: c_int,
+    /// Byte offset of the argument string inside `arg_s_buffer`.
+    argv0_size: c_int,
+    /// The full command line with the command name at the front.
+    arg_s_buffer: [512]u8,
+    /// NUL-terminated copies of every argument.
+    argv_buffer: [512]u8,
+    /// Pointers to `argc` tokens, each pointing into `argv_buffer`.
+    argv: [64]?[*:0]const u8,
+};
+
+/// Returns token `index` of `command`, or null when it is absent.
+///
+/// The returned slice borrows the engine-owned command storage and remains
+/// valid only for the duration of the `Dispatch` call.
+fn commandArgument(command: *const CCommand, index: usize) ?[]const u8 {
+    if (command.argc <= 0) return null;
+    const argc: usize = @intCast(command.argc);
+    if (index >= argc) return null;
+    const token = command.argv[index] orelse return null;
+    return std.mem.span(token);
+}
+
+/// Returns whether the engine dispatched the registered `zorcerer ping`
+/// command line.
+///
+/// The engine looks a console command up by its first token alone, so the
+/// `ping` argument has to be checked here to keep other invocations of
+/// `zorcerer` from starting the test exchange.
+fn isTestPingInvocation(command: *const CCommand) bool {
+    if (command.argc != 2) return false;
+    const name = commandArgument(command, 0) orelse return false;
+    const argument = commandArgument(command, 1) orelse return false;
+    return std.mem.eql(u8, name, test_command_name) and
+        std.mem.eql(u8, argument, test_ping_argument);
+}
+
+/// In-process `ConCommand` registered with the engine at load time.
+///
+/// The field order and sizes follow `ConCommandBase` followed by `ConCommand`
+/// in the Source SDK's `public/tier1/convar.h`, for the Itanium C++ ABI used
+/// by the Linux dedicated server. The vtable pointer must stay first, and the
+/// members up to `flags` must keep their offsets: the engine links this
+/// object into its own command list and reads those members directly.
+///
+/// The callback words and the bitfield byte are present only to match the
+/// C++ object size. This implementation overrides `Dispatch` directly, so
+/// `ConCommand`'s own callback dispatch is never used.
+const ConCommandObject = extern struct {
+    /// Itanium ABI vptr pointing at `concommand_vtable`.
+    vptr: [*]const Slot,
+    /// Engine-owned link to the next registered command (`m_pNext`).
+    next: ?*anyopaque,
+    /// Whether the engine has registered this command (`m_bRegistered`).
+    registered: u8,
+    /// NUL-terminated command name (`m_pszName`).
+    name: ?[*:0]const u8,
+    /// NUL-terminated help text (`m_pszHelpString`).
+    help: ?[*:0]const u8,
+    /// `FCVAR_*` flags (`m_nFlags`).
+    flags: c_int,
+    /// `ConCommand`'s callback union. Null: this object's Dispatch runs.
+    command_callback: ?*const anyopaque,
+    /// `ConCommand`'s completion callback union. Null: no completion.
+    completion_callback: ?*const anyopaque,
+    /// `ConCommand`'s three callback-kind bitfields.
+    callback_flags: u8,
+};
+
+/// Complete/deleting destructor entry of `ConCommandObject`.
+///
+/// The command has static storage duration and must never be freed by the
+/// engine, so both destructor vtable slots are no-ops.
+fn conCommandDestroy(_: *ConCommandObject) callconv(.c) void {}
+
+/// Reports that the registered object is a console command, not a ConVar.
+fn conCommandIsCommand(_: *const ConCommandObject) callconv(.c) bool {
+    return true;
+}
+
+/// Tests one `FCVAR_*` flag against the command's flags.
+fn conCommandIsFlagSet(self: *const ConCommandObject, flag: c_int) callconv(.c) bool {
+    return (self.flags & flag) != 0;
+}
+
+/// Adds `flags` to the command's `FCVAR_*` flags.
+fn conCommandAddFlags(self: *ConCommandObject, flags: c_int) callconv(.c) void {
+    self.flags |= flags;
+}
+
+/// Returns the command name the engine looks up.
+fn conCommandGetName(self: *const ConCommandObject) callconv(.c) [*:0]const u8 {
+    return self.name orelse @as([*:0]const u8, "");
+}
+
+/// Returns the command's help text.
+fn conCommandGetHelpText(self: *const ConCommandObject) callconv(.c) [*:0]const u8 {
+    return self.help orelse @as([*:0]const u8, "");
+}
+
+/// Returns whether the engine currently holds this command.
+fn conCommandIsRegistered(self: *const ConCommandObject) callconv(.c) bool {
+    return self.registered != 0;
+}
+
+/// Returns the DLL identifier allocated for this command.
+fn conCommandGetDllIdentifier(_: *const ConCommandObject) callconv(.c) c_int {
+    return test_ping_dll_id;
+}
+
+/// Initializes the `ConCommandBase` fields from explicit values.
+///
+/// The static object is already initialized before registration, so the
+/// engine does not normally call this. It is implemented for ABI completeness.
+fn conCommandCreateBase(
+    self: *ConCommandObject,
+    name: [*:0]const u8,
+    help: ?[*:0]const u8,
+    flags: c_int,
+) callconv(.c) void {
+    self.name = name;
+    self.help = help orelse @as([*:0]const u8, "");
+    self.flags = flags;
+}
+
+/// Registration hook of `ConCommandBase`.
+///
+/// Registration is performed directly through `ICvar::RegisterConCommand`, so
+/// calling the accessor again here would recurse into the engine.
+fn conCommandInit(_: *ConCommandObject) callconv(.c) void {}
+
+/// Reports no completion suggestions.
+fn conCommandAutoCompleteSuggest(
+    _: *ConCommandObject,
+    _: [*:0]const u8,
+    _: *anyopaque,
+) callconv(.c) c_int {
+    return 0;
+}
+
+/// Reports that this command has no completion callback.
+fn conCommandCanAutoComplete(_: *ConCommandObject) callconv(.c) bool {
+    return false;
+}
+
+/// Runs the test ping exchange when the engine dispatches `zorcerer ping`.
+///
+/// Other arguments print a usage line instead of starting an exchange, so the
+/// registered command cannot be used to issue arbitrary manager requests.
+fn conCommandDispatch(_: *ConCommandObject, command: *const CCommand) callconv(.c) void {
+    if (!isTestPingInvocation(command)) {
+        std.debug.print("[zorcerer] usage: {s}\n", .{test_ping_command});
+        return;
+    }
+
+    const server = engine orelse {
+        std.debug.print(
+            "[zorcerer] {s}: engine interface is unavailable\n",
+            .{test_ping_command},
+        );
+        return;
+    };
+    runTestPingExchange(server);
+}
+
+/// Virtual method table for `test_ping_concommand`.
+///
+/// Entries are placed by the indices the code generator recorded for
+/// `ConCommand`, so the ordering cannot drift from the analyzed engine ABI.
+const concommand_vtable: [Indexes.ConCommand.dispatch + 1]Slot = blk: {
+    var slots = [_]Slot{null} ** (Indexes.ConCommand.dispatch + 1);
+    slots[Indexes.ConCommand.@"~ConCommand"] = @ptrCast(&conCommandDestroy);
+    slots[Indexes.ConCommand.@"~ConCommand@1"] = @ptrCast(&conCommandDestroy);
+    slots[Indexes.ConCommand.is_command] = @ptrCast(&conCommandIsCommand);
+    slots[Indexes.ConCommand.is_flag_set] = @ptrCast(&conCommandIsFlagSet);
+    slots[Indexes.ConCommand.add_flags] = @ptrCast(&conCommandAddFlags);
+    slots[Indexes.ConCommand.get_name] = @ptrCast(&conCommandGetName);
+    slots[Indexes.ConCommand.get_help_text] = @ptrCast(&conCommandGetHelpText);
+    slots[Indexes.ConCommand.is_registered] = @ptrCast(&conCommandIsRegistered);
+    slots[Indexes.ConCommand.get_dll_identifier] = @ptrCast(&conCommandGetDllIdentifier);
+    slots[Indexes.ConCommand.create_base] = @ptrCast(&conCommandCreateBase);
+    slots[Indexes.ConCommand.init] = @ptrCast(&conCommandInit);
+    slots[Indexes.ConCommand.auto_complete_suggest] = @ptrCast(&conCommandAutoCompleteSuggest);
+    slots[Indexes.ConCommand.can_auto_complete] = @ptrCast(&conCommandCanAutoComplete);
+    slots[Indexes.ConCommand.dispatch] = @ptrCast(&conCommandDispatch);
+    break :blk slots;
+};
+
+/// Static command object the engine holds between registration and unload.
+var test_ping_concommand = ConCommandObject{
+    .vptr = &concommand_vtable,
+    .next = null,
+    .registered = 0,
+    .name = test_command_name,
+    .help = "Test command: zorcerer ping",
+    .flags = 0,
+    .command_callback = null,
+    .completion_callback = null,
+    .callback_flags = 0,
+};
+
+/// `ICvar` pointer captured at registration time, or null while the test
+/// command is not registered. Used to call `UnregisterConCommand` on unload.
+var test_ping_cvar: ?*anyopaque = null;
+
+/// DLL identifier allocated from `ICvar` for the test command, or -1 while no
+/// identifier has been allocated. The command's `GetDLLIdentifier` reports it.
+var test_ping_dll_id: c_int = -1;
+
+/// Whether `registerTestPingCommand` completed and the engine holds the
+/// command. Kept separately from the engine-managed `registered` byte so
+/// teardown does not depend on the object's state.
+var test_ping_registered = false;
+
+/// Installed `IVEngineServer::ServerCommand` hook, or null while no manager
+/// child is running. The detour reaches this module-level value because a
+/// C-ABI function pointer cannot close over the hook it belongs to.
+var server_command_hook: ?VTableHooks.VtableHook = null;
+
+/// Guards the ping exchange against re-entry: `ServerCommand` is an engine
+/// entry point and the test exchange must not start a second nested exchange.
+var handling_test_ping = false;
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
 /// discover/cache the plugin .so files under tf/addons/zorcerer/plugins/, run
@@ -180,6 +428,345 @@ test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
     var fake = extern struct { vptr: [*]const Slot }{ .vptr = &slots };
 
     try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
+}
+
+/// Returns whether `command` is the test scenario's `zorcerer ping`.
+///
+/// The engine may deliver the console line with a trailing newline or
+/// surrounding whitespace, so the comparison trims it first.
+fn isTestPingCommand(command: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, command, " \t\r\n"), test_ping_command);
+}
+
+/// Calls the engine's original `ServerCommand` implementation.
+///
+/// `command` must be zero-terminated. Does nothing when no hook is installed,
+/// which also makes the helper safe to call from early-failure paths.
+fn callOriginalServerCommand(this: *anyopaque, command: [*:0]const u8) void {
+    const hook = server_command_hook orelse return;
+    const original: *const fn (*anyopaque, [*:0]const u8) callconv(.c) void =
+        @ptrCast(hook.original_fn);
+    original(this, command);
+}
+
+/// Sends one `serverCommand` JSON-RPC request to `fd` and waits for the
+/// matching response.
+///
+/// While waiting, log notifications from the manager are executed and
+/// answered exactly like `jsonListener` does, so manager logging cannot be
+/// mistaken for the test response.
+///
+/// The returned slice borrows `result_buffer` and is valid until the caller
+/// overwrites it.
+///
+/// Errors: framing errors from `Ipc.readFrame`/`Ipc.writeFrame`, JSON errors
+/// from `Ipc.parseRequest`/`Ipc.parseResponse`, `error.UnexpectedResponseId`
+/// when the reply does not answer `Ipc.server_command_request_id`, and the
+/// response-shape errors of `Ipc.serverCommandFromResponse`.
+fn exchangeServerCommand(
+    fd: std.os.linux.fd_t,
+    command: []const u8,
+    result_buffer: []u8,
+) ![]const u8 {
+    const allocator = std.heap.page_allocator;
+    const request_json = try Ipc.makeServerCommandRequest(allocator, command);
+    defer allocator.free(request_json);
+
+    std.debug.print("[zorcerer] JSON-RPC request: {s}\n", .{request_json});
+    try Ipc.writeFrame(fd, request_json);
+
+    while (true) {
+        const frame = try Ipc.readFrame(fd);
+        if (!frame.framed) return error.InvalidFrame;
+        if (!frame.received) return error.EmptyMessage;
+
+        if (Ipc.parseRequest(allocator, frame.text())) |request| {
+            defer request.deinit();
+            const request_id = request.id();
+            _ = try handleRequest(request.value);
+            if (!request_id.isNotification()) {
+                try Ipc.sendResultResponse(fd, request_id, "\"OK\"");
+            }
+            continue;
+        } else |err| switch (err) {
+            error.NotRpcRequest => {},
+            else => return err,
+        }
+
+        var response = Ipc.parseResponse(allocator, frame.text());
+        defer response.deinit();
+        const rpc_response = try response.value();
+        if (!rpc_response.id.eql(Ipc.server_command_request_id)) {
+            return error.UnexpectedResponseId;
+        }
+
+        std.debug.print("[zorcerer] JSON-RPC response: {s}\n", .{frame.text()});
+        const reply = try Ipc.serverCommandFromResponse(rpc_response);
+        if (reply.len > result_buffer.len) return error.NoSpaceLeft;
+        @memcpy(result_buffer[0..reply.len], reply);
+        return result_buffer[0..reply.len];
+    }
+}
+
+/// Performs one JSON-RPC ping exchange and executes the manager's reply
+/// through the original engine `ServerCommand`.
+///
+/// `server` is the IVEngineServer instance used to execute the reply. The
+/// helper does nothing while no plugin-manager child is running or while an
+/// exchange is already in progress; re-entry is ignored because both engine
+/// entry points used here can run nested command lines.
+///
+/// The exchange is synchronous and must run on the engine thread that
+/// invoked the command; the engine invokes console commands from one thread
+/// at a time.
+fn runTestPingExchange(server: *anyopaque) void {
+    if (handling_test_ping) return;
+
+    const child = if (manager_child) |*running| running else return;
+
+    handling_test_ping = true;
+    defer handling_test_ping = false;
+
+    var reply_buffer: [256]u8 = undefined;
+    const reply = exchangeServerCommand(
+        child.socket,
+        test_ping_command,
+        reply_buffer[0 .. reply_buffer.len - 1],
+    ) catch |err| {
+        std.debug.print("[zorcerer] {s} exchange failed: {s}\n", .{
+            test_ping_command,
+            @errorName(err),
+        });
+        return;
+    };
+
+    // `ServerCommand` takes a zero-terminated line; keep one byte free for
+    // the terminator.
+    reply_buffer[reply.len] = 0;
+    std.debug.print("[zorcerer] executing ServerCommand: {s}\n", .{reply});
+    callOriginalServerCommand(server, reply_buffer[0..reply.len :0].ptr);
+}
+
+/// Detour installed in `IVEngineServer::ServerCommand`.
+///
+/// The registered `zorcerer` ConCommand is the normal trigger for the test
+/// exchange. This detour keeps the previous whole-line fallback for engine
+/// paths that hand `ServerCommand` the complete `zorcerer ping` line, and it
+/// owns the original function pointer used to execute the manager's reply.
+///
+/// Non-test commands go straight to the original implementation. A nested
+/// ping re-enters the original implementation instead of starting a second
+/// exchange.
+fn serverCommandDetour(this: *anyopaque, command: [*:0]const u8) callconv(.c) void {
+    const text = std.mem.span(command);
+    if (!isTestPingCommand(text) or handling_test_ping) {
+        callOriginalServerCommand(this, command);
+        return;
+    }
+
+    runTestPingExchange(this);
+}
+
+/// Installs the `ServerCommand` detour on the shared IVEngineServer vtable.
+///
+/// Errors: `VTableHooks.HookError` when the slot is empty or cannot be made
+/// writable.
+fn installServerCommandHook(engine_interface: *anyopaque) !void {
+    server_command_hook = try VTableHooks.VtableHook.install(
+        VTableHooks.vtableOf(engine_interface),
+        Indexes.IVEngineServer.server_command,
+        @ptrCast(&serverCommandDetour),
+    );
+}
+
+/// Removes the `ServerCommand` detour, if one is installed.
+///
+/// A failed restore is logged instead of propagated: unloading must still
+/// proceed and release the manager child.
+fn uninstallServerCommandHook() void {
+    if (server_command_hook) |*hook| {
+        hook.uninstall() catch |err| {
+            Log.logLine(
+                "[zorcerer] removing the ServerCommand hook failed: {s}\n",
+                .{@errorName(err)},
+            );
+        };
+        server_command_hook = null;
+    }
+}
+
+/// Registers the test `zorcerer` console command with the engine's ICvar.
+///
+/// The ICvar interface is resolved through the engine's interface factory,
+/// the same route the Source SDK's `ConnectTier1Libraries` uses. A DLL
+/// identifier is allocated for the command so `GetDLLIdentifier` returns a
+/// value the engine's own `UnregisterConCommands` can match, then
+/// `ICvar::RegisterConCommand` links the static command object into the
+/// engine's command table. Once this succeeds, `zorcerer ping` reaches
+/// `conCommandDispatch` instead of being reported as an unknown command.
+///
+/// On success the command remains registered until
+/// `unregisterTestPingCommand` is called. On error nothing is registered and
+/// the previous registration state is unchanged.
+///
+/// Errors: `error.AlreadyRegistered` when a registration is already active,
+/// `error.CvarVersionTooLong` when the version string does not fit the local
+/// buffer, `error.CvarUnavailable` when the factory does not expose the
+/// recorded ICvar interface version,
+/// `error.MissingAllocateDllIdentifier`,
+/// `error.MissingRegisterConCommand`, or `error.MissingUnregisterConCommand`
+/// when the live ICvar vtable lacks a required method, and
+/// `error.InvalidDllIdentifier` when allocation returns a negative id.
+fn registerTestPingCommand(interface_factory: CreateInterfaceFn) !void {
+    if (test_ping_registered) return error.AlreadyRegistered;
+
+    var version_buffer: [32]u8 = undefined;
+    const version = std.fmt.bufPrintZ(
+        &version_buffer,
+        "{s}",
+        .{Indexes.cvar_interface_version},
+    ) catch return error.CvarVersionTooLong;
+
+    const cvar_ptr = interface_factory(version.ptr, null) orelse
+        return error.CvarUnavailable;
+
+    const cvar_vtable = VTableHooks.vtableOf(cvar_ptr);
+    const allocate_slot = cvar_vtable[Indexes.ICvar.allocate_dll_identifier] orelse
+        return error.MissingAllocateDllIdentifier;
+    const register_slot = cvar_vtable[Indexes.ICvar.register_con_command] orelse
+        return error.MissingRegisterConCommand;
+    if (cvar_vtable[Indexes.ICvar.unregister_con_command] == null)
+        return error.MissingUnregisterConCommand;
+
+    const allocate: *const fn (*anyopaque) callconv(.c) c_int =
+        @ptrCast(allocate_slot);
+    const dll_id = allocate(cvar_ptr);
+    if (dll_id < 0) return error.InvalidDllIdentifier;
+
+    // The id and interface must be visible through the command's virtual
+    // methods while the engine is linking it, so publish them first.
+    test_ping_dll_id = dll_id;
+    test_ping_cvar = cvar_ptr;
+
+    const register: *const fn (*anyopaque, *anyopaque) callconv(.c) void =
+        @ptrCast(register_slot);
+    register(cvar_ptr, @ptrCast(&test_ping_concommand));
+
+    test_ping_registered = true;
+    Log.logLine("[MyLoader] registered the {s} console command\n", .{test_command_name});
+}
+
+/// Removes the test command from the engine and clears the registration
+/// state.
+///
+/// Safe to call while no command is registered. A missing unregister slot is
+/// logged instead of propagated because unloading must still proceed, which
+/// mirrors how the ServerCommand hook teardown treats a failed restore.
+fn unregisterTestPingCommand() void {
+    if (!test_ping_registered) return;
+    test_ping_registered = false;
+
+    const cvar_ptr = test_ping_cvar orelse {
+        test_ping_dll_id = -1;
+        return;
+    };
+
+    const slot = VTableHooks.vtableOf(cvar_ptr)[Indexes.ICvar.unregister_con_command];
+    if (slot) |unregister_slot| {
+        const unregister: *const fn (*anyopaque, *anyopaque) callconv(.c) void =
+            @ptrCast(unregister_slot);
+        unregister(cvar_ptr, @ptrCast(&test_ping_concommand));
+        test_ping_concommand.registered = 0;
+    } else {
+        Log.logLine(
+            "[zorcerer] unregistering the {s} command failed: missing UnregisterConCommand\n",
+            .{test_command_name},
+        );
+    }
+
+    test_ping_cvar = null;
+    test_ping_dll_id = -1;
+}
+
+test "ServerCommand ping matching ignores console whitespace" {
+    try std.testing.expect(isTestPingCommand("zorcerer ping"));
+    try std.testing.expect(isTestPingCommand("  zorcerer ping\r\n"));
+    try std.testing.expect(!isTestPingCommand("zorcerer ping extra"));
+    try std.testing.expect(!isTestPingCommand("echo \"Pong!\""));
+}
+
+test "test ping command recognizes the engine's command tokens" {
+    // Only argc and the first two argv entries are read; the token buffers
+    // and the remaining entries stay undefined.
+    var command: CCommand = undefined;
+    command.argc = 2;
+    command.argv[0] = test_command_name;
+    command.argv[1] = test_ping_argument;
+    try std.testing.expect(isTestPingInvocation(&command));
+
+    command.argc = 1;
+    try std.testing.expect(!isTestPingInvocation(&command));
+
+    command.argc = 3;
+    command.argv[2] = "extra";
+    try std.testing.expect(!isTestPingInvocation(&command));
+
+    command.argc = 2;
+    command.argv[1] = "pong";
+    try std.testing.expect(!isTestPingInvocation(&command));
+}
+
+test "CCommand layout follows the Source SDK C++ layout" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(CCommand, "argc"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(CCommand, "argv0_size"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(CCommand, "arg_s_buffer"));
+    try std.testing.expectEqual(@as(usize, 520), @offsetOf(CCommand, "argv_buffer"));
+    try std.testing.expectEqual(@as(usize, 1032), @offsetOf(CCommand, "argv"));
+    try std.testing.expectEqual(@as(usize, 1544), @sizeOf(CCommand));
+}
+
+test "test ping ConCommand layout follows the Source SDK C++ layout" {
+    // Offsets from the Itanium C++ ABI layout of ConCommandBase followed by
+    // ConCommand (public/tier1/convar.h). The engine reads these fields
+    // directly when it links the command into its own list.
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ConCommandObject, "vptr"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ConCommandObject, "next"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ConCommandObject, "registered"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ConCommandObject, "name"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ConCommandObject, "help"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(ConCommandObject, "flags"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(ConCommandObject, "command_callback"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ConCommandObject, "completion_callback"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(ConCommandObject, "callback_flags"));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(ConCommandObject));
+}
+
+test "test ping ConCommand vtable follows the generated indices" {
+    try std.testing.expectEqual(
+        @intFromPtr(&conCommandIsCommand),
+        @intFromPtr(concommand_vtable[Indexes.ConCommand.is_command].?),
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&conCommandGetName),
+        @intFromPtr(concommand_vtable[Indexes.ConCommand.get_name].?),
+    );
+    try std.testing.expectEqual(
+        @intFromPtr(&conCommandDispatch),
+        @intFromPtr(concommand_vtable[Indexes.ConCommand.dispatch].?),
+    );
+}
+
+test "manager answers the ServerCommand ping round trip over JSON-RPC" {
+    var child = try forkChild(Manager.listenForEvents);
+    defer child.finish() catch {};
+
+    var buffer: [256]u8 = undefined;
+    const reply = try exchangeServerCommand(
+        child.socket,
+        Manager.test_ping_command,
+        buffer[0 .. buffer.len - 1],
+    );
+    try std.testing.expectEqualStrings(Manager.test_ping_reply, reply);
 }
 
 /// Waits for `pid` to exit and verifies a successful exit status.
@@ -782,6 +1369,36 @@ fn load(
         return false;
     };
 
+    // The test scenario's trigger is a real console command. Without the
+    // registration below the engine tokenizes `zorcerer ping` as the unknown
+    // command `zorcerer`; with it, the engine dispatches to this module and
+    // the dispatch callback starts the JSON-RPC round trip.
+    //
+    // The ServerCommand hook remains installed because its original function
+    // pointer is how the manager's reply (`echo "Pong!"`) is executed through
+    // the engine. It also keeps the previous whole-line fallback for engine
+    // paths that hand ServerCommand the complete `zorcerer ping` line.
+    installServerCommandHook(engine.?) catch |err| {
+        Log.logLine(
+            "[MyLoader] installing the ServerCommand hook failed: {s}\n",
+            .{@errorName(err)},
+        );
+        if (manager_child) |*child| child.finish() catch {};
+        manager_child = null;
+        return false;
+    };
+
+    registerTestPingCommand(interface_factory) catch |err| {
+        Log.logLine(
+            "[MyLoader] registering the {s} command failed: {s}\n",
+            .{ test_command_name, @errorName(err) },
+        );
+        uninstallServerCommandHook();
+        if (manager_child) |*child| child.finish() catch {};
+        manager_child = null;
+        return false;
+    };
+
     const manifests: ?[]const Manager.Manifest = plugin_manager.readConfig() catch null;
     if (manifests) |m| {
         for (m) |manifest| {
@@ -794,7 +1411,13 @@ fn load(
 
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
-    Log.logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
+    Log.logLine("[MyLoader] unloading, removing demo hooks and command.\n", .{});
+
+    // Remove the engine-visible command before dropping the hook and the
+    // manager it depends on, so no later console invocation can dispatch
+    // into the unloading module.
+    unregisterTestPingCommand();
+    uninstallServerCommandHook();
 
     if (manager_child) |*child| {
         // Closing our end is the shutdown signal: the child's event listener
