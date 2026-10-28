@@ -21,6 +21,7 @@
 - Do not initialize, update, or recursively download Git submodules unless explicitly requested.
 - Do not assume that permission to inspect a resource also grants permission to modify or execute it.
 - Use .tmp directory in the repository root for temporary files instead of /tmp.
+- Do not edit extern directory contents. If extern dependency needs any code rewrite, try to find a fork of it in the working directory of harness.
 
 ### Tool Denial and Restriction Handling
 
