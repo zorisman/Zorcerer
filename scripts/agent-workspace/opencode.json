@@ -389,7 +389,10 @@
             { "action": "read", "resource": "/usr/lib/zig/*", "effect": "allow" },
             { "action": "edit", "resource": "/usr/lib/zig/*", "effect": "deny" },
 
-            { "action": "external_directory", "resource": "/home/Repository/*", "effect": "allow" }
+            { "action": "external_directory", "resource": "/home/Repository", "effect": "allow" },
+            { "action": "external_directory", "resource": "/home/Repository/*", "effect": "allow" },
+            { "action": "shell", "resource": "zig build *", "effect": "allow" },
+            { "action": "shell", "resource": "zig test *", "effect": "allow" }
         ],
         "policies": [
             { "action": "tool.use", "resource": "external_directory:*", "effect": "deny" },
@@ -625,9 +628,6 @@
             { "action": "tool.use", "resource": "shell:bazel *", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:gradle *", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:mvn *", "effect": "deny" },
-            { "action": "tool.use", "resource": "shell:zig build*", "effect": "deny" },
-            { "action": "tool.use", "resource": "shell:zig run*", "effect": "deny" },
-            { "action": "tool.use", "resource": "shell:zig test*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:zig build-exe*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:zig build-lib*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:zig build-obj*", "effect": "deny" },
