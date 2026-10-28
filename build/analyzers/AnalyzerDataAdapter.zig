@@ -480,22 +480,22 @@ pub fn beginAnalyze(
         const stdout_file = child.stdout.?;
         child.stdout = null;
 
-        var stdout_capture = std.Io.Writer.Allocating.init(alloc);
-        defer stdout_capture.deinit();
         {
             var read_buffer: [4096]u8 = undefined;
             var reader = stdout_file.reader(io, &read_buffer);
             defer stdout_file.close(io);
-            _ = try stdout_capture.writer.sendFileAll(
-                &reader,
+            // Read the child's pipe into the aggregation list. Unlike
+            // `sendFileAll`, which requires a writer with an internal buffer,
+            // `appendRemaining` reads directly from the reader into the list.
+            try reader.interface.appendRemaining(
+                alloc,
+                &stdout_list,
                 .limited(max_analyzer_output_bytes),
             );
         }
 
         const term = try child.wait(io);
         if (term != .exited or term.exited != 0) return error.AnalyzerFailed;
-
-        try stdout_list.appendSlice(alloc, stdout_capture.written());
         for (run.queries) |query| {
             try queries.append(alloc, .{
                 .header_path = try alloc.dupe(u8, query.header_path),
