@@ -17,11 +17,13 @@ set -euo pipefail
 # Resolve paths relative to this script so the launcher works from any CWD.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
+zigjr_root="$(cd "${repo_root}/../zigjr" && pwd)"
 
 config_file="${script_dir}/opencode.json"
 image="${ZORCERER_IMAGE:-zorcerer-dev}"
 container_home="/home/dev"
-container_repo="${container_home}/Repository/Zorcerer"
+container_root="${container_home}/Repository"
+zigjr_repo="${container_root}/zigjr"
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "error: docker is not installed or not on PATH" >&2
@@ -47,6 +49,7 @@ exec docker run --rm -it \
     --cap-drop=ALL \
     --security-opt=no-new-privileges \
     -v "${config_file}:${container_home}/.config/opencode/opencode.json:ro" \
-    -v "${repo_root}:${container_repo}" \
-    -w "${container_repo}" \
+    -v "${repo_root}:${container_root}/Zorcerer" \
+    -v "${zigjr_root}:${container_root}/zigjr" \
+    -w "${container_root}" \
     "${image}" "$@"
