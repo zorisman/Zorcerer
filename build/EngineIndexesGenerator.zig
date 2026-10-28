@@ -1,6 +1,8 @@
 //! Build-time generator for src/codegen_generated/engine_indexes.zig.
-//! The generated file is currently committed by hand; no build step
-//! invokes this generator.
+//! `build.zig` invokes it through `AnalyzerDataAdapter.intoEngineIndexes`
+//! after the C++ analyzer reports its results; no intermediate TOML file
+//! is involved. `generateFromAnalysis` accepts typed analyzer rows and
+//! renders them into the flat-key form parsed by `generate`.
 //!
 //! Supported TOML-like forms:
 //!
@@ -16,6 +18,12 @@
 //!   ["global::Variables"]
 //!   CVAR_INTERFACE_VERSION = "VEngineCvar004"
 //!
+//! Enumerator tables use:
+//!
+//!   [enum::IN_BUTTONS]
+//!   FIRST = 1
+//!
+//! and emit an `isize` member inside a struct named after the enum.
 //! Global values are emitted as top-level Zig constants, not as a struct.
 //! The flat-key parser also accepts unquoted keys, even though TOML keys
 //! containing ':' should be quoted by a TOML parser.
@@ -26,7 +34,12 @@ const ArrayList = std.ArrayList;
 
 const Method = struct {
     name: []const u8,
-    index: usize,
+    /// Slot index for class methods (non-negative) or enumerator value
+    /// (possibly negative).
+    value: i64,
+    /// Whether to emit `isize` (enum values) instead of `usize`
+    /// (class vtable indices).
+    is_signed: bool = false,
     quoted_name: bool = false,
 };
 
@@ -35,10 +48,24 @@ const Class = struct {
     methods: ArrayList(Method) = .empty,
 };
 
+/// Zig type used for one generated global constant.
+const GlobalKind = enum {
+    /// A quoted literal, emitted as `[]const u8`.
+    string,
+    /// An unsigned decimal, emitted as `usize`.
+    integer,
+    /// A negative decimal, emitted as `isize`.
+    signed_integer,
+    /// `true` or `false`, emitted as `bool`.
+    boolean,
+    /// Any other float literal, emitted as `f64`.
+    float,
+};
+
 const GlobalVariable = struct {
     name: []const u8,
     value: []const u8,
-    is_string: bool,
+    kind: GlobalKind,
 };
 
 const whitespace = " \t\r\n";
@@ -57,6 +84,7 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
 
     var current_class: ?[]const u8 = null;
     var current_section_is_global = false;
+    var current_section_is_enum = false;
     var lines = std.mem.splitScalar(u8, source, '\n');
 
     while (lines.next()) |raw_line| {
@@ -77,14 +105,24 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
                 if (!isZigIdentifier(section)) return error.InvalidClassName;
                 current_class = section;
                 current_section_is_global = false;
+                current_section_is_enum = false;
+                try ensureClass(allocator, &classes, section);
+            } else if (std.mem.startsWith(u8, section, "enum::")) {
+                section = section["enum::".len..];
+                if (!isZigIdentifier(section)) return error.InvalidClassName;
+                current_class = section;
+                current_section_is_global = false;
+                current_section_is_enum = true;
                 try ensureClass(allocator, &classes, section);
             } else if (std.mem.startsWith(u8, section, "global::")) {
                 current_class = null;
                 current_section_is_global = true;
+                current_section_is_enum = false;
             } else {
                 if (!isZigIdentifier(section)) return error.InvalidClassName;
                 current_class = section;
                 current_section_is_global = false;
+                current_section_is_enum = false;
                 try ensureClass(allocator, &classes, section);
             }
             continue;
@@ -103,6 +141,9 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
         var member_name_is_quoted = false;
         var is_global = current_section_is_global;
         if (std.mem.indexOf(u8, key, "::")) |separator| {
+            // A composite key names its own owner, so it is never part of
+            // an enum section that may still be active.
+            current_section_is_enum = false;
             class_name = std.mem.trim(u8, key[0..separator], whitespace);
             member_name = std.mem.trim(u8, key[separator + 2 ..], whitespace);
             class_name = unquote(class_name.?);
@@ -135,28 +176,42 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
         if (is_global and !isZigIdentifier(snake_name)) return error.InvalidGeneratedGlobalName;
 
         if (is_global) {
-            const is_string = value_text.len >= 2 and
-                value_text[0] == '"' and value_text[value_text.len - 1] == '"';
-            const value = if (is_string) unquote(value_text) else value_text;
-            if (!is_string) {
-                _ = std.fmt.parseInt(usize, value, 10) catch return error.InvalidGlobalValue;
-            }
-            try putGlobalVariable(allocator, &global_variables, member_name, value, is_string);
+            const kind = classifyGlobalValue(value_text) orelse
+                return error.InvalidGlobalValue;
+            const value = if (kind == .string) unquote(value_text) else value_text;
+            try putGlobalVariable(allocator, &global_variables, member_name, value, kind);
             continue;
         }
 
-        const index = std.fmt.parseInt(usize, value_text, 10) catch
-            return error.InvalidIndex;
         const actual_class_name = class_name orelse return error.MethodWithoutClass;
         if (!isZigIdentifier(actual_class_name)) return error.InvalidClassName;
-        try putMethod(
-            allocator,
-            &classes,
-            actual_class_name,
-            member_name,
-            index,
-            member_name_is_quoted,
-        );
+
+        if (current_section_is_enum) {
+            const value = std.fmt.parseInt(i64, value_text, 10) catch
+                return error.InvalidIndex;
+            try putMethod(
+                allocator,
+                &classes,
+                actual_class_name,
+                member_name,
+                value,
+                true,
+                member_name_is_quoted,
+            );
+        } else {
+            const index = std.fmt.parseInt(usize, value_text, 10) catch
+                return error.InvalidIndex;
+            const value = std.math.cast(i64, index) orelse return error.InvalidIndex;
+            try putMethod(
+                allocator,
+                &classes,
+                actual_class_name,
+                member_name,
+                value,
+                false,
+                member_name_is_quoted,
+            );
+        }
     }
 
     var output: ArrayList(u8) = .empty;
@@ -178,14 +233,21 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
             }
         }
 
-        if (variable.is_string) {
-            try appendFmt(allocator, &output,
-                "pub const {s}: []const u8 = \"", .{snake_name});
-            try appendZigEscapedString(allocator, &output, variable.value);
-            try output.appendSlice(allocator, "\";\n");
-        } else {
-            try appendFmt(allocator, &output,
-                "pub const {s}: usize = {s};\n", .{ snake_name, variable.value });
+        switch (variable.kind) {
+            .string => {
+                try appendFmt(allocator, &output,
+                    "pub const {s}: []const u8 = \"", .{snake_name});
+                try appendZigEscapedString(allocator, &output, variable.value);
+                try output.appendSlice(allocator, "\";\n");
+            },
+            .integer => try appendFmt(allocator, &output,
+                "pub const {s}: usize = {s};\n", .{ snake_name, variable.value }),
+            .signed_integer => try appendFmt(allocator, &output,
+                "pub const {s}: isize = {s};\n", .{ snake_name, variable.value }),
+            .boolean => try appendFmt(allocator, &output,
+                "pub const {s}: bool = {s};\n", .{ snake_name, variable.value }),
+            .float => try appendFmt(allocator, &output,
+                "pub const {s}: f64 = {s};\n", .{ snake_name, variable.value }),
         }
     }
     if (global_variables.items.len != 0) try output.append(allocator, '\n');
@@ -211,16 +273,22 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
                 }
             }
 
+            const type_name = if (method.is_signed) "isize" else "usize";
             if (method.quoted_name) {
                 try output.appendSlice(allocator, "    pub const @\"");
                 try appendZigEscapedString(allocator, &output, method.name);
-                try appendFmt(allocator, &output, "\": usize = {d};\n", .{method.index});
+                try appendFmt(
+                    allocator,
+                    &output,
+                    "\": {s} = {d};\n",
+                    .{ type_name, method.value },
+                );
             } else {
                 try appendFmt(
                     allocator,
                     &output,
-                    "    pub const {s}: usize = {d};\n",
-                    .{ snake_name, method.index },
+                    "    pub const {s}: {s} = {d};\n",
+                    .{ snake_name, type_name, method.value },
                 );
             }
         }
@@ -229,6 +297,102 @@ pub fn generate(allocator: Allocator, source: []const u8) ![]u8 {
     }
 
     return output.toOwnedSlice(allocator);
+}
+
+/// What one analysis row represents, which decides the flat-key prefix
+/// `generateFromAnalysis` gives it.
+pub const AnalysisKind = enum {
+    /// A virtual-method vtable slot index; `owner` is the class name.
+    method,
+    /// A namespace-scope or macro constant emitted at file scope.
+    global,
+    /// An enum enumerator; `owner` is the enum type name. Enumerator
+    /// values are emitted as `isize` because C++ enums may be negative.
+    enumerator,
+};
+
+/// One analyzer result handed directly to the generator, without an
+/// intermediate TOML document.
+pub const AnalysisRow = struct {
+    /// Interpretation of `owner` and `value`.
+    kind: AnalysisKind,
+    /// Class name for `.method`, enum type name for `.enumerator`.
+    /// Ignored for `.global`, which always emits at file scope.
+    owner: []const u8 = "",
+    /// Method, enumerator, or constant name, verbatim.
+    name: []const u8,
+    /// Decimal slot/enumerator value for `.method` and `.enumerator`;
+    /// a literal (quoted string, integer, boolean, or float) for
+    /// `.global`.
+    value: []const u8,
+};
+
+/// Renders analyzer result rows as the flat-key format accepted by
+/// `generate` and returns the generated Zig source.
+///
+/// Rows are rendered in input order; classes accumulate into structs of
+/// `usize` vtable indices, enum types into structs of `isize` values,
+/// and global constants stay top-level. Duplicate names keep the last
+/// value, matching `generate`'s regular behavior. The caller owns the
+/// returned slice.
+///
+/// Errors are those of `generate`, including invalid names, non-decimal
+/// method values, and unsupported global literals.
+pub fn generateFromAnalysis(
+    allocator: Allocator,
+    rows: []const AnalysisRow,
+) ![]u8 {
+    var source: ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+
+    for (rows) |row| {
+        switch (row.kind) {
+            .method => try appendFmt(
+                allocator,
+                &source,
+                "\"{s}::{s}\" = {s}\n",
+                .{ row.owner, row.name, row.value },
+            ),
+            .enumerator => try appendFmt(
+                allocator,
+                &source,
+                "[enum::{s}]\n{s} = {s}\n",
+                .{ row.owner, row.name, row.value },
+            ),
+            .global => try appendFmt(
+                allocator,
+                &source,
+                "\"global::{s}\" = {s}\n",
+                .{ row.name, row.value },
+            ),
+        }
+    }
+
+    return generate(allocator, source.items);
+}
+
+/// Classifies a global constant literal from the flat-key format.
+///
+/// Quoted text is a string, `true`/`false` is a boolean, an unsigned
+/// decimal is an integer, a negative decimal is a signed integer, and
+/// any other float-parsable text is a float.
+///
+/// \returns the kind, or null when the literal is not supported.
+fn classifyGlobalValue(value_text: []const u8) ?GlobalKind {
+    if (value_text.len >= 2 and value_text[0] == '"' and
+        value_text[value_text.len - 1] == '"') return .string;
+    if (std.mem.eql(u8, value_text, "true") or
+        std.mem.eql(u8, value_text, "false")) return .boolean;
+    if (std.fmt.parseInt(usize, value_text, 0)) |_| {
+        return .integer;
+    } else |_| {}
+    if (std.fmt.parseInt(isize, value_text, 0)) |_| {
+        return .signed_integer;
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, value_text)) |_| {
+        return .float;
+    } else |_| {}
+    return null;
 }
 
 fn ensureClass(
@@ -247,7 +411,8 @@ fn putMethod(
     classes: *ArrayList(Class),
     class_name: []const u8,
     method_name: []const u8,
-    index: usize,
+    value: i64,
+    is_signed: bool,
     quoted_name: bool,
 ) !void {
     var class_index: ?usize = null;
@@ -267,7 +432,8 @@ fn putMethod(
     for (class.methods.items) |*method| {
         if (std.mem.eql(u8, method.name, method_name)) {
             // Last value wins if the same method appears more than once.
-            method.index = index;
+            method.value = value;
+            method.is_signed = is_signed;
             method.quoted_name = quoted_name;
             return;
         }
@@ -275,7 +441,8 @@ fn putMethod(
 
     try class.methods.append(allocator, .{
         .name = method_name,
-        .index = index,
+        .value = value,
+        .is_signed = is_signed,
         .quoted_name = quoted_name,
     });
 }
@@ -285,19 +452,19 @@ fn putGlobalVariable(
     variables: *ArrayList(GlobalVariable),
     name: []const u8,
     value: []const u8,
-    is_string: bool,
+    kind: GlobalKind,
 ) !void {
     for (variables.items) |*variable| {
         if (std.mem.eql(u8, variable.name, name)) {
             variable.value = value;
-            variable.is_string = is_string;
+            variable.kind = kind;
             return;
         }
     }
     try variables.append(allocator, .{
         .name = name,
         .value = value,
-        .is_string = is_string,
+        .kind = kind,
     });
 }
 

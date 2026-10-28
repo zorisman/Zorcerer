@@ -1,5 +1,6 @@
 const std = @import("std");
 const toml = @import("../../extern/zig-toml/src/root.zig");
+const EngineIndexesGenerator = @import("../EngineIndexesGenerator.zig");
 
 const Allocator = std.mem.Allocator;
 const allocator = std.heap.page_allocator;
@@ -101,7 +102,7 @@ fn domainForHeaderPath(header: []const u8) AnalyzerDomain {
     return .interface;
 }
 
-/// Owns the prepared argv and query metadata for the analyzer invocations.
+/// Owns the prepared invocation data and query metadata for the analyzer.
 /// The analyzer parses each query as a separate translation unit but shares
 /// the compiler arguments between them, while the domains above need
 /// different preludes/defines - so queries are grouped into one invocation
@@ -120,15 +121,17 @@ pub const PreparedAnalyzerArgs = struct {
 };
 
 pub const AnalyzerRun = struct {
+    /// Compiler arguments after `--`; the query text travels on stdin.
     args: []const []const u8,
+    /// Brace-set query payload written to the analyzer's standard input.
+    query_text: []const u8,
     queries: []const QueryInfo,
 };
 
-/// Owns one analyzer run's stdout, stderr, and query metadata.
+/// Owns one analyzer run's stdout and query metadata.
 pub const AnalyzerOutput = struct {
     arena: std.heap.ArenaAllocator,
     stdout: []const u8,
-    stderr: []const u8,
     queries: []const QueryInfo,
 
     pub fn deinit(self: *@This()) void {
@@ -136,35 +139,6 @@ pub const AnalyzerOutput = struct {
         self.* = undefined;
     }
 };
-
-/// One `key = value` pair in a generated `[[...]]` row's body. `value`
-/// is already a TOML literal, classified or quoted by the row builder.
-const TomlField = struct {
-    key: []const u8,
-    value: []const u8,
-};
-
-/// One generated `[[<header>]]` array-of-tables row of `intoToml`'s
-/// output. Consecutive rows sharing a header accumulate into the same
-/// TOML array element sequence, so output rows never need key-renaming
-/// deduplication.
-///
-/// Rows are typed by the query they were built from:
-/// - class vtable index rows: `usize` value, `[[<class>::<method>]]`.
-/// - constants: `integer`, `boolean`, `float`, or `string` value,
-///   `[[<header-path>::<const-name>]]`.
-/// - enumerators: one row per enumerator under `[[<enum-name>]]`, the
-///   `name` field carrying the enumerator, the value an `integer`.
-const TomlRow = struct {
-    /// Table-array header without brackets, e.g. `CBaseEntity::Spawn`,
-    /// `public/eiface.h::INTERFACEVERSION_VENGINESERVER`, or a plain
-    /// enum type name (`IN_BUTTONS`).
-    header: []const u8,
-    /// Ordered body fields (`type`, `value`, and for enumerators
-    /// `name` first).
-    fields: std.ArrayList(TomlField) = .empty,
-};
-
 
 fn appendSlice(list: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
     try list.appendSlice(alloc, value);
@@ -192,9 +166,10 @@ fn appendIncludeArg(
     try args.append(alloc, arg);
 }
 
-/// Reads an analyzer TOML configuration and prepares the analyzer's argv for
-/// one invocation per query domain (see `AnalyzerDomain`). The configuration
-/// carries a `[[root]]` table with the SDK path plus `[[class]]`, `[[const]]`,
+/// Reads an analyzer TOML configuration and prepares one invocation per
+/// query domain (see `AnalyzerDomain`): stdin query text plus compiler
+/// arguments. The configuration carries a `[[root]]` table with the SDK path
+/// plus `[[class]]`, `[[const]]`,
 /// and `[[enum]]` query tables; all of them are optional but at least one
 /// query must be present.
 ///
@@ -338,10 +313,10 @@ fn appendArgsFrom(
     for (source) |arg| try args.append(alloc, arg);
 }
 
-/// Builds the argv for one domain's analyzer invocation: that domain's
-/// queries (in the analyzer's brace-set syntax), the shared include dirs
-/// and defines, clang's built-in-header resource dir, and the domain's
-/// prelude header and define.
+/// Builds one domain's analyzer invocation: the query text for standard
+/// input, plus the shared include dirs and defines, clang's
+/// built-in-header resource dir, and the domain's prelude header and
+/// define after `--`.
 ///
 /// The clang resource dir must be passed explicitly: `clang::tooling`'s
 /// builtin-header lookup normally derives it from the executable's own
@@ -374,7 +349,7 @@ fn makeAnalyzerRun(
         try query_text.append(alloc, '}');
     }
     try query_text.append(alloc, '}');
-    try args.append(alloc, try query_text.toOwnedSlice(alloc));
+    const owned_query_text = try query_text.toOwnedSlice(alloc);
     try args.append(alloc, "--");
 
     const include_dirs = [_][]const u8{
@@ -438,6 +413,7 @@ fn makeAnalyzerRun(
 
     return .{
         .args = try args.toOwnedSlice(alloc),
+        .query_text = owned_query_text,
         .queries = queries,
     };
 }
@@ -454,10 +430,22 @@ fn detectClangResourceDir(io: std.Io, alloc: Allocator) !?[]const u8 {
     return try alloc.dupe(u8, trimmed);
 }
 
-/// Runs the analyzer once per domain run with explicitly supplied prepared
-/// arguments, aggregating their stdout/stderr and queries into one result.
+/// Runs the analyzer once per domain run, writing each run's query text
+/// to its standard input and aggregating the analyzer's standard output
+/// and query metadata into one result. The analyzer's diagnostics inherit
+/// this process's standard error so they appear directly in build output.
 /// The returned output owns its memory and must be released with
 /// `AnalyzerOutput.deinit()`.
+///
+/// \param io I/O implementation used for the child process and pipes.
+/// \param analyzer_path executable to spawn.
+/// \param prepared validated queries grouped by domain.
+/// \returns the aggregated output, or `error.AnalyzerArgumentsNotPrepared`
+///          when `prepared` has no runs.
+/// \returns `error.AnalyzerFailed` when any analyzer invocation exits
+///          unsuccessfully; the child's stderr was forwarded to this
+///          process's stderr.
+///          Pipe, spawn, and allocation errors propagate.
 pub fn beginAnalyze(
     io: std.Io,
     analyzer_path: []const u8,
@@ -470,7 +458,6 @@ pub fn beginAnalyze(
     const alloc = arena.allocator();
 
     var stdout_list: std.ArrayList(u8) = .empty;
-    var stderr_list: std.ArrayList(u8) = .empty;
     var queries: std.ArrayList(QueryInfo) = .empty;
 
     for (prepared.runs) |run| {
@@ -478,23 +465,37 @@ pub fn beginAnalyze(
         argv[0] = analyzer_path;
         @memcpy(argv[1..], run.args);
 
-        const result = try std.process.run(alloc, io, .{
+        var child = try std.process.spawn(io, .{
             .argv = argv,
-            .stdout_limit = .limited(max_analyzer_output_bytes),
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
         });
 
-        if (result.term != .exited or result.term.exited != 0) {
-            if (result.stderr.len != 0) {
-                std.debug.print("VTableIndexAnalyzer failed:\n{s}\n", .{result.stderr});
-            }
+        const stdin_file = child.stdin.?;
+        child.stdin = null;
+        try stdin_file.writeStreamingAll(io, run.query_text);
+        stdin_file.close(io);
 
-            return error.AnalyzerFailed;
+        const stdout_file = child.stdout.?;
+        child.stdout = null;
+
+        var stdout_capture = std.Io.Writer.Allocating.init(alloc);
+        defer stdout_capture.deinit();
+        {
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stdout_file.reader(io, &read_buffer);
+            defer stdout_file.close(io);
+            _ = try stdout_capture.writer.sendFileAll(
+                &reader,
+                .limited(max_analyzer_output_bytes),
+            );
         }
 
-        try stdout_list.appendSlice(alloc, result.stdout);
-        if (result.stderr.len != 0) {
-            try stderr_list.appendSlice(alloc, result.stderr);
-        }
+        const term = try child.wait(io);
+        if (term != .exited or term.exited != 0) return error.AnalyzerFailed;
+
+        try stdout_list.appendSlice(alloc, stdout_capture.written());
         for (run.queries) |query| {
             try queries.append(alloc, .{
                 .header_path = try alloc.dupe(u8, query.header_path),
@@ -509,34 +510,12 @@ pub fn beginAnalyze(
     return .{
         .arena = arena,
         .stdout = try stdout_list.toOwnedSlice(alloc),
-        .stderr = try stderr_list.toOwnedSlice(alloc),
         .queries = queries_slice,
     };
 }
 
-fn appendTomlBasicString(list: *std.ArrayList(u8), alloc: Allocator, value: []const u8) !void {
-    try list.append(alloc, '"');
-    const hex = "0123456789abcdef";
-    for (value) |byte| {
-        switch (byte) {
-            '"' => try appendSlice(list, alloc, "\\\""),
-            '\\' => try appendSlice(list, alloc, "\\\\"),
-            '\n' => try appendSlice(list, alloc, "\\n"),
-            '\r' => try appendSlice(list, alloc, "\\r"),
-            '\t' => try appendSlice(list, alloc, "\\t"),
-            0...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
-                try appendSlice(list, alloc, "\\u00");
-                try list.append(alloc, hex[byte >> 4]);
-                try list.append(alloc, hex[byte & 0x0f]);
-            },
-            else => try list.append(alloc, byte),
-        }
-    }
-    try list.append(alloc, '"');
-}
-
-/// Representative data types of constant values, as recorded in each
-/// row's `type` field.
+/// Representative data types of constant values, used to validate that
+/// the analyzer reported a literal the generator can classify.
 const ConstantKind = enum {
     integer,
     boolean,
@@ -548,12 +527,12 @@ const ConstantKind = enum {
 /// or `apValueAsToml` output) into its representative data type.
 ///
 /// Quoted text is a `string`, `true`/`false` is `boolean`, anything that
-/// parses as an integer (including TOML's `0x`/`0o`/`0b` prefixes) is
-/// `integer`, anything else that parses as a float is `float`.
+/// parses as an integer (including TOML-style `0x`/`0o`/`0b` prefixes)
+/// is `integer`, anything else that parses as a float is `float`.
 ///
 /// \param literal the analyzer's RHS text, trimmed.
 /// \returns the kind, or null when the literal is not a recognisable
-///          TOML value (the caller must fail with
+///          value (the caller must fail with
 ///          `error.UnexpectedAnalyzerOutput`).
 ///
 /// Limitation: a whole-number float (e.g. `4.0` printed as `4` by
@@ -577,34 +556,6 @@ fn constantLiteralKind(literal: []const u8) ?ConstantKind {
     return null;
 }
 
-/// Wraps \p value as a TOML basic string literal.
-///
-/// \returns the quoted text, allocated by \p alloc.
-fn tomlBasicString(alloc: Allocator, value: []const u8) ![]u8 {
-    var list: std.ArrayList(u8) = .empty;
-    try appendTomlBasicString(&list, alloc, value);
-    return list.toOwnedSlice(alloc);
-}
-
-/// Appends one typed row's body field (`\p value_kind` records the
-/// representative data type next to the TOML literal in \p value; both
-/// are emitted as TOML basic strings).
-fn appendTypedRow(
-    rows: *std.ArrayList(TomlRow),
-    alloc: Allocator,
-    header: []const u8,
-    value_kind: []const u8,
-    value: []const u8,
-) !void {
-    var row = TomlRow{ .header = header };
-    try row.fields.append(alloc, .{
-        .key = "type",
-        .value = try tomlBasicString(alloc, value_kind),
-    });
-    try row.fields.append(alloc, .{ .key = "value", .value = value });
-    try rows.append(alloc, row);
-}
-
 fn stripMethodAnnotation(value: []const u8) []const u8 {
     if (std.mem.startsWith(u8, value, "\"")) return value;
 
@@ -625,24 +576,45 @@ fn stripMethodAnnotation(value: []const u8) []const u8 {
     return value;
 }
 
-/// Converts one analyzer stdout report line into a typed output row
-/// (see `TomlRow`) and appends it to \p rows.
+/// Whether an earlier method row uses the same owner and name for a
+/// different slot index.
+///
+/// Wildcard class queries report every vtable slot, including overloads
+/// that share a method name. The previous TOML writer kept those apart by
+/// suffixing repeated keys with `@<slot index>`; the adapter reproduces
+/// that convention so overloads do not collapse under the generator's
+/// last-value-wins handling. A repeated query that reports the same name
+/// at the same index is not treated as an overload, so it keeps its
+/// original name.
+fn methodNameConflicts(
+    rows: []const EngineIndexesGenerator.AnalysisRow,
+    owner: []const u8,
+    name: []const u8,
+    value: []const u8,
+) bool {
+    for (rows) |row| {
+        if (row.kind != .method or
+            !std.mem.eql(u8, row.owner, owner) or
+            !std.mem.eql(u8, row.name, name)) continue;
+        return !std.mem.eql(u8, row.value, value);
+    }
+    return false;
+}
+
+/// Converts one analyzer stdout report line into a generator analysis row
+/// and appends it to \p rows.
 ///
 /// Routing, first matching query wins:
-/// 1. `const::` queries (`is_const`): a
-///    `<header-path>::<Name> = <literal>` line becomes the row
-///    `[["<header-path>::<Name>"]]` whose `value` is the constant's
-///    TOML literal and whose `type` is its representative data type
-///    (see `constantLiteralKind`).
+/// 1. `const::` queries (`is_const`): `<header-path>::<Name> = <literal>`
+///    becomes a `.global` row named after the constant. The literal is
+///    validated with `constantLiteralKind`; the generator repeats that
+///    classification to pick the Zig type.
 /// 2. `enum::<Enum>` queries: `<Enum>::<Enumerator> = <value>` becomes
-///    one `[[<Enum>]]` row per enumerator; the `name` field carries
-///    the enumerator, the `value` an integer (the analyzer reports
-///    signed decimal values). Enumerator rows repeat under the same
-///    header and accumulate as array-of-tables entries.
-/// 3. class queries: `<Class>::<Method> = <index>` becomes
-///    `[["<Class>::<Method>"]]` with `type = "usize"`; destructor
-///    report annotations are stripped, and the analyzer has already
-///    renamed duplicate slot keys with an `@<index>` suffix.
+///    one `.enumerator` row owned by the enum type; the value must be a
+///    signed decimal.
+/// 3. class queries: `<Class>::<Method> = <index>` becomes a `.method`
+///    row; destructor report annotations are stripped and the index must
+///    be an unsigned decimal.
 ///
 /// \param queries metadata of the queries the analyzed output belongs
 ///                to; a line is routed by the `::`-prefixed forms above.
@@ -650,11 +622,10 @@ fn stripMethodAnnotation(value: []const u8) []const u8 {
 /// \param line one trimmed non-empty analyzer stdout line.
 /// \returns `error.UnrecognizedAnalyzerOutput` when no query owns the
 ///          line and `error.UnexpectedAnalyzerOutput` when the owner's
-///          value is not a classifiable TOML value or a report word
-///          is empty.
+///          value is not classifiable or a report word is empty.
 fn addAnalyzerLine(
     queries: []const QueryInfo,
-    rows: *std.ArrayList(TomlRow),
+    rows: *std.ArrayList(EngineIndexesGenerator.AnalysisRow),
     alloc: Allocator,
     line: []const u8,
 ) !void {
@@ -663,7 +634,7 @@ fn addAnalyzerLine(
     const raw_value = std.mem.trim(u8, line[separator + 3 ..], " \t\r");
     if (lhs.len == 0 or raw_value.len == 0) return error.UnexpectedAnalyzerOutput;
 
-    // 1. Constants: "<header-path>::<Name> = <toml literal>".
+    // 1. Constants: "<header-path>::<Name> = <literal>".
     for (queries) |query| {
         if (!query.is_const) continue;
         const prefix = try std.fmt.allocPrint(alloc, "{s}::", .{query.header_path});
@@ -671,15 +642,17 @@ fn addAnalyzerLine(
 
         const name = lhs[prefix.len..];
         if (name.len == 0) return error.UnexpectedAnalyzerOutput;
-        const kind = constantLiteralKind(raw_value) orelse
+        _ = constantLiteralKind(raw_value) orelse
             return error.UnexpectedAnalyzerOutput;
-        const header = try std.fmt.allocPrint(alloc, "{s}::{s}", .{ query.header_path, name });
-        try appendTypedRow(rows, alloc, header, @tagName(kind), raw_value);
+        try rows.append(alloc, .{
+            .kind = .global,
+            .name = name,
+            .value = raw_value,
+        });
         return;
     }
 
-    // 2. Enumerators: "<Enum>::<Enumerator> = <value>"; one row per
-    //    enumerator, all sharing the plain enum name header.
+    // 2. Enumerators: "<Enum>::<Enumerator> = <value>".
     for (queries) |query| {
         if (query.is_const or !std.mem.startsWith(u8, query.name, "enum::")) continue;
         const enum_name = query.name["enum::".len..];
@@ -692,17 +665,12 @@ fn addAnalyzerLine(
         // The analyzer prints enumerator values as signed decimals.
         _ = std.fmt.parseInt(i128, raw_value, 10) catch
             return error.UnexpectedAnalyzerOutput;
-        var row = TomlRow{ .header = try alloc.dupe(u8, enum_name) };
-        try row.fields.append(alloc, .{
-            .key = "name",
-            .value = try tomlBasicString(alloc, enumerator),
+        try rows.append(alloc, .{
+            .kind = .enumerator,
+            .owner = enum_name,
+            .name = enumerator,
+            .value = raw_value,
         });
-        try row.fields.append(alloc, .{
-            .key = "type",
-            .value = try tomlBasicString(alloc, "integer"),
-        });
-        try row.fields.append(alloc, .{ .key = "value", .value = raw_value });
-        try rows.append(alloc, row);
         return;
     }
 
@@ -718,41 +686,45 @@ fn addAnalyzerLine(
         // Slot indices are plain decimals.
         _ = std.fmt.parseInt(u64, index, 10) catch
             return error.UnexpectedAnalyzerOutput;
-        const header = try std.fmt.allocPrint(alloc, "{s}::{s}", .{ query.name, method });
-        try appendTypedRow(rows, alloc, header, "usize", index);
+
+        const is_wildcard = query.methods.len == 1 and
+            std.mem.eql(u8, query.methods[0], "*");
+        const generated_name = if (is_wildcard and
+            methodNameConflicts(rows.items, query.name, method, index))
+            try std.fmt.allocPrint(alloc, "{s}@{s}", .{ method, index })
+        else
+            method;
+        try rows.append(alloc, .{
+            .kind = .method,
+            .owner = query.name,
+            .name = generated_name,
+            .value = index,
+        });
         return;
     }
 
     return error.UnrecognizedAnalyzerOutput;
 }
 
-/// Converts one analyzer result into TOML and writes it to `toml_path`.
-/// The result and its query metadata are passed explicitly; no global
-/// state is used.
+/// Converts one analyzer result into `engine_indexes.zig` at
+/// `output_path`.
 ///
-/// Every analyzer line becomes a typed array-of-tables row (see
-/// `TomlRow` and `addAnalyzerLine`):
+/// Every non-empty stdout line becomes an `AnalysisRow` (see
+/// `addAnalyzerLine`); `EngineIndexesGenerator.generateFromAnalysis`
+/// renders those rows and `generate` emits the final Zig source. The
+/// result and its query metadata are passed explicitly; no global state
+/// is used and no intermediate TOML file is written.
 ///
-///     [["CBaseEntity::~CBaseEntity"]]
-///     type = "usize"
-///     value = 0
-///
-///     [["public/eiface.h::INTERFACEVERSION_VENGINESERVER"]]
-///     type = "string"
-///     value = "VEngineCvar004"
-///
-///     [["IN_BUTTONS"]]
-///     name = "FIRST"
-///     type = "integer"
-///     value = 1
-///
-/// Headers carrying a literal `<class>::<method>` or
-/// `<header-path>::<const-name>` composite are emitted quoted, since
-/// `:` is not a TOML bare-key character. All emitted row names are
-/// unique, so plain `[<name>]` and `[[<name>]]` tables never collide.
-pub fn intoToml(
+/// \param io I/O implementation used to write the generated file.
+/// \param output_path destination path, typically
+///        `src/codegen_generated/engine_indexes.zig`.
+/// \param analysis analyzer stdout and the queries that produced it.
+/// \returns `error.EmptyAnalyzerOutput` when stdout contains no rows, or
+///          an analyzer-routing/generator error for malformed output.
+///          Filesystem errors from writing `output_path` propagate.
+pub fn intoEngineIndexes(
     io: std.Io,
-    toml_path: []const u8,
+    output_path: []const u8,
     analysis: *const AnalyzerOutput,
 ) !void {
     if (analysis.stdout.len == 0) return error.EmptyAnalyzerOutput;
@@ -761,7 +733,7 @@ pub fn intoToml(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var rows: std.ArrayList(TomlRow) = .empty;
+    var rows: std.ArrayList(EngineIndexesGenerator.AnalysisRow) = .empty;
     var lines = std.mem.splitScalar(u8, analysis.stdout, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -771,23 +743,9 @@ pub fn intoToml(
 
     if (rows.items.len == 0) return error.EmptyAnalyzerOutput;
 
-    var output: std.ArrayList(u8) = .empty;
-    for (rows.items) |*row| {
-        try output.appendSlice(alloc, "[[");
-        try appendTomlBasicString(&output, alloc, row.header);
-        try appendSlice(&output, alloc, "]]\n");
-
-        for (row.fields.items) |field| {
-            try appendSlice(&output, alloc, field.key);
-            try appendSlice(&output, alloc, " = ");
-            try appendSlice(&output, alloc, field.value);
-            try output.append(alloc, '\n');
-        }
-        try output.append(alloc, '\n');
-    }
-
+    const generated = try EngineIndexesGenerator.generateFromAnalysis(alloc, rows.items);
     try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = toml_path,
-        .data = output.items,
+        .sub_path = output_path,
+        .data = generated,
     });
 }

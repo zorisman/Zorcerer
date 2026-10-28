@@ -9,14 +9,19 @@
 // pair a virtual destructor reserves are all handled by the same logic
 // the compiler itself relies on, not reimplemented here.
 //
-// This is meant to feed EngineVersions.zig's calibrated table: run it
-// once per SDK checkout/branch you want to support, and add the reported
-// indices (together with that branch's real IVEngineServer version
-// string) as a new row there.
+// This feeds the generated engine index table
+// (src/codegen_generated/engine_indexes.zig): the adapter runs it once per
+// SDK checkout/branch you want to support, and its stdout supplies the
+// vtable indices and version strings that EngineIndexesGenerator turns into
+// Zig constants.
 //
 // Usage:
-//   vtable-index-analyzer <header.h> <ClassName> <method1|*> [method2 ...] [--write-into <file.toml>] -- <compiler args...>
-//   vtable-index-analyzer '{{<header.h> <target> <selector...>}, {<header.h> <target> <selector...>}}' [--write-into <file.toml>] -- <compiler args...>
+//   vtable-index-analyzer -- <compiler args...>
+//   The query set is read from standard input in either the brace-set
+//   form '{{<header.h> <target> <selector...>}, ...}' or the legacy
+//   positional form '<header.h> <target> <selector...>' (a single line
+//   is enough for one query). Results are written to standard output;
+//   the tool no longer writes TOML files itself.
 //   <target> selects what is resolved: a class name resolves that
 //   class's virtual method vtable indices (named selectors may also
 //   resolve static const/constexpr data members of the class);
@@ -65,11 +70,13 @@
 // trick against a real build), not as a number to trust as-is.
 //
 // *** VERIFIED - compiled and exercised in this environment ***
-// This file now builds and links against the system Clang/LLVM 21
-// (libclang-cpp, libstdc++), and all query forms (class, wildcard,
-// macro, brace set, --write-into, error paths) were run end to end
-// against synthetic headers. Real hl2sdk checkouts and other LLVM
-// releases are still unexercised here: if a build fails on a different
+// This file previously built and linked against the system Clang/LLVM 21
+// (libclang-cpp, libstdc++), and its query forms (class, wildcard,
+// macro, brace set, error paths) were run end to end against synthetic
+// headers. Reading queries from standard input reuses that parser but
+// was not exercised after the change. Real hl2sdk checkouts and other
+// LLVM releases are still unexercised here: if a build fails on a
+// different
 // LLVM version, treat `clang::tooling::buildASTFromCodeWithArgs`'s
 // exact signature and `ItaniumVTableContext`'s constructor as the
 // risky API surface - both have shifted shape across LLVM releases
@@ -93,6 +100,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -124,9 +132,8 @@ enum class TargetKind {
 /// vtable slots of the class's primary vtable, all enumerators of the
 /// enum, or all constant definitions of the header.
 ///
-/// User-facing results are printed to stdout while resolving; the TOML
-/// output path is a per-invocation option, not per-query, so it lives
-/// outside this struct and is threaded through the run helpers.
+/// User-facing results are printed to stdout while resolving; callers
+/// that need machine-readable data consume that stream directly.
 struct Query {
     /// Path of the header to parse, exactly as given on the command
     /// line; also used as the key of the Constants section, for the
@@ -197,116 +204,6 @@ bool parseTarget(const std::string &Token, TargetKind &Kind,
 bool wildcardsEverything(const Query &Q) {
     return Q.selectors.size() == 1 && Q.selectors.front() == "*";
 }
-
-/// TOML section key under which a query's results are grouped in the
-/// --write-into file: "[class::<class>]" for class queries,
-/// "[enum::<enum>]" for enum queries, and "[const::<headerPath>]" for
-/// constant queries.
-///
-/// \param Q the query being written out.
-/// \returns the section key without enclosing brackets.
-std::string tomlSectionName(const Query &Q) {
-    std::string Section;
-    switch (Q.kind) {
-    case TargetKind::Class:
-        Section = "class::" + Q.targetName;
-        break;
-    case TargetKind::Enum:
-        Section = "enum::" + Q.targetName;
-        break;
-    case TargetKind::Constants:
-        Section = "const::" + Q.headerPath;
-        break;
-    }
-    return Section;
-}
-
-/// Accumulates the TOML section generated for one query and writes each
-/// entry to a stream. When \p Output is null (--write-into was not
-/// given), every entry is discarded and the section stays empty; the
-/// caller then must not flush anything.
-///
-/// Invariants:
-/// - The "[<section-name>]" header is emitted lazily, exactly once,
-///   before the first surviving entry.
-/// - Keys recorded with \c ensureUnique never collide within the
-///   section: a duplicate receives "@" + the caller's suffix so the
-///   destructor pair and repeated macro names stay distinct.
-/// - \c failed() is sticky: \c true forever once a stream write fails,
-///   and callers must treat the generated section as unusable then.
-class TomlSectionWriter {
-public:
-    /// Prepares a writer for one query's section.
-    ///
-    /// \param Output destination stream, or null to discard all entries.
-    /// \param SectionName section key (see \c tomlSectionName); emitted
-    ///                    inside brackets on first entry.
-    TomlSectionWriter(std::ostream *Output, std::string SectionName)
-        : Output(Output), SectionName(std::move(SectionName)) {}
-
-    /// Records a vtable index entry for a method (in wildcard mode the
-    /// whole slot, in named mode a single method); the key is
-    /// deduplicated against previously written keys using the decimal
-    /// slot index as suffix when \p EnsureUniqueKey is set. Named-mode
-    /// callers pass false there because a duplicate method name cannot
-    /// be requested twice after parse validation.
-    void addMethodEntry(const std::string &MethodName, uint64_t Index,
-                        bool EnsureUniqueKey) {
-        addEntry(MethodName, std::to_string(Index), EnsureUniqueKey,
-                 std::to_string(Index));
-    }
-
-    /// Records a constant value entry under \p Name. When
-    /// \p EnsureUniqueKey is set, keys already recorded in this section
-    /// receive "@" + \p DuplicateSuffix so repeated selectors (e.g. a
-    /// value requested twice) cannot collide; pass false to preserve
-    /// the named-mode class behavior of writing plain keys verbatim.
-    void addValueEntry(const std::string &Name, const std::string &Value,
-                       bool EnsureUniqueKey, const std::string &DuplicateSuffix) {
-        addEntry(Name, Value, EnsureUniqueKey, DuplicateSuffix);
-    }
-
-    /// Whether any entry was recorded (i.e. the section contains data
-    /// worth flushing to the --write-into file).
-    bool hasEntries() const { return !WrittenKeys.empty(); }
-
-    /// Whether a stream write has failed (see class invariants).
-    bool failed() const { return WriteFailed; }
-
-private:
-    /// Shared implementation of both public entry forms.
-    void addEntry(const std::string &Name, const std::string &Value,
-                  bool EnsureUniqueKey, const std::string &DuplicateSuffix) {
-        if (Output == nullptr)
-            return;
-
-        std::string Key = Name;
-        if (EnsureUniqueKey &&
-            std::find(WrittenKeys.begin(), WrittenKeys.end(), Key) != WrittenKeys.end())
-            Key += "@" + DuplicateSuffix;
-        WrittenKeys.push_back(Key);
-
-        if (!SectionHeaderWritten) {
-            *Output << "[";
-            writeTomlBasicString(*Output, SectionName);
-            *Output << "]\n";
-            SectionHeaderWritten = true;
-        }
-
-        writeTomlKey(*Output, Key);
-        *Output << " = " << Value << '\n';
-        if (!*Output) {
-            llvm::errs() << "error: failed writing TOML output\n";
-            WriteFailed = true;
-        }
-    }
-
-    std::ostream *Output;
-    std::string SectionName;
-    bool SectionHeaderWritten = false;
-    std::vector<std::string> WrittenKeys;
-    bool WriteFailed = false;
-};
 
 const CXXMethodDecl *findVirtualMethod(const CXXRecordDecl *RD, const std::string &name) {
     DeclarationName DN(&RD->getASTContext().Idents.get(name));
@@ -400,16 +297,14 @@ const VarDecl *findConstantMember(const CXXRecordDecl *RD, const std::string &Na
 /// It walks the parsed translation unit looking for a complete class
 /// definition matching the query's target name (by qualified or simple
 /// name, first match wins), then reports each requested method's
-/// Itanium vtable index to stdout and records it in the section writer.
-/// Named selectors that are not virtual methods fall back to static
-/// const/constexpr data members, resolved through the compiler's own
-/// value evaluation. Lifetime: bound references must outlive the
-/// traversal; the writer is shared state owned by the run helper.
+/// Itanium vtable index to stdout. Named selectors that are not virtual
+/// methods fall back to static const/constexpr data members, resolved
+/// through the compiler's own value evaluation.
 class IndexVisitor : public RecursiveASTVisitor<IndexVisitor> {
 public:
     /// Prepares a visitor for one class query.
-    IndexVisitor(ASTContext &Context, const Query &Q, TomlSectionWriter &Writer)
-        : Context(Context), Q(Q), Writer(Writer) {}
+    IndexVisitor(ASTContext &Context, const Query &Q)
+        : Context(Context), Q(Q) {}
 
     /// Reports every completed class definition whose qualified or
     /// simple name matches the query, then resolves its requested
@@ -450,7 +345,7 @@ public:
     /// Sticky failure flag set when a reported vtable layout is
     /// internally inconsistent (invalid address point) and the
     /// generated indices cannot be trusted; callers must abort the
-    /// query without flushing TOML output.
+    /// query without trusting its stdout.
     bool fatalError = false;
 
 private:
@@ -458,9 +353,9 @@ private:
     /// primary vtable - the "*" query mode. VTableLayout indices are
     /// relative to the address point, matching getMethodVTableIndex()'s
     /// index convention; ABI metadata (including RTTI) and unused slots
-    /// are skipped. Destructor variants are annotated in the report and
-    /// deduplicated in the TOML keys by their slot index. This mode
-    /// stays methods-only (no wildcard setup for constants exists).
+    /// are skipped. Destructor variants are annotated in the report.
+    /// This mode stays methods-only (no wildcard setup for constants
+    /// exists).
     void reportWildcardSlots(const CXXRecordDecl *RD, ItaniumVTableContext &VTContext) {
         const VTableLayout &Layout = VTContext.getVTableLayout(RD);
         const auto AddressPoint =
@@ -496,7 +391,6 @@ private:
                 llvm::outs() << "  (deleting destructor)";
             }
             llvm::outs() << "\n";
-            Writer.addMethodEntry(Method->getNameAsString(), SlotIndex, true);
         }
     }
 
@@ -544,7 +438,6 @@ private:
                             "variant)";
         }
         llvm::outs() << "\n";
-        Writer.addMethodEntry(MethodName, Index, false);
     }
 
     /// Evaluates and reports one static const/constexpr data member of
@@ -576,13 +469,11 @@ private:
             return true;
         }
         llvm::outs() << Q.targetName << "::" << Name << " = " << TomlValue << "\n";
-        Writer.addValueEntry(Name, TomlValue, false, "");
         return true;
     }
 
     ASTContext &Context;
     const Query &Q;
-    TomlSectionWriter &Writer;
 };
 
 /// Whether a macro definition location lives in the query's header.
@@ -613,9 +504,8 @@ bool definitionIsInHeader(const SourceManager &SM, SourceLocation Loc,
 /// AST visitor that resolves the namespace-scope constant-variable part
 /// of a "const::" query: definitions of const or constexpr variables at
 /// file scope whose definition lives in the query's header. Each value
-/// is reported to stdout and recorded in the section writer; received
-/// names are appended to the query's shared found-name list in
-/// encounter order.
+/// is reported to stdout; received names are appended to the query's
+/// shared found-name list in encounter order.
 class ConstantVarVisitor : public RecursiveASTVisitor<ConstantVarVisitor> {
 public:
     /// Prepares a visitor for one constant query.
@@ -624,13 +514,11 @@ public:
     ///          \c TargetKind::Constants).
     /// \param SM source manager of the translation unit being walked;
     ///           used to match variable definitions against the header.
-    /// \param Writer destination for the TOML section.
     /// \param FoundNames shared list that receives every name this
     ///                   visitor resolved.
     ConstantVarVisitor(const Query &Q, const SourceManager &SM,
-                       TomlSectionWriter &Writer,
                        std::vector<std::string> &FoundNames)
-        : Q(Q), SM(SM), Writer(Writer), FoundNames(FoundNames) {}
+        : Q(Q), SM(SM), FoundNames(FoundNames) {}
 
     /// Reports every namespace-scope constant definition that lives in
     /// the query's header and (in named mode) matches a selector;
@@ -684,7 +572,6 @@ public:
         }
 
         llvm::outs() << Q.headerPath << "::" << Name << " = " << TomlValue << '\n';
-        Writer.addValueEntry(Name, TomlValue, true, std::to_string(FoundNames.size()));
         FoundNames.push_back(Name);
         return true;
     }
@@ -697,7 +584,6 @@ public:
 private:
     const Query &Q;
     const SourceManager &SM;
-    TomlSectionWriter &Writer;
     std::vector<std::string> &FoundNames;
 };
 
@@ -708,24 +594,21 @@ private:
 /// A lone "*" selects all of them; otherwise only the requested names
 /// are reported.
 ///
-/// Results are printed to stdout and recorded in the writer; a missing
-/// requested name (or one whose value cannot be evaluated) ends the
-/// query with \c false, names written before it stay recorded.
-/// \c "#define" values keep the macro expansion text; variable values
-/// are compiler-evaluated compile-time constants (integer, boolean, or
-/// floating-point).
+/// Results are printed to stdout; a missing requested name (or one whose
+/// value cannot be evaluated) ends the query with \c false, lines
+/// written before it stay on stdout. \c "#define" values keep the macro
+/// expansion text; variable values are compiler-evaluated compile-time
+/// constants (integer, boolean, or floating-point).
 ///
 /// \param Q the constant query (kind \c TargetKind::Constants).
 /// \param Context AST context of the parsed translation unit.
 /// \param PP preprocessor of the same translation unit.
 /// \param SM source manager of the same translation unit; used to match
 ///           macro and variable definitions against the header path.
-/// \param Writer destination for the TOML section.
 /// \returns true if every requested name was resolved (or "*" mode
 ///          found at least one constant); false otherwise.
 bool processConstantQuery(const Query &Q, ASTContext &Context,
-                          Preprocessor &PP, const SourceManager &SM,
-                          TomlSectionWriter &Writer) {
+                          Preprocessor &PP, const SourceManager &SM) {
     const bool AllConstants = wildcardsEverything(Q);
     std::vector<std::string> FoundNames;
 
@@ -743,12 +626,11 @@ bool processConstantQuery(const Query &Q, ASTContext &Context,
             continue;
 
         const std::string Value = macroValueAsToml(PP, *MI);
-        Writer.addValueEntry(Name, Value, true, std::to_string(FoundNames.size()));
         llvm::outs() << Q.headerPath << "::" << Name << " = " << Value << '\n';
         FoundNames.push_back(Name);
     }
 
-    ConstantVarVisitor VarVisitor(Q, SM, Writer, FoundNames);
+    ConstantVarVisitor VarVisitor(Q, SM, FoundNames);
     VarVisitor.TraverseDecl(Context.getTranslationUnitDecl());
     if (VarVisitor.errored)
         return false;
@@ -777,8 +659,7 @@ bool processConstantQuery(const Query &Q, ASTContext &Context,
 class EnumVisitor : public RecursiveASTVisitor<EnumVisitor> {
 public:
     /// Prepares a visitor for one enum query.
-    EnumVisitor(const Query &Q, TomlSectionWriter &Writer)
-        : Q(Q), Writer(Writer) {}
+    EnumVisitor(const Query &Q) : Q(Q) {}
 
     /// Reports every completed enum definition whose qualified or
     /// simple name matches the query's target; other declarations are
@@ -828,19 +709,14 @@ public:
     bool missing = false;
 
 private:
-    /// Reports and records one enumerator: "<Enum>::<Name> = <value>"
-    /// on stdout and a TOML entry in the enum's section (keys are
-    /// deduplicated by record order for repeated selectors).
+    /// Reports one enumerator as "<Enum>::<Name> = <value>" on stdout.
     void reportEnumerator(const EnumConstantDecl *Constant) {
         const std::string Name = Constant->getNameAsString();
         const std::string Value = llvm::toString(Constant->getInitVal(), 10);
         llvm::outs() << Q.targetName << "::" << Name << " = " << Value << '\n';
-        Writer.addValueEntry(Name, Value, true, std::to_string(RecordedCount++));
     }
 
     const Query &Q;
-    TomlSectionWriter &Writer;
-    std::size_t RecordedCount = 0;
 };
 
 /// Split brace-set syntax even when the whole expression is quoted as one
@@ -983,30 +859,70 @@ bool parseSetQueries(const std::vector<std::string> &Arguments,
 }
 
 /// Everything the query runners need from the command line: the parsed
-/// queries, the --write-into target (empty when absent), and the
-/// compiler arguments after '--'.
+/// queries and the compiler arguments after '--'.
 struct CommandLine {
-    /// Query arguments on the command line, before '--'; the raw input
-    /// the query parser consumes, with '--write-into' options removed.
+    /// Query arguments before '--'; filled from standard input when no
+    /// query arguments were supplied.
     std::vector<std::string> preQueryArgs;
     /// Parsed queries; empty until parsing succeeded.
     std::vector<Query> queries;
-    /// --write-into target file path, empty when the option was not given.
-    std::string writeIntoPath;
     /// Compiler arguments after '--', shared by all queries.
     std::vector<std::string> compilerArgs;
 };
 
+/// Reads standard input to end and appends its query tokens to
+/// \p Destinations.
+///
+/// A brace-set input is kept as one argument so \c parseSetQueries can
+/// tokenize it; anything else is split on whitespace, matching the
+/// legacy positional '<header> <target> <selector...>' form.
+///
+/// \param Destinations receives the query arguments in input order.
+/// \param Error receives a user-facing message when reading fails.
+/// \returns true on success; false when standard input could not be read
+///          or contained no query text.
+bool readStdinQueries(std::vector<std::string> &Destinations,
+                      std::string &Error) {
+    std::ostringstream Buffer;
+    Buffer << std::cin.rdbuf();
+    if (std::cin.bad()) {
+        Error = "failed reading queries from standard input";
+        return false;
+    }
+
+    const std::string Input = Buffer.str();
+    const std::size_t First = Input.find_first_not_of(" \t\r\n");
+    if (First == std::string::npos) {
+        Error = "no query was specified on the command line or standard input";
+        return false;
+    }
+
+    if (Input[First] == '{') {
+        // Drop leading whitespace so the caller's brace-set detection sees
+        // '{' as the first character.
+        Destinations.push_back(Input.substr(First));
+        return true;
+    }
+
+    std::istringstream Tokens(Input);
+    std::string Token;
+    while (Tokens >> Token)
+        Destinations.push_back(Token);
+    return true;
+}
+
 /// Parses the tool invocation into \c CommandLine form.
 ///
 /// Accepts the legacy positional form '<header> <class> <method...>'
-/// and the braced set form '{{...}, {...}}'; see the usage text. No
-/// parse failures are printed here - the caller reports \p Error.
+/// and the braced set form '{{...}, {...}}'; see the usage text. When no
+/// query arguments precede '--', the same forms are read from standard
+/// input. No parse failures are printed here - the caller reports
+/// \p Error.
 ///
 /// \param argc \param argv the process arguments (argv[0] is skipped).
 /// \param Command receives the parsed state on success.
 /// \param Error receives a user-facing message on failure.
-/// \returns true on success; false on any argument error.
+/// \returns true on success; false on any argument or input error.
 bool parseCommandLine(int argc, char **argv, CommandLine &Command,
                       std::string &Error) {
     // Deliberately plain argv handling rather than
@@ -1022,26 +938,14 @@ bool parseCommandLine(int argc, char **argv, CommandLine &Command,
         }
     }
 
-    for (int ArgIndex = 1; ArgIndex < Separator; ++ArgIndex) {
-        const std::string Arg = argv[ArgIndex];
-        if (Arg == "--write-into") {
-            if (ArgIndex + 1 >= Separator) {
-                Error = "--write-into requires a file path before '--'";
-                return false;
-            }
-            Command.writeIntoPath = argv[++ArgIndex];
-            continue;
-        }
-        Command.preQueryArgs.push_back(Arg);
-    }
+    for (int ArgIndex = 1; ArgIndex < Separator; ++ArgIndex)
+        Command.preQueryArgs.push_back(argv[ArgIndex]);
 
     for (int ArgIndex = Separator + 1; ArgIndex < argc; ++ArgIndex)
         Command.compilerArgs.push_back(argv[ArgIndex]);
 
-    if (Command.preQueryArgs.empty()) {
-        Error = "no query was specified";
+    if (Command.preQueryArgs.empty() && !readStdinQueries(Command.preQueryArgs, Error))
         return false;
-    }
 
     if (!Command.preQueryArgs.front().empty() &&
         Command.preQueryArgs.front().front() == '{') {
@@ -1078,19 +982,14 @@ bool parseCommandLine(int argc, char **argv, CommandLine &Command,
 
 /// Runs one query end to end: verifies the header exists, parses it
 /// with Clang plus the shared compiler arguments, resolves the query
-/// against the AST, emits the human-readable report, and (when a
-/// --write-into path was given and anything was generated) appends the
-/// generated TOML section to that file.
+/// against the AST, and emits the machine-readable report on stdout.
 ///
 /// \param Q the query to run.
-/// \param WriteIntoPath TOML file to append to, or empty to skip.
 /// \param CompilerArgs arguments passed to Clang, shared by all queries.
 /// \returns this query's process exit code contribution: 0 on success;
-///          1 when parsing, resolution, or TOML generation failed; 2
-///          when the header file could not be opened; or whatever
-///          \c updateTomlFile reports if it fails.
-int runQuery(const Query &Q, const std::string &WriteIntoPath,
-             const std::vector<std::string> &CompilerArgs) {
+///          1 when parsing or resolution failed; 2 when the header file
+///          could not be opened.
+int runQuery(const Query &Q, const std::vector<std::string> &CompilerArgs) {
     {
         std::ifstream Probe(Q.headerPath);
         if (!Probe) {
@@ -1098,10 +997,6 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
             return 2;
         }
     }
-
-    std::ostringstream TomlBuffer;
-    TomlSectionWriter Writer(WriteIntoPath.empty() ? nullptr : &TomlBuffer,
-                             tomlSectionName(Q));
 
     const std::string Code = "#include \"" + Q.headerPath + "\"\n";
     std::unique_ptr<ASTUnit> AST = clang::tooling::buildASTFromCodeWithArgs(
@@ -1116,11 +1011,11 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
     switch (Q.kind) {
     case TargetKind::Constants:
         if (!processConstantQuery(Q, AST->getASTContext(), AST->getPreprocessor(),
-                                  AST->getSourceManager(), Writer))
+                                  AST->getSourceManager()))
             Status = 1;
         break;
     case TargetKind::Enum: {
-        EnumVisitor Visitor(Q, Writer);
+        EnumVisitor Visitor(Q);
         Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
         if (!Visitor.found) {
             llvm::errs() << "error: enum '" << Q.targetName
@@ -1133,7 +1028,7 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
         break;
     }
     case TargetKind::Class: {
-        IndexVisitor Visitor(AST->getASTContext(), Q, Writer);
+        IndexVisitor Visitor(AST->getASTContext(), Q);
         Visitor.TraverseDecl(AST->getASTContext().getTranslationUnitDecl());
 
         if (!Visitor.found) {
@@ -1148,14 +1043,6 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
     }
     }
 
-    if (Writer.failed())
-        Status = 1;
-
-    if (Status == 0 && !WriteIntoPath.empty() && Writer.hasEntries()) {
-        const int WriteResult = updateTomlFile(WriteIntoPath, TomlBuffer.str());
-        if (WriteResult != 0)
-            return WriteResult;
-    }
     return Status;
 }
 
@@ -1163,13 +1050,13 @@ int runQuery(const Query &Q, const std::string &WriteIntoPath,
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        llvm::errs() << "usage: vtable-index-analyzer <header.h> "
+        llvm::errs() << "usage: vtable-index-analyzer [<header.h> "
                          "<Class|enum::<Enum>|const::> <selector1|*> "
-                         "[selector2 ...] [--write-into <file.toml>] "
-                         "-- <compiler args...>\n"
-                         "   or: vtable-index-analyzer '{{<header.h> <target> <selector...>}, "
-                         "{<header.h> <target> <selector...>}}' "
-                         "[--write-into <file.toml>] -- <compiler args...>\n";
+                         "[selector2 ...]] -- <compiler args...>\n"
+                         "   or: vtable-index-analyzer [{{<header.h> <target> <selector...>}, "
+                         "{<header.h> <target> <selector...>}}] -- <compiler args...>\n"
+                         "   Queries omitted from the command line are read from "
+                         "standard input; results are written to standard output.\n";
         return 2;
     }
 
@@ -1183,7 +1070,7 @@ int main(int argc, char **argv) {
     // Process every query separately: each may name a different header and
     // class, while all queries share the compiler arguments after '--'.
     for (const Query &Q : Command.queries) {
-        const int Status = runQuery(Q, Command.writeIntoPath, Command.compilerArgs);
+        const int Status = runQuery(Q, Command.compilerArgs);
         if (Status != 0)
             return Status;
     }
