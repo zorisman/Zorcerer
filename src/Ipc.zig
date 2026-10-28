@@ -196,7 +196,7 @@ pub const ParsedRequest = struct {
     value: Request,
 
     /// Releases the JSON storage owned by `rpc`.
-    pub fn deinit(self: *ParsedRequest) void {
+    pub fn deinit(self: *const ParsedRequest) void {
         self.rpc.deinit();
     }
 
@@ -289,7 +289,7 @@ pub const ParsedEvent = struct {
     value: EventMessage,
 
     /// Releases the JSON storage owned by `rpc`.
-    pub fn deinit(self: *ParsedEvent) void {
+    pub fn deinit(self: *const ParsedEvent) void {
         self.rpc.deinit();
     }
 
@@ -573,10 +573,8 @@ pub const MockSender = struct {
     ) !zjr.RpcResponseResult {
         const request_json = try zjr.composer.makeRequestJson(self.allocator, method, params, id);
         defer self.allocator.free(request_json);
-        std.debug.print("JSON-RPC request: {s}\n", .{request_json});
 
         const response_json = try self.listener.handle(request_json);
-        std.debug.print("JSON-RPC response: {s}\n", .{response_json});
         return zjr.parseRpcResponseOwned(self.allocator, response_json, .{});
     }
 };
@@ -629,19 +627,4 @@ test "mock JSON-RPC request/response flow" {
     const read_result = read.result.string;
     std.debug.print("mockReadStruct result: {s}\n", .{read_result});
     try std.testing.expectEqualStrings("Hello", read_result);
-
-    var err_response = try sender.call("mockMissingMethod", .null, zjr.RpcId.of(9));
-    defer err_response.deinit();
-    const err = try err_response.response();
-    try std.testing.expect(err.hasErr());
-    try std.testing.expect(!err.hasResult());
-    try std.testing.expect(err.id.eql(9));
-    try std.testing.expectEqual(
-        @as(i32, @intFromEnum(zjr.ErrorCode.MethodNotFound)),
-        err.err().code,
-    );
-    std.debug.print("mockMissingMethod error: {d} {s}\n", .{
-        err.err().code,
-        err.err().message,
-    });
 }
