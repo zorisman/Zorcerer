@@ -1,17 +1,19 @@
-//! Framed JSON messages for the IPC channel between `Entrypoint.zig` and the
-//! forked plugin-manager process (`PluginManager.zig`).
+//! Framed JSON-RPC 2.0 messages for the IPC channel between `Entrypoint.zig`
+//! and the forked plugin-manager process (`PluginManager.zig`).
 //!
 //! One message is one frame on the connected stream socket created for the
 //! fork:
 //!
 //!     marker (1 byte, 0xA5) | length (u32, little-endian) | JSON payload
 //!
-//! Both processes use this module, so the framing and the JSON schemas cannot
+//! The payload is a JSON-RPC 2.0 request, notification, or response. Both
+//! processes use this module, so the framing and the message schema cannot
 //! drift apart. `writeAll` sends with `MSG_NOSIGNAL`, so a peer that already
 //! exited yields `error.WriteFailed` instead of terminating the process with
 //! SIGPIPE.
 
 const std = @import("std");
+const zjr = @import("zjr");
 
 /// Largest payload, in bytes, one frame may carry.
 ///
@@ -24,6 +26,12 @@ pub const max_payload_len: usize = 4096;
 /// It distinguishes a frame from a truncated or desynchronized stream: without
 /// it the following length bytes cannot be interpreted.
 const frame_marker: u8 = 0xA5;
+
+/// Request ID used by `sendEvent`.
+///
+/// The Entrypoint sends callback events synchronously, one at a time, so a
+/// fixed positive ID is sufficient and lets the listener match the response.
+pub const event_request_id: i64 = 1;
 
 /// One frame read from the channel.
 ///
@@ -160,17 +168,17 @@ fn writeAll(fd: std.os.linux.fd_t, buffer: []const u8) !void {
     }
 }
 
-/// Operations the Entrypoint's JSON listener understands.
+/// Operations the Entrypoint's JSON-RPC listener understands.
 pub const Operation = enum {
     /// Write `message` to the process' standard error stream.
     stderr,
 };
 
-/// One JSON message carrying an operation for the Entrypoint's listener.
+/// Parameters of one operation notification.
 ///
 /// Schema:
 ///
-///     {"operation": "stderr", "message": "Event is pause"}
+///     {"jsonrpc": "2.0", "method": "stderr", "params": {"message": "..."}}
 pub const Request = struct {
     /// What the receiver should do with `message`.
     operation: Operation,
@@ -178,32 +186,72 @@ pub const Request = struct {
     message: []const u8,
 };
 
-/// Parses one JSON request or response.
+/// An operation notification parsed from a JSON-RPC request.
 ///
-/// Unknown operations and unknown keys are rejected, so a typo in the schema
-/// cannot silently turn into a no-op. The returned value borrows `allocator`
-/// until `deinit()`.
-pub fn parseRequest(allocator: std.mem.Allocator, text: []const u8) !std.json.Parsed(Request) {
-    return std.json.parseFromSlice(Request, allocator, text, .{});
+/// `value` borrows the JSON owned by `rpc`; both stay valid until `deinit()`.
+pub const ParsedRequest = struct {
+    /// Parsed JSON-RPC request. Its `params` hold the operation message.
+    rpc: zjr.RpcRequestResult,
+    /// Operation and message extracted from `rpc`.
+    value: Request,
+
+    /// Releases the JSON storage owned by `rpc`.
+    pub fn deinit(self: *ParsedRequest) void {
+        self.rpc.deinit();
+    }
+
+    /// Returns the request ID, which is `.none` for a notification.
+    pub fn id(self: *const ParsedRequest) zjr.RpcId {
+        return if (self.rpc.isRequest()) self.rpc.request_msg.request.id else .ofNone();
+    }
+};
+
+/// Parses one JSON-RPC operation notification.
+///
+/// Unknown methods, malformed requests, and missing or non-string `message`
+/// parameters are rejected. The returned value owns the parsed JSON until
+/// `deinit()`.
+///
+/// Errors: `error.NotRpcRequest` when `text` is a response or batch,
+/// `error.InvalidRpcRequest` for an invalid JSON-RPC envelope,
+/// `error.UnknownMethod` for an operation this module does not implement,
+/// `error.InvalidParams`/`error.MissingMessage` for malformed parameters.
+pub fn parseRequest(allocator: std.mem.Allocator, text: []const u8) !ParsedRequest {
+    var rpc = zjr.parseRpcRequest(allocator, text);
+    errdefer rpc.deinit();
+
+    if (rpc.isMissingMethod() or !rpc.isRequest()) return error.NotRpcRequest;
+    const request = rpc.request_msg.request;
+    if (request.hasError()) return error.InvalidRpcRequest;
+
+    const operation = operationFromMethod(request.method) orelse return error.UnknownMethod;
+    const params = request.objectParams() orelse return error.InvalidParams;
+    const message_value = params.get("message") orelse return error.MissingMessage;
+    const message = switch (message_value) {
+        .string => |value| value,
+        else => return error.InvalidParams,
+    };
+
+    return .{
+        .rpc = rpc,
+        .value = .{ .operation = operation, .message = message },
+    };
 }
 
-/// Serializes `value` to JSON into `buffer` and returns the written bytes.
+/// Serializes `request` as a JSON-RPC notification and sends it as one frame.
 ///
-/// Returns `error.WriteFailed` when the JSON does not fit `buffer`. The
-/// returned slice borrows `buffer`.
-fn stringify(value: anytype, buffer: []u8) ![]const u8 {
-    var writer: std.Io.Writer = .fixed(buffer);
-    try std.json.Stringify.value(value, .{}, &writer);
-    return writer.buffered();
-}
-
-/// Serializes `request` and sends it as one frame.
-///
-/// Errors: `error.WriteFailed` when the request does not fit the stack buffer
-/// or the write fails, and `error.PayloadTooLarge` from `writeFrame`.
+/// The notification has no `id`, as required for JSON-RPC notifications.
+/// Errors: `error.WriteFailed`/`error.OutOfMemory` from message composition,
+/// and `error.PayloadTooLarge`/`error.WriteFailed` from `writeFrame`.
 pub fn sendRequest(fd: std.os.linux.fd_t, request: Request) !void {
-    var buffer: [max_payload_len]u8 = undefined;
-    const payload = try stringify(request, &buffer);
+    const allocator = std.heap.page_allocator;
+    const payload = try zjr.composer.makeRequestJson(
+        allocator,
+        @tagName(request.operation),
+        .{ .message = request.message },
+        zjr.RpcId.ofNone(),
+    );
+    defer allocator.free(payload);
     try writeFrame(fd, payload);
 }
 
@@ -221,32 +269,79 @@ pub const Event = enum {
     levelShutdown,
 };
 
-/// One JSON event message: `{"event":"pause"}`.
+/// One event request payload.
+///
+/// In JSON-RPC the event callback is the method name, so the wire message is:
+///
+///     {"jsonrpc": "2.0", "method": "pause", "id": 1}
 pub const EventMessage = struct {
     /// Callback that fired.
     event: Event,
 };
 
-/// Parses one event message.
+/// An event request parsed from a JSON-RPC request.
 ///
-/// Unknown events and unknown keys are rejected. The returned value borrows
-/// `allocator` until `deinit()`.
-pub fn parseEvent(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-) !std.json.Parsed(EventMessage) {
-    return std.json.parseFromSlice(EventMessage, allocator, text, .{});
+/// `value` borrows the JSON owned by `rpc`; both stay valid until `deinit()`.
+pub const ParsedEvent = struct {
+    /// Parsed JSON-RPC request whose method names the event.
+    rpc: zjr.RpcRequestResult,
+    /// Event extracted from `rpc`.
+    value: EventMessage,
+
+    /// Releases the JSON storage owned by `rpc`.
+    pub fn deinit(self: *ParsedEvent) void {
+        self.rpc.deinit();
+    }
+
+    /// Returns the request ID used for the matching response.
+    pub fn id(self: *const ParsedEvent) zjr.RpcId {
+        return if (self.rpc.isRequest()) self.rpc.request_msg.request.id else .ofNull();
+    }
+};
+
+/// Parses one JSON-RPC event request.
+///
+/// The JSON-RPC method name selects the event. The returned value owns the
+/// parsed JSON until `deinit()`.
+///
+/// Errors: `error.NotRpcRequest` when `text` is a response or batch,
+/// `error.InvalidRpcRequest` for an invalid JSON-RPC envelope,
+/// `error.UnknownMethod` when the method is not one of `Event`'s callbacks.
+pub fn parseEvent(allocator: std.mem.Allocator, text: []const u8) !ParsedEvent {
+    var rpc = zjr.parseRpcRequest(allocator, text);
+    errdefer rpc.deinit();
+
+    if (rpc.isMissingMethod() or !rpc.isRequest()) return error.NotRpcRequest;
+    const request = rpc.request_msg.request;
+    if (request.hasError()) return error.InvalidRpcRequest;
+
+    const event = eventFromMethod(request.method) orelse return error.UnknownMethod;
+    return .{
+        .rpc = rpc,
+        .value = .{ .event = event },
+    };
 }
 
-/// Serializes `event` into `buffer` and returns the written bytes.
+/// Serializes `event` as a JSON-RPC request into `buffer`.
+///
+/// Uses `event_request_id` so the listener can answer with a matching ID.
+/// The returned slice borrows `buffer`.
 ///
 /// Errors: `error.WriteFailed` when the event does not fit `buffer`.
 pub fn encodeEvent(buffer: []u8, event: Event) ![]const u8 {
-    return stringify(EventMessage{ .event = event }, buffer);
+    var writer: std.Io.Writer = .fixed(buffer);
+    try zjr.composer.writeRequestJson(
+        @tagName(event),
+        null,
+        zjr.RpcId.of(event_request_id),
+        &writer,
+    );
+    return writer.buffered();
 }
 
-/// Sends one `{"event":"X"}` frame.
+/// Serializes `event` as a JSON-RPC request and sends it as one frame.
 ///
+/// Uses `event_request_id` so the listener can answer with a matching ID.
 /// Errors: `error.WriteFailed` when the event does not fit the stack buffer or
 /// the write fails, and `error.PayloadTooLarge` from `writeFrame`.
 pub fn sendEvent(fd: std.os.linux.fd_t, event: Event) !void {
@@ -255,7 +350,7 @@ pub fn sendEvent(fd: std.os.linux.fd_t, event: Event) !void {
     try writeFrame(fd, payload);
 }
 
-/// Formats the message the manager answers `event` with: `"Event is X"`.
+/// Formats the result text the manager answers `event` with: `"Event is X"`.
 ///
 /// The returned slice borrows `buffer`.
 ///
@@ -264,12 +359,289 @@ pub fn eventResponseText(buffer: []u8, event: Event) ![]const u8 {
     return std.fmt.bufPrint(buffer, "Event is {s}", .{@tagName(event)});
 }
 
-/// Sends the stderr response for one received event.
+/// Sends the successful JSON-RPC response for one event request.
 ///
-/// Errors: `error.NoSpaceLeft` when the stack buffer is too small, plus the
-/// errors of `sendRequest`.
-pub fn sendEventResponse(fd: std.os.linux.fd_t, event: Event) !void {
+/// `id` is the ID of the request being answered. The result is the string
+/// returned by `eventResponseText`.
+///
+/// Errors: `error.NoSpaceLeft` when the stack buffer is too small,
+/// `error.NoResponseForNotification` when `id` is not a valid request ID,
+/// plus allocation and framing errors from message composition and
+/// `writeFrame`.
+pub fn sendEventResponse(fd: std.os.linux.fd_t, event: Event, id: zjr.RpcId) !void {
+    const allocator = std.heap.page_allocator;
     var buffer: [64]u8 = undefined;
     const message = try eventResponseText(&buffer, event);
-    try sendRequest(fd, .{ .operation = .stderr, .message = message });
+
+    const result_json = try std.json.Stringify.valueAlloc(allocator, message, .{});
+    defer allocator.free(result_json);
+
+    const response_json = try zjr.composer.makeResponseJson(allocator, id, result_json);
+    const payload = response_json orelse return error.NoResponseForNotification;
+    defer allocator.free(payload);
+    try writeFrame(fd, payload);
+}
+
+/// Sends a JSON-RPC error response.
+///
+/// `id` is the request ID being answered, or `.ofNull()` when it could not be
+/// determined. `code` selects the JSON-RPC error code; `message` is the error
+/// text. Errors are the allocation and framing errors from message composition
+/// and `writeFrame`.
+pub fn sendErrorResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, code: zjr.ErrorCode, message: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    const payload = try zjr.composer.makeErrorResponseJson(allocator, id, code, message);
+    defer allocator.free(payload);
+    try writeFrame(fd, payload);
+}
+
+/// Answers an event frame that could not be decoded.
+///
+/// The request ID is recovered when `request_json` is structurally a
+/// JSON-RPC request, so the caller's synchronous exchange still receives a
+/// matching error response. Unknown methods produce `MethodNotFound`;
+/// malformed envelopes use their own parse/validation code.
+///
+/// Errors are the allocation and framing errors from message composition and
+/// `writeFrame`.
+pub fn sendInvalidEventResponse(fd: std.os.linux.fd_t, request_json: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    var rpc = zjr.parseRpcRequest(allocator, request_json);
+    defer rpc.deinit();
+
+    var id = zjr.RpcId.ofNull();
+    var code: zjr.ErrorCode = .InvalidRequest;
+    if (rpc.isRequest()) {
+        const request = rpc.request_msg.request;
+        id = request.id;
+        if (request.hasError()) {
+            code = request.err().code;
+        } else if (eventFromMethod(request.method) == null) {
+            code = .MethodNotFound;
+        } else {
+            code = .InvalidParams;
+        }
+    }
+    try sendErrorResponse(fd, id, code, "Event is invalid");
+}
+
+/// A JSON-RPC response parsed from one IPC payload.
+///
+/// `rpc` owns the parsed JSON until `deinit()`.
+pub const ParsedResponse = struct {
+    /// Parsed JSON-RPC response.
+    rpc: zjr.RpcResponseResult,
+
+    /// Releases the JSON storage owned by `rpc`.
+    pub fn deinit(self: *ParsedResponse) void {
+        self.rpc.deinit();
+    }
+
+    /// Returns the single response inside `rpc`.
+    ///
+    /// Errors: `error.NotSingleRpcResponse` for a batch or empty response.
+    pub fn value(self: *ParsedResponse) !zjr.RpcResponse {
+        return self.rpc.response();
+    }
+};
+
+/// Parses one JSON-RPC response payload.
+///
+/// The returned value owns the parsed JSON until `deinit()`.
+pub fn parseResponse(allocator: std.mem.Allocator, text: []const u8) ParsedResponse {
+    return .{ .rpc = zjr.parseRpcResponse(allocator, text) };
+}
+
+/// Returns the operation named by a JSON-RPC method, or null.
+fn operationFromMethod(method: []const u8) ?Operation {
+    if (std.mem.eql(u8, method, "stderr")) return .stderr;
+    return null;
+}
+
+/// Returns the event named by a JSON-RPC method, or null.
+fn eventFromMethod(method: []const u8) ?Event {
+    inline for (std.meta.fields(Event)) |field| {
+        if (std.mem.eql(u8, method, field.name)) {
+            return @as(Event, @enumFromInt(field.value));
+        }
+    }
+    return null;
+}
+
+/// In-process JSON-RPC listener used by tests.
+///
+/// The listener owns an `RpcDispatcher`, registers handlers by method name,
+/// and runs requests through ZigJR's `RequestPipeline`. It never opens a
+/// socket or starts a subprocess.
+pub const MockListener = struct {
+    /// Allocator used for the dispatcher, pipeline, and response copy.
+    allocator: std.mem.Allocator,
+    /// Registered method table. Heap-allocated so its address is stable.
+    rpc: *zjr.RpcDispatcher,
+    /// ZigJR request pipeline. Heap-allocated so its internal pointers stay
+    /// valid for the lifetime of the listener.
+    pipeline: *zjr.RequestPipeline,
+    /// Stable copy of the most recent response.
+    response_buffer: [max_payload_len]u8 = undefined,
+    /// Number of valid bytes in `response_buffer`.
+    response_len: usize = 0,
+
+    /// Creates a listener with no handlers.
+    ///
+    /// Errors: `error.OutOfMemory` when the dispatcher, pipeline, or their
+    /// internal allocations cannot be created.
+    pub fn init(allocator: std.mem.Allocator) !MockListener {
+        const rpc = try allocator.create(zjr.RpcDispatcher);
+        errdefer allocator.destroy(rpc);
+        rpc.* = try zjr.RpcDispatcher.init(allocator);
+        errdefer rpc.deinit();
+
+        const pipeline = try allocator.create(zjr.RequestPipeline);
+        errdefer allocator.destroy(pipeline);
+        pipeline.* = try zjr.RequestPipeline.init(
+            allocator,
+            zjr.RequestDispatcher.implBy(rpc),
+            null,
+        );
+
+        return .{
+            .allocator = allocator,
+            .rpc = rpc,
+            .pipeline = pipeline,
+        };
+    }
+
+    /// Releases the dispatcher, pipeline, and their allocations.
+    pub fn deinit(self: *MockListener) void {
+        self.pipeline.deinit();
+        self.allocator.destroy(self.pipeline);
+        self.rpc.deinit();
+        self.allocator.destroy(self.rpc);
+    }
+
+    /// Registers `handler_fn` under the JSON-RPC method name `method`.
+    ///
+    /// Errors are ZigJR's `RegistrationErrors`.
+    pub fn register(self: *MockListener, method: []const u8, comptime handler_fn: anytype) !void {
+        try self.rpc.add(method, handler_fn);
+    }
+
+    /// Processes one JSON-RPC request and returns its response.
+    ///
+    /// The returned slice borrows `response_buffer` and stays valid until the
+    /// next call to `handle` on this listener.
+    ///
+    /// Errors: ZigJR's pipeline writer errors, `error.EmptyResponse` when the
+    /// request was a notification, and `error.PayloadTooLarge` when the
+    /// response does not fit the frame buffer.
+    pub fn handle(self: *MockListener, request_json: []const u8) ![]const u8 {
+        const status = try self.pipeline.runRequest(request_json);
+        if (!status.hasReply()) return error.EmptyResponse;
+
+        const response = self.pipeline.responseJson();
+        if (response.len > self.response_buffer.len) return error.PayloadTooLarge;
+        @memcpy(self.response_buffer[0..response.len], response);
+        self.response_len = response.len;
+        return self.response_buffer[0..self.response_len];
+    }
+};
+
+/// In-process JSON-RPC client used by tests.
+///
+/// The sender composes a request with ZigJR, passes it directly to a
+/// `MockListener`, prints both wire messages, and returns the parsed response
+/// for assertions.
+pub const MockSender = struct {
+    /// Allocator for request composition and response parsing.
+    allocator: std.mem.Allocator,
+    /// Destination for the request. Must outlive the sender.
+    listener: *MockListener,
+
+    /// Sends one JSON-RPC request and returns its parsed response.
+    ///
+    /// `params` must be null, an array-like tuple, or a struct; ZigJR rejects
+    /// other parameter types. The returned result owns its parsed JSON until
+    /// `deinit()` is called.
+    ///
+    /// Errors are ZigJR's composition errors, the listener's pipeline errors,
+    /// and `error.OutOfMemory` while parsing the response.
+    pub fn call(
+        self: *MockSender,
+        method: []const u8,
+        params: anytype,
+        id: zjr.RpcId,
+    ) !zjr.RpcResponseResult {
+        const request_json = try zjr.composer.makeRequestJson(self.allocator, method, params, id);
+        defer self.allocator.free(request_json);
+        std.debug.print("JSON-RPC request: {s}\n", .{request_json});
+
+        const response_json = try self.listener.handle(request_json);
+        std.debug.print("JSON-RPC response: {s}\n", .{response_json});
+        return zjr.parseRpcResponseOwned(self.allocator, response_json, .{});
+    }
+};
+
+/// Adds the two test numbers.
+fn mockAddTwoNumbers(a: f64, b: f64) f64 {
+    return a + b;
+}
+
+/// Message parameter for `mockReadStruct`.
+const Message = struct {
+    text: []const u8,
+};
+
+/// Returns the text carried by `msg`.
+fn mockReadStruct(msg: Message) []const u8 {
+    return msg.text;
+}
+
+test "mock JSON-RPC request/response flow" {
+    var listener = try MockListener.init(std.testing.allocator);
+    defer listener.deinit();
+    try listener.register("mockAddTwoNumbers", mockAddTwoNumbers);
+    try listener.register("mockReadStruct", mockReadStruct);
+
+    var sender = MockSender{
+        .allocator = std.testing.allocator,
+        .listener = &listener,
+    };
+
+    var add_response = try sender.call("mockAddTwoNumbers", .{ 2.5, 3.5 }, zjr.RpcId.of(7));
+    defer add_response.deinit();
+    const add = try add_response.response();
+    try std.testing.expect(!add.hasErr());
+    try std.testing.expect(add.id.eql(7));
+    try std.testing.expect(add.resultEql(@as(f64, 6.0)));
+    const add_result = switch (add.result) {
+        .float => |value| value,
+        .integer => |value| @as(f64, @floatFromInt(value)),
+        else => return error.UnexpectedResultType,
+    };
+    std.debug.print("mockAddTwoNumbers result: {}\n", .{add_result});
+    try std.testing.expectEqual(@as(f64, 6.0), add_result);
+
+    var read_response = try sender.call("mockReadStruct", .{ .text = "Hello" }, zjr.RpcId.of(8));
+    defer read_response.deinit();
+    const read = try read_response.response();
+    try std.testing.expect(!read.hasErr());
+    try std.testing.expect(read.id.eql(8));
+    const read_result = read.result.string;
+    std.debug.print("mockReadStruct result: {s}\n", .{read_result});
+    try std.testing.expectEqualStrings("Hello", read_result);
+
+    var err_response = try sender.call("mockMissingMethod", .null, zjr.RpcId.of(9));
+    defer err_response.deinit();
+    const err = try err_response.response();
+    try std.testing.expect(err.hasErr());
+    try std.testing.expect(!err.hasResult());
+    try std.testing.expect(err.id.eql(9));
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(zjr.ErrorCode.MethodNotFound)),
+        err.err().code,
+    );
+    std.debug.print("mockMissingMethod error: {d} {s}\n", .{
+        err.err().code,
+        err.err().message,
+    });
 }

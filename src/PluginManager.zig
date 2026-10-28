@@ -350,11 +350,13 @@ pub const Manager = struct {
 /// manager process owns this end and turns it into its JSON listener. The
 /// Entrypoint holds the other end.
 ///
-/// Each received frame must carry `{"event":"X"}`, where `X` is one of
-/// `Ipc.Event`'s callbacks. Every framed message is answered with exactly one
-/// `{"operation":"stderr","message":...}` frame, so the Entrypoint's
-/// synchronous event exchange never waits for a reply that will not come. A
-/// message that cannot be decoded is answered with `"Event is invalid"`.
+/// Each received frame must carry a JSON-RPC request whose method is one of
+/// `Ipc.Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
+/// "id":1}`. Every framed message is answered with exactly one JSON-RPC result
+/// or error response carrying the request ID, so the Entrypoint's synchronous
+/// event exchange never waits for a reply that will not come. A message that
+/// cannot be decoded is answered with a JSON-RPC error and the message
+/// "Event is invalid".
 ///
 /// A frame that cannot be read, or whose marker is wrong, ends the listener:
 /// the stream can no longer be resynchronized. The caller keeps ownership of
@@ -381,7 +383,7 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
 
         if (!frame.received) {
             Log.logLine("[zorcerer] event listener: empty event frame\n", .{});
-            if (!respondInvalidEvent(fd)) return;
+            if (!respondInvalidEvent(fd, frame.text())) return;
             continue;
         }
 
@@ -390,12 +392,12 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
                 "[zorcerer] event listener: invalid event ({s})\n",
                 .{@errorName(err)},
             );
-            if (!respondInvalidEvent(fd)) return;
+            if (!respondInvalidEvent(fd, frame.text())) return;
             continue;
         };
         defer parsed.deinit();
 
-        Ipc.sendEventResponse(fd, parsed.value.event) catch |err| {
+        Ipc.sendEventResponse(fd, parsed.value.event, parsed.id()) catch |err| {
             Log.logLine(
                 "[zorcerer] event listener: replying to {s} failed: {s}\n",
                 .{ @tagName(parsed.value.event), @errorName(err) },
@@ -407,16 +409,16 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
 
 /// Answers an event that could not be decoded.
 ///
-/// Keeping the answer count at exactly one per received frame is what lets the
-/// Entrypoint stay synchronous even when a peer sends a malformed event.
+/// `request_json` is the original frame payload. When it is structurally a
+/// JSON-RPC request, its ID is recovered so the error response can be matched
+/// to the request. Keeping the answer count at exactly one per received frame
+/// is what lets the Entrypoint stay synchronous even when a peer sends a
+/// malformed event.
 ///
 /// Returns true when the reply was sent. Returns false when the write failed,
 /// which means the channel is gone and the listener should stop.
-fn respondInvalidEvent(fd: std.os.linux.fd_t) bool {
-    Ipc.sendRequest(fd, .{
-        .operation = .stderr,
-        .message = "Event is invalid",
-    }) catch |err| {
+fn respondInvalidEvent(fd: std.os.linux.fd_t, request_json: []const u8) bool {
+    Ipc.sendInvalidEventResponse(fd, request_json) catch |err| {
         Log.logLine(
             "[zorcerer] event listener: sending the invalid-event reply failed: {s}\n",
             .{@errorName(err)},

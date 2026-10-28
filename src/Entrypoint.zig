@@ -24,12 +24,12 @@
 //! `jsonListener`. The child then serves VSP callback events through the
 //! manager's own listener (`PluginManager.listenForEvents`).
 //!
-//! Messages are JSON frames (see src/Ipc.zig). Reports are
-//! `{"operation": "stderr", "message": "..."}`, which means "write message to
-//! stderr". The callbacks send `{"event": "X"}` and receive
-//! `{"operation": "stderr", "message": "Event is X"}`. `unload` closes the
-//! parent's socket end, which tells the child to unload its plugins and exit,
-//! then reaps it.
+//! Messages are framed JSON-RPC 2.0 messages (see src/Ipc.zig). The manager's
+//! readiness report is a `stderr` notification whose `params.message` is
+//! written to stderr. The callbacks send a request named after the event and
+//! receive a JSON-RPC result `"Event is X"` (or an error response). `unload`
+//! closes the parent's socket end, which tells the child to unload its plugins
+//! and exit, then reaps it.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -76,12 +76,18 @@
 //! earlier) - the .vdf route is what actually loads this on a live server.
 
 const std = @import("std");
+const zjr = @import("zjr");
 const Ipc = @import("Ipc.zig");
 const VTableHooks = @import("hooks").VTableHook;
 const Indexes = @import("codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
 const Log = @import("root.zig").Log;
 const abi = @import("root.zig").abi;
+
+// Include Ipc.zig's in-process JSON-RPC tests in this module's test build.
+test {
+    _ = @import("Ipc.zig");
+}
 
 pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
 
@@ -291,28 +297,59 @@ pub fn forkChild(child_main: ChildMain) !ForkedChild {
     return .{ .pid = pid, .socket = fds[0] };
 }
 
-/// Executes one request received from the plugin manager.
+/// Executes one operation notification received from the plugin manager.
 fn handleRequest(request: Ipc.Request) void {
     switch (request.operation) {
         .stderr => std.debug.print("{s}", .{request.message}),
     }
 }
 
-/// Listener for the manager's reports: reads one framed JSON message from
+/// Executes one JSON-RPC response received from the plugin manager.
+///
+/// Error responses are printed as diagnostics instead of being treated as
+/// results; the engine callbacks have no way to report the failure.
+///
+/// Errors: `error.UnexpectedResultType` when a successful response does not
+/// carry the event text as a JSON string.
+fn handleResponse(response: zjr.RpcResponse) !void {
+    if (response.hasErr()) {
+        std.debug.print(
+            "JSON-RPC error {d}: {s}\n",
+            .{ response.err().code, response.err().message },
+        );
+        return;
+    }
+
+    switch (response.result) {
+        .string => |text| std.debug.print("{s}", .{text}),
+        else => return error.UnexpectedResultType,
+    }
+}
+
+/// Listener for the manager's messages: reads one framed JSON-RPC message from
 /// `socket` and executes it.
 ///
-/// The same listener handles the initial readiness report ("Hello from fork")
-/// and every "Event is X" response to a callback event.
+/// The same listener handles the initial readiness notification ("Hello from
+/// fork") and every result or error response to a callback event.
 ///
 /// Errors: `error.InvalidFrame` when the frame marker is missing,
 /// `error.EmptyMessage` for a zero-length payload, the framing errors of
-/// `Ipc.readFrame`, and the JSON errors of `Ipc.parseRequest`.
+/// `Ipc.readFrame`, the JSON errors of `Ipc.parseRequest`/`Ipc.parseResponse`,
+/// and the response-shape errors of `handleResponse`.
 fn jsonListener(socket: std.os.linux.fd_t) !void {
     const frame = try Ipc.readFrame(socket);
     if (!frame.framed) return error.InvalidFrame;
     if (!frame.received) return error.EmptyMessage;
 
-    const request = try Ipc.parseRequest(std.heap.page_allocator, frame.text());
+    const request = Ipc.parseRequest(std.heap.page_allocator, frame.text()) catch |err| switch (err) {
+        error.NotRpcRequest => {
+            var response = Ipc.parseResponse(std.heap.page_allocator, frame.text());
+            defer response.deinit();
+            try handleResponse(try response.value());
+            return;
+        },
+        else => return err,
+    };
     defer request.deinit();
     handleRequest(request.value);
 }
@@ -379,6 +416,7 @@ test "parent receives a JSON message from the child" {
     defer request.deinit();
     try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
     try std.testing.expectEqualStrings(manager_ready_message, request.value.message);
+    try std.testing.expect(request.id().isNone());
 }
 
 test "child payload matches the serialized request" {
@@ -387,14 +425,14 @@ test "child payload matches the serialized request" {
 
     const frame = try Ipc.readFrame(child.socket);
     try std.testing.expect(frame.matches(
-        "{\"operation\":\"stderr\",\"message\":\"Hello from fork\"}",
+        "{\"jsonrpc\": \"2.0\", \"method\": \"stderr\", \"params\": {\"message\":\"Hello from fork\"}}",
     ));
 }
 
 test "listener schema decodes the stderr operation" {
     const request = try Ipc.parseRequest(
         std.testing.allocator,
-        "{\"operation\": \"stderr\", \"message\": \"Hello from fork\"}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"Hello from fork\"}}",
     );
     defer request.deinit();
 
@@ -404,19 +442,23 @@ test "listener schema decodes the stderr operation" {
 
 test "listener schema rejects an unknown operation" {
     try std.testing.expectError(
-        error.InvalidEnumTag,
-        Ipc.parseRequest(std.testing.allocator, "{\"operation\": \"stdout\", \"message\": \"x\"}"),
+        error.UnknownMethod,
+        Ipc.parseRequest(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"stdout\",\"params\":{\"message\":\"x\"}}",
+        ),
     );
 }
 
-test "listener schema rejects an unknown field" {
-    try std.testing.expectError(
-        error.UnknownField,
-        Ipc.parseRequest(
-            std.testing.allocator,
-            "{\"operation\": \"stderr\", \"message\": \"x\", \"unexpected\": 1}",
-        ),
+test "listener schema ignores unknown JSON-RPC fields" {
+    const request = try Ipc.parseRequest(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"x\"},\"unexpected\":1}",
     );
+    defer request.deinit();
+
+    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqualStrings("x", request.value.message);
 }
 
 test "event JSON matches the schema" {
@@ -435,25 +477,29 @@ test "event JSON matches the schema" {
         var expected_buffer: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(
             &expected_buffer,
-            "{{\"event\":\"{s}\"}}",
-            .{case.name},
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"{s}\", \"id\": {d}}}",
+            .{ case.name, Ipc.event_request_id },
         );
         try std.testing.expectEqualStrings(expected, text);
 
         const parsed = try Ipc.parseEvent(std.testing.allocator, text);
         defer parsed.deinit();
         try std.testing.expectEqual(case.event, parsed.value.event);
+        try std.testing.expect(parsed.id().eql(Ipc.event_request_id));
     }
 }
 
 test "event schema rejects an unknown callback" {
     try std.testing.expectError(
-        error.InvalidEnumTag,
-        Ipc.parseEvent(std.testing.allocator, "{\"event\": \"bogus\"}"),
+        error.UnknownMethod,
+        Ipc.parseEvent(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":1}",
+        ),
     );
 }
 
-test "manager answers every Entrypoint event with the stderr schema" {
+test "manager answers every Entrypoint event with a JSON-RPC result" {
     var child = try forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
@@ -471,9 +517,11 @@ test "manager answers every Entrypoint event with the stderr schema" {
         const frame = try Ipc.readFrame(child.socket);
         try std.testing.expect(frame.received);
 
-        const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
-        defer request.deinit();
-        try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+        var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+        defer response.deinit();
+        const rpc_response = try response.value();
+        try std.testing.expect(!rpc_response.hasErr());
+        try std.testing.expect(rpc_response.id.eql(Ipc.event_request_id));
 
         var expected_buffer: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(
@@ -481,7 +529,7 @@ test "manager answers every Entrypoint event with the stderr schema" {
             "Event is {s}",
             .{case.name},
         );
-        try std.testing.expectEqualStrings(expected, request.value.message);
+        try std.testing.expectEqualStrings(expected, rpc_response.result.string);
     }
 }
 
@@ -489,14 +537,23 @@ test "manager answers an unknown event instead of stalling" {
     var child = try forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
-    try Ipc.writeFrame(child.socket, "{\"event\":\"bogus\"}");
+    try Ipc.writeFrame(
+        child.socket,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":3}",
+    );
 
     const frame = try Ipc.readFrame(child.socket);
-    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
-    defer request.deinit();
+    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+    defer response.deinit();
+    const rpc_response = try response.value();
 
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
-    try std.testing.expectEqualStrings("Event is invalid", request.value.message);
+    try std.testing.expect(rpc_response.hasErr());
+    try std.testing.expect(rpc_response.id.eql(3));
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(zjr.ErrorCode.MethodNotFound)),
+        rpc_response.err().code,
+    );
+    try std.testing.expectEqualStrings("Event is invalid", rpc_response.err().message);
 }
 
 fn load(
