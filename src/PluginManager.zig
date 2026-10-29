@@ -4,6 +4,7 @@ const toml = @import("toml");
 const abi = @import("root.zig").abi;
 const Log = @import("root.zig").Log;
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
+const zlua = @import("zlua");
 
 /// Plugin directory relative to the process working directory.
 /// If srcds is launched from the server root, this usually starts with "tf/".
@@ -41,14 +42,32 @@ pub const Plugin = struct {
     active: bool = false,
 };
 
+/// One Lua script loaded directly by the manager.
+///
+/// A script is discovered as `main.lua` inside a plugin directory. It runs in
+/// its own `zlua` state, registers callbacks through `zostd.on`, and is called
+/// directly by the manager on the existing IPC events. This is the prototype
+/// path for ZLua; it does not use the native `.so` plugin ABI.
+pub const LuaScript = struct {
+    /// Plugin id shown to the script through `zostd.plugin_id()`.
+    /// Owned by the manager.
+    plugin_id: []const u8,
+    /// Root directory used by `plugin://` file access. Owned by the manager.
+    root: []const u8,
+    /// Script path used in error messages. Owned by the manager.
+    path: []const u8,
+    /// Independent Lua state for this script.
+    runtime: zlua.runtime.Runtime,
+};
+
 /// Minimal plugin manager.
 /// readConfig() returns parsed manifests owned by the manager. The returned
 /// data remains valid until the next readConfig() call or deinit().
 ///
-/// Independently of manifests, loadPlugins() discovers plugin libraries
-/// (see plugins_directory and Plugin), caches them and calls each plugin's
-/// load(); unloadAll() reverses that for every plugin that became active,
-/// then releases the cache. Plugins only ever talk to the host through
+/// Independently of manifests, loadPlugins() discovers each directory's
+/// `main.lua` (see LuaScript) and its plugin libraries (see plugins_directory
+/// and Plugin), caches them and calls each plugin's load(); unloadAll()
+/// reverses that for every plugin that became active, then releases the cache. Plugins only ever talk to the host through
 /// src/PluginContext.zig, so no plugin-defined code needs direct links into the
 /// process. A plugin is skipped (with a log line through the logger) when
 /// its directory cannot be opened, dlopen() fails or an export is missing.
@@ -68,6 +87,10 @@ pub const Manager = struct {
     /// released by unloadAll().
     plugins: std.ArrayList(Plugin) = .empty,
 
+    /// Lua scripts loaded directly by the manager: filled by loadPlugins(),
+    /// emptied and released by unloadAll().
+    lua_scripts: std.ArrayList(LuaScript) = .empty,
+
     pub fn init() @This() {
         return .{};
     }
@@ -78,6 +101,8 @@ pub const Manager = struct {
     pub fn deinit(self: *@This()) void {
         self.unloadAll();
         self.plugins.deinit(self.allocator);
+        self.lua_scripts.deinit(self.allocator);
+        if (event_manager == self) event_manager = null;
         self.clearManifestResult();
     }
 
@@ -204,17 +229,20 @@ pub const Manager = struct {
         return .{ .logger = if (self.logger) |*logger| logger else null };
     }
 
-    /// Iterates the directories inside plugins_directory, opens every .so
-    /// file directly inside them, looks up the plugin ABI's load()/unload()
+    /// Iterates the directories inside plugins_directory, loads each
+    /// directory's `main.lua` into its own ZLua runtime, opens every .so file
+    /// directly inside them, looks up the plugin ABI's load()/unload()
     /// exports (src/PluginContext.zig), adds the library into the cache and
-    /// calls its load(). Sketchy entities are skipped with a log line
-    /// instead of aborting the whole scan; everything cached until then is
-    /// unloaded on the way out if a fatal error aborts the scan.
+    /// calls its load(). Lua scripts do not require a manifest; native
+    /// plugins still do. Sketchy entities are skipped with a log line instead
+    /// of aborting the whole scan; everything cached until then is unloaded on
+    /// the way out if a fatal error aborts the scan.
     pub fn loadPlugins(self: *@This()) !void {
-        if (self.plugins.items.len != 0) {
+        if (self.plugins.items.len != 0 or self.lua_scripts.items.len != 0) {
             return error.AlreadyLoaded;
         }
 
+        event_manager = self;
         errdefer self.unloadAll();
 
         // Plugin configurations parsed from each plugin directory's
@@ -242,6 +270,11 @@ pub const Manager = struct {
             };
             defer plugin_dir.close(io);
 
+            // Lua scripts are independent of the native plugin ABI and do
+            // not need a manifest. A directory may contain both a script and
+            // managed .so plugins.
+            self.loadLuaScript(dir.name);
+
             // Plugins that carry a manifest.toml are managed: parse the
             // manifest and remember its configuration. A directory without
             // a readable manifest stays unmanaged and is only picked up
@@ -249,7 +282,7 @@ pub const Manager = struct {
             const manifest_name = "manifest.toml";
 
             const manifest_toml = plugin_dir.readFileAlloc(io, manifest_name, self.allocator, .unlimited) catch {
-                Log.logLine("[Zorcerer] Failed to load manifest for {s}, skipping.\n", .{dir.name});
+                Log.logLine("[Zorcerer] Failed to load manifest for {s}, skipping native plugins.\n", .{dir.name});
                 continue;
             };
             defer self.allocator.free(manifest_toml);
@@ -324,9 +357,11 @@ pub const Manager = struct {
         plugin.active = true;
     }
 
-    /// Runs everyone's unload() in reverse discovery order (last loaded
-    /// unloads first), dlcloses every cached library and releases the
-    /// cache. loadPlugins() can be used again afterwards.
+    /// Runs every active native plugin's unload() in reverse discovery order
+    /// (last loaded unloads first), dlcloses every cached library and releases
+    /// the cache. Lua scripts are notified with `on_unload` in reverse load
+    /// order, then their runtimes and owned strings are released.
+    /// loadPlugins() can be used again afterwards.
     pub fn unloadAll(self: *@This()) void {
         const host = self.hostApi();
 
@@ -348,8 +383,176 @@ pub const Manager = struct {
         }
 
         self.plugins.clearRetainingCapacity();
+
+        var remaining_scripts = self.lua_scripts.items.len;
+        while (remaining_scripts > 0) {
+            remaining_scripts -= 1;
+            const script = &self.lua_scripts.items[remaining_scripts];
+
+            script.runtime.dispatchEvent("on_unload", null);
+            script.runtime.deinit();
+            self.allocator.free(script.plugin_id);
+            self.allocator.free(script.root);
+            self.allocator.free(script.path);
+        }
+
+        self.lua_scripts.clearRetainingCapacity();
+    }
+
+    /// Loads `<plugins_directory>/<dir_name>/main.lua` into its own runtime.
+    ///
+    /// A missing script leaves the manager unchanged. Read, compile, and
+    /// runtime failures are logged and the partially initialized state is
+    /// released, matching how invalid native plugins are skipped. On success,
+    /// the script receives the `on_load` event and is retained until
+    /// `unloadAll()`.
+    fn loadLuaScript(self: *@This(), dir_name: []const u8) void {
+        const io = self.threaded_io.io();
+
+        const script_path = std.Io.Dir.path.join(
+            self.allocator,
+            &.{ plugins_directory, dir_name, "main.lua" },
+        ) catch |err| {
+            Log.logLine(
+                "[zlua] {s}/{s}/main.lua: path join failed ({s}), script skipped\n",
+                .{ plugins_directory, dir_name, @errorName(err) },
+            );
+            return;
+        };
+        var keep_path = false;
+        defer if (!keep_path) self.allocator.free(script_path);
+
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            script_path,
+            self.allocator,
+            .unlimited,
+        ) catch |err| {
+            if (err != error.FileNotFound) {
+                Log.logLine(
+                    "[zlua] {s}: read failed ({s}), script skipped\n",
+                    .{ script_path, @errorName(err) },
+                );
+            }
+            return;
+        };
+        defer self.allocator.free(source);
+
+        const plugin_id = self.allocator.dupe(u8, dir_name) catch |err| {
+            Log.logLine(
+                "[zlua] {s}: could not duplicate plugin id ({s}), script skipped\n",
+                .{ script_path, @errorName(err) },
+            );
+            return;
+        };
+        var keep_plugin_id = false;
+        defer if (!keep_plugin_id) self.allocator.free(plugin_id);
+
+        const root = std.Io.Dir.path.join(
+            self.allocator,
+            &.{ plugins_directory, dir_name },
+        ) catch |err| {
+            Log.logLine(
+                "[zlua] {s}: could not build plugin root ({s}), script skipped\n",
+                .{ script_path, @errorName(err) },
+            );
+            return;
+        };
+        var keep_root = false;
+        defer if (!keep_root) self.allocator.free(root);
+
+        var runtime = zlua.runtime.Runtime.init(self.allocator) catch |err| {
+            Log.logLine(
+                "[zlua] {s}: could not create Lua state ({s}), script skipped\n",
+                .{ script_path, @errorName(err) },
+            );
+            return;
+        };
+        var runtime_alive = true;
+        defer if (runtime_alive) runtime.deinit();
+
+        // The runtime borrows these slices, so they must outlive it. They are
+        // moved into the manager's LuaScript entry on success.
+        runtime.setPluginId(plugin_id);
+        runtime.setPluginRoot(root);
+        runtime.setHost(.{ .context = self, .log = luaLog });
+        runtime.openSafeLibs();
+        runtime.installZostd();
+
+        var chunk_name_buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+        const chunk_name = std.fmt.bufPrintZ(
+            &chunk_name_buffer,
+            "@{s}",
+            .{script_path},
+        ) catch {
+            Log.logLine(
+                "[zlua] {s}: path is too long for a Lua chunk name, script skipped\n",
+                .{script_path},
+            );
+            return;
+        };
+
+        runtime.run(source, chunk_name) catch |err| {
+            const message = runtime.lua.toString(-1) catch "<non-string error>";
+            Log.logLine(
+                "[zlua] {s}: {s}: {s}\n",
+                .{ script_path, @errorName(err), std.mem.span(message) },
+            );
+            return;
+        };
+
+        self.lua_scripts.append(self.allocator, .{
+            .plugin_id = plugin_id,
+            .root = root,
+            .path = script_path,
+            .runtime = runtime,
+        }) catch |err| {
+            Log.logLine(
+                "[zlua] {s}: could not retain script ({s}), script skipped\n",
+                .{ script_path, @errorName(err) },
+            );
+            return;
+        };
+
+        keep_path = true;
+        keep_plugin_id = true;
+        keep_root = true;
+        runtime_alive = false;
+
+        const script = &self.lua_scripts.items[self.lua_scripts.items.len - 1];
+        Log.logLine("[zlua] loaded {s} as {s}\n", .{ script_path, plugin_id });
+        script.runtime.dispatchEvent("on_load", null);
+    }
+
+    /// Delivers one manager event to every loaded Lua script.
+    ///
+    /// `event` is the `Ipc.Event` method name, for example `"pause"`. Runtime
+    /// dispatch isolates and logs callback failures, so one script cannot stop
+    /// delivery to the rest.
+    pub fn dispatchEvent(self: *@This(), event: []const u8) void {
+        for (self.lua_scripts.items) |*script| {
+            script.runtime.dispatchEvent(event, null);
+        }
     }
 };
+
+/// Manager whose Lua scripts receive IPC events.
+///
+/// `loadPlugins()` sets this to the manager that owns the loaded scripts and
+/// `deinit()` clears it. The listener is a free function without a manager
+/// parameter, so it reaches the manager through this process-global pointer.
+/// The manager is single-threaded and lives in the forked child for the whole
+/// lifetime of the listener.
+var event_manager: ?*Manager = null;
+
+/// Forwards one `zostd.log()` message from a Lua script to the manager's log.
+///
+/// `context` is the owning manager; the log sink itself is process-global
+/// (see src/io/Log.zig), so the context is not used.
+fn luaLog(context: ?*anyopaque, message: []const u8) void {
+    _ = context;
+    Log.logLine("[zlua] {s}\n", .{message});
+}
 
 /// Serves the Entrypoint's callback events on the manager's end of the IPC
 /// channel until the Entrypoint closes it.
@@ -360,8 +563,9 @@ pub const Manager = struct {
 ///
 /// Each received frame must carry a JSON-RPC request whose method is one of
 /// `Ipc.Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
-/// "id":1}`. Every request carrying an ID is answered with exactly one
-/// JSON-RPC result or error response carrying that ID, so the Entrypoint's
+/// "id":1}`. Every valid event is delivered to the loaded Lua scripts before
+/// any response is sent. Every request carrying an ID is answered with exactly
+/// one JSON-RPC result or error response carrying that ID, so the Entrypoint's
 /// synchronous event exchange never waits for a reply that will not come.
 /// Notifications (requests without an ID) are served without a response,
 /// as JSON-RPC requires. A message that cannot be decoded is answered with a
@@ -405,6 +609,10 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
             continue;
         };
         defer parsed.deinit();
+
+        if (event_manager) |manager| {
+            manager.dispatchEvent(@tagName(parsed.value.event));
+        }
 
         const request_id = parsed.id();
         if (request_id.isNotification()) continue;

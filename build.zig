@@ -2,6 +2,7 @@ const std = @import("std");
 
 const index_analyzer = @import("build/build_index_analyzer.zig");
 const DataAdapter = @import("build/analyzers/AnalyzerDataAdapter.zig");
+const luajit_build = @import("build/luajit.zig");
 
 /// Describes one compiled example plugin that is installed as its own
 /// directory under `zig-out/lib/plugins/`.
@@ -137,12 +138,37 @@ pub fn build(b: *std.Build) !void {
         .pic = true,
     });
 
+    const luajit_support = try luajit_build.addLuaJit(b, target, optimize);
+
     const luajit = b.addModule("luajit", .{
         .root_source_file = b.path("extern/zig-luajit/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
+    luajit.addImport("c", luajit_support.c_module);
+
+    // Zig-facing `zostd` standard library types. The module indirection is
+    // needed because `src/zlua` may not import files outside its own module
+    // root, and the plugin manager uses the same declarations.
+    const zostd = b.addModule("zostd", .{
+        .root_source_file = b.path("src/zostd/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
+    // LuaJIT runtime (src/zlua). The plugin manager creates one runtime per
+    // loaded Lua script; the module is also tested directly.
+    const zlua = b.addModule("zlua", .{
+        .root_source_file = b.path("src/zlua/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .link_libc = true,
+    });
+    zlua.addImport("luajit", luajit);
+    zlua.addImport("zostd", zostd);
 
     // Configuration of a single plugin's TOML manifest
     // (src/PluginConfiguration.zig), later shared between the manager and
@@ -186,6 +212,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .pic = true,
+            .link_libc = true,
         }),
     });
 
@@ -194,6 +221,11 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("plugin-configuration", plugin_configuration);
     zorcerer.root_module.addImport("zjr", zjr);
     zorcerer.root_module.addImport("luajit", luajit);
+    zorcerer.root_module.addImport("zlua", zlua);
+    zorcerer.root_module.linkLibrary(luajit_support.library);
+    zorcerer.root_module.linkSystemLibrary("m", .{});
+    zorcerer.root_module.linkSystemLibrary("dl", .{});
+    zorcerer.root_module.linkSystemLibrary("gcc_s", .{});
     zorcerer.out_filename = "zorcerer.so";
 
     // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed
@@ -228,6 +260,13 @@ pub fn build(b: *std.Build) !void {
         .name = "plugin-configuration-tests",
         .root_module = plugin_configuration,
     });
+    const zlua_tests = b.addTest(.{
+        .name = "zlua-tests",
+        .root_module = zlua,
+    });
+    zlua_tests.root_module.linkLibrary(luajit_support.library);
+    zlua_tests.root_module.linkSystemLibrary("m", .{});
+    zlua_tests.root_module.linkSystemLibrary("dl", .{});
 
     const compile_modules_step = b.step(
         "compile-modules",
@@ -239,6 +278,7 @@ pub fn build(b: *std.Build) !void {
     compile_modules_step.dependOn(&hooks_tests.step);
     compile_modules_step.dependOn(&toml_tests.step);
     compile_modules_step.dependOn(&plugin_configuration_tests.step);
+    compile_modules_step.dependOn(&zlua_tests.step);
     compile_modules_step.dependOn(&hello_plugin.step);
 
     const run_zorcerer_tests = b.addRunArtifact(zorcerer_tests);
@@ -253,6 +293,12 @@ pub fn build(b: *std.Build) !void {
     const run_plugin_configuration_tests = b.addRunArtifact(plugin_configuration_tests);
     run_plugin_configuration_tests.step.dependOn(compile_modules_step);
 
+    const run_zlua_tests = b.addRunArtifact(zlua_tests);
+    run_zlua_tests.step.dependOn(compile_modules_step);
+
+    const zlua_tests_step = b.step("zlua-tests", "Run the ZLua LuaJIT runtime tests");
+    zlua_tests_step.dependOn(&run_zlua_tests.step);
+
     const tests_step = b.step("tests", "Run tests for all project modules");
     // TODO: Find out why this causes tests failure
     // tests_step.dependOn(&run_zorcerer_tests.step);
@@ -262,6 +308,7 @@ pub fn build(b: *std.Build) !void {
     // tests_step.dependOn(&run_toml_tests.step);
 
     tests_step.dependOn(&run_plugin_configuration_tests.step);
+    tests_step.dependOn(&run_zlua_tests.step);
 
     const should_skip_analyze = b.option(
         bool,
