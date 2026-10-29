@@ -84,6 +84,7 @@ const Indexes = @import("codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
 const Log = @import("root.zig").Log;
 const abi = @import("root.zig").abi;
+const fork = @import("ForkProcess.zig");
 
 // Include Ipc.zig's in-process JSON-RPC tests in this module's test build.
 test {
@@ -137,7 +138,7 @@ var engine: ?*anyopaque = null;
 var plugin_manager = Manager.Manager.init();
 
 /// The forked plugin-manager process, or null while none runs.
-var manager_child: ?ForkedChild = null;
+var manager_child: ?fork.ForkedChild = null;
 
 /// Pulls the engine's Source SDK console logging function out of a live
 /// IVEngineServer instance. `engine_interface` is the interface pointer
@@ -182,125 +183,6 @@ test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
     try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
 }
 
-/// Waits for `pid` to exit and verifies a successful exit status.
-///
-/// Retries interrupted waits. Returns `error.WaitFailed` when the wait itself
-/// fails and `error.ChildFailed` when the child exited abnormally or with a
-/// non-zero status.
-fn waitForChild(pid: std.os.linux.pid_t) !void {
-    var status: u32 = undefined;
-    while (true) {
-        const rc = std.os.linux.waitpid(pid, &status, 0);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {
-                if (!std.os.linux.W.IFEXITED(status) or
-                    std.os.linux.W.EXITSTATUS(status) != 0)
-                {
-                    return error.ChildFailed;
-                }
-                return;
-            },
-            .INTR => continue,
-            else => return error.WaitFailed,
-        }
-    }
-}
-
-/// Entry point of a forked child. `fd` is the child's end of the IPC socket
-/// pair; the parent holds the other end.
-///
-/// Returning from a child entry point is allowed: `forkChild` exits the child
-/// process afterwards, so the child never returns into the parent's stack.
-pub const ChildMain = *const fn (fd: std.os.linux.fd_t) void;
-
-/// A forked child plus the parent's end of the IPC socket pair.
-pub const ForkedChild = struct {
-    /// Process id of the child.
-    pid: std.os.linux.pid_t,
-    /// Parent's end of the socket pair; see `close`.
-    socket: std.os.linux.fd_t,
-    /// Whether `socket` is still open; keeps `close` idempotent.
-    socket_open: bool = true,
-
-    /// Closes the parent's end of the socket pair, if still open.
-    ///
-    /// Closing is also how the parent asks a long-lived child to shut down:
-    /// the child's read returns EOF and it exits.
-    pub fn close(self: *ForkedChild) void {
-        if (!self.socket_open) return;
-        _ = std.os.linux.close(self.socket);
-        self.socket_open = false;
-    }
-
-    /// Waits for the child to exit and verifies a zero exit status.
-    ///
-    /// Does not close `socket`. Use `finish` for the usual shutdown order.
-    pub fn wait(self: ForkedChild) !void {
-        try waitForChild(self.pid);
-    }
-
-    /// Closes the socket (signalling shutdown) and waits for the child.
-    ///
-    /// The socket is closed even when waiting fails.
-    ///
-    /// Errors: see `wait`.
-    pub fn finish(self: *ForkedChild) !void {
-        self.close();
-        try waitForChild(self.pid);
-    }
-};
-
-/// Forks a child that runs `child_main` and returns the parent's handle to it.
-///
-/// The parent creates a connected `AF_UNIX`/`SOCK_STREAM` pair before forking;
-/// the child gets one end, the parent keeps the other in the returned handle.
-/// The child exits once `child_main` returns, so a child that should stay alive
-/// must block in `child_main`.
-///
-/// Errors: `error.SocketPairFailed`, `error.ForkUnsupported`, and
-/// `error.ForkFailed`. No child exists when one of these is returned.
-pub fn forkChild(child_main: ChildMain) !ForkedChild {
-    var fds: [2]std.os.linux.fd_t = undefined;
-    switch (std.os.linux.errno(std.os.linux.socketpair(
-        std.os.linux.AF.UNIX,
-        std.os.linux.SOCK.STREAM,
-        0,
-        &fds,
-    ))) {
-        .SUCCESS => {},
-        else => return error.SocketPairFailed,
-    }
-
-    const fork_result = std.os.linux.fork();
-    switch (std.os.linux.errno(fork_result)) {
-        .SUCCESS => {},
-        .NOSYS => {
-            _ = std.os.linux.close(fds[0]);
-            _ = std.os.linux.close(fds[1]);
-            return error.ForkUnsupported;
-        },
-        else => {
-            _ = std.os.linux.close(fds[0]);
-            _ = std.os.linux.close(fds[1]);
-            return error.ForkFailed;
-        },
-    }
-
-    const pid: std.os.linux.pid_t = @intCast(fork_result);
-    if (pid == 0) {
-        _ = std.os.linux.close(fds[0]);
-        child_main(fds[1]);
-        _ = std.os.linux.close(fds[1]);
-        std.os.linux.exit_group(0);
-    }
-
-    _ = std.os.linux.close(fds[1]);
-    return .{ .pid = pid, .socket = fds[0] };
-}
-
-/// Message the plugin-manager child reports once it has loaded its plugins.
-const manager_ready_message = "Hello from fork";
-
 /// What the listener should do after executing one operation notification.
 const RequestOutcome = enum {
     /// Keep serving the channel.
@@ -322,7 +204,7 @@ fn handleRequest(request: Ipc.Request) !RequestOutcome {
             return .continue_listening;
         },
         .ready => {
-            if (std.mem.eql(u8, request.message, manager_ready_message)) {
+            if (std.mem.eql(u8, request.message, fork.manager_ready_message)) {
                 return .ready;
             }
             Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{request.message});
@@ -441,7 +323,7 @@ fn pluginManagerChild(fd: std.os.linux.fd_t) void {
                 .{@errorName(err)},
             ) catch "plugin loading failed";
         };
-        break :load manager_ready_message;
+        break :load fork.manager_ready_message;
     };
 
     Ipc.sendReady(fd, message) catch {};
@@ -452,7 +334,7 @@ fn pluginManagerChild(fd: std.os.linux.fd_t) void {
 /// Child used by the IPC tests: sends the same readiness message the
 /// plugin-manager child sends once it is ready.
 fn testReportChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendReady(fd, manager_ready_message) catch {};
+    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
 }
 
 /// Child used by the logging test: forwards a plugin print over IPC.
@@ -462,7 +344,7 @@ fn testLogChild(fd: std.os.linux.fd_t) void {
 }
 
 test "child logging is sent over IPC" {
-    var child = try forkChild(testLogChild);
+    var child = try fork.forkChild(testLogChild);
     defer child.finish() catch {};
 
     const frame = try Ipc.readFrame(child.socket);
@@ -475,7 +357,7 @@ test "child logging is sent over IPC" {
 }
 
 test "forked child reports that it initialized" {
-    var child = try forkChild(testReportChild);
+    var child = try fork.forkChild(testReportChild);
     defer child.finish() catch {};
 
     const frame = try Ipc.readFrame(child.socket);
@@ -483,7 +365,7 @@ test "forked child reports that it initialized" {
 }
 
 test "parent receives a JSON message from the child" {
-    var child = try forkChild(testReportChild);
+    var child = try fork.forkChild(testReportChild);
     defer child.finish() catch {};
 
     const frame = try Ipc.readFrame(child.socket);
@@ -492,12 +374,12 @@ test "parent receives a JSON message from the child" {
     const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
     defer request.deinit();
     try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
-    try std.testing.expectEqualStrings(manager_ready_message, request.value.message);
+    try std.testing.expectEqualStrings(fork.manager_ready_message, request.value.message);
     try std.testing.expect(request.id().isNone());
 }
 
 test "child payload matches the serialized request" {
-    var child = try forkChild(testReportChild);
+    var child = try fork.forkChild(testReportChild);
     defer child.finish() catch {};
 
     const frame = try Ipc.readFrame(child.socket);
@@ -531,7 +413,7 @@ test "listener schema decodes the stderr operation" {
 test "successful readiness is accepted" {
     try std.testing.expectEqual(
         RequestOutcome.ready,
-        try handleRequest(.{ .operation = .ready, .message = manager_ready_message }),
+        try handleRequest(.{ .operation = .ready, .message = fork.manager_ready_message }),
     );
 }
 
@@ -617,7 +499,7 @@ test "event schema rejects an unknown callback" {
 }
 
 test "manager answers every Entrypoint event with a JSON-RPC result" {
-    var child = try forkChild(Manager.listenForEvents);
+    var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
     const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
@@ -651,7 +533,7 @@ test "manager answers every Entrypoint event with a JSON-RPC result" {
 }
 
 test "manager ignores event notifications" {
-    var child = try forkChild(Manager.listenForEvents);
+    var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
     // Neither a valid event notification nor an invalid one may produce a
@@ -672,7 +554,7 @@ test "manager ignores event notifications" {
 }
 
 test "manager answers an unknown event instead of stalling" {
-    var child = try forkChild(Manager.listenForEvents);
+    var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
     try Ipc.writeFrame(
@@ -763,7 +645,7 @@ fn load(
         return false;
     }
 
-    manager_child = forkChild(pluginManagerChild) catch |err| {
+    manager_child = fork.forkChild(pluginManagerChild) catch |err| {
         Log.logLine("[MyLoader] forking the plugin manager failed: {s}\n", .{@errorName(err)});
         return false;
     };
