@@ -15,3 +15,6 @@
 [submodule "extern/zigjr"]
 	path = extern/zigjr
 	url = https://github.com/zorisman/zigjr.git
+[submodule "extern/LuaJIT"]
+	path = extern/LuaJIT
+	url = https://github.com/LuaJIT/LuaJIT.git
