@@ -169,20 +169,20 @@ pub fn setZorcererRoot(path: []const u8) void {
 ///   filesystem (`.scheme == .game`).
 /// - `"plugin://<tail>"` resolves `<tail>` against the calling plugin's
 ///   root directory, which is derived from the directory component of
-///   `ctx.config.lib_path` underneath the configured Zorcerer root (see
+///   `ctx.config.path` underneath the configured Zorcerer root (see
 ///   `setZorcererRoot`); read and write, no execute, routed to `std.Io`
 ///   (`.scheme == .plugin`).
 /// - Any other URI format is not a supported scheme.
 ///
 /// Parameters:
-/// - `ctx`: the query's plugin context; `config.lib_path` determines the
+/// - `ctx`: the query's plugin context; `config.path` determines the
 ///   plugin root for `plugin://` URIs.
 /// - `path`: the raw URI as forwarded by a plugin.
 ///
 /// Returns the validated `ZorcererPath`, or:
 /// - `error.OperationNotAllowed` if the URI does not start with a supported
 ///   scheme prefix, if a URI tail contains a `..` path component (parent
-///   traversal), or if the plugin's `lib_path` does not contain a directory
+///   traversal), or if the plugin's `path` does not contain a directory
 ///   component (so no plugin root can be derived).
 /// - `error.RootNotConfigured` if the requested scheme's root directory has
 ///   not been configured yet.
@@ -210,7 +210,7 @@ pub fn parsePath(ctx: *PluginContext, path: []const u8) !ZorcererPath {
     // read/write only.
     if (std.mem.startsWith(u8, path, plugin_scheme)) {
         const root = zorcerer_root orelse return error.RootNotConfigured;
-        const lib_directory = std.Io.Dir.path.dirname(ctx.config.lib_path) orelse
+        const lib_directory = std.Io.Dir.path.dirname(ctx.config.path) orelse
             return error.OperationNotAllowed;
         return ZorcererPath{
             .absolute_path = try joinRelativeParts(alloc, root, &.{
@@ -1540,11 +1540,11 @@ const test_io = std.testing.io;
 fn mockContext() PluginContext {
     return PluginContext{
         .config = PluginConfiguration{
-            .plugin_id = "hello",
+            .id = "hello",
             .name = "Hello Example",
             .version = "0.1.0",
             .author = "Zorcerer",
-            .lib_path = "plugins/hello/hello_plugin.so",
+            .path = "plugins/hello/hello_plugin.so",
         },
     };
 }

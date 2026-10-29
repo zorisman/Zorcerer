@@ -63,11 +63,11 @@ const materials_uri = "game://materials";
 fn pluginContext() filesystem.PluginContext {
     return .{
         .config = .{
-            .plugin_id = "hello",
+            .id = "hello",
             .name = "Hello Example",
             .version = "0.1.0",
             .author = "Zorcerer",
-            .lib_path = "plugins/hello/hello_plugin.so",
+            .path = "plugins/hello/hello_plugin.so",
         },
     };
 }

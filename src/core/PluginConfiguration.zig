@@ -27,16 +27,16 @@ pub const PluginConfiguration = struct {
     /// that carries a key not listed here is rejected with
     /// `error.KeysNotImplemented`.
     pub const known_keys: []const []const u8 = &.{
-        "plugin_id",
+        "id",
         "name",
         "version",
         "author",
-        "lib_path",
+        "path",
     };
 
     /// Unique identifier of the plugin, also the name of the directory the
     /// plugin is loaded from.
-    plugin_id: []const u8,
+    id: []const u8,
     /// Human-readable display name of the plugin.
     name: []const u8,
     /// Version string of the plugin in the author's chosen format.
@@ -44,7 +44,7 @@ pub const PluginConfiguration = struct {
     /// Author string of the plugin, in the author's chosen format.
     author: []const u8,
     /// Path to the plugin's `.so` library, relative to the plugin directory.
-    lib_path: []const u8,
+    path: []const u8,
 
     /// Parses the raw TOML text of a plugin manifest into a
     /// `PluginConfiguration`.
@@ -179,21 +179,21 @@ pub fn readToml(comptime T: type, raw_toml: []const u8, node: ?[]const u8) !T {
 
 test "parseConfig parses fully correct TOML" {
     const config = try PluginConfiguration.parseConfig(
-        \\plugin_id = "hello"
+        \\id = "hello"
         \\name = "Hello Example"
         \\version = "0.1.0"
         \\author = "Zorcerer"
-        \\lib_path = "plugins/hello/hello_plugin.so"
+        \\path = "plugins/hello/hello_plugin.so"
         \\
         \\# Both comments and blank lines are fine.
         \\# All exactly five keys must be present.
     );
 
-    try std.testing.expectEqualStrings("hello", config.plugin_id);
+    try std.testing.expectEqualStrings("hello", config.id);
     try std.testing.expectEqualStrings("Hello Example", config.name);
     try std.testing.expectEqualStrings("0.1.0", config.version);
     try std.testing.expectEqualStrings("Zorcerer", config.author);
-    try std.testing.expectEqualStrings("plugins/hello/hello_plugin.so", config.lib_path);
+    try std.testing.expectEqualStrings("plugins/hello/hello_plugin.so", config.path);
 }
 
 test "parseConfig fails on partially implemented keys" {
@@ -208,7 +208,7 @@ test "parseConfig fails on partially implemented keys" {
     // `plugin_id` and `name` are implemented, but `compression` is not a
     // field of `PluginConfiguration`.
     const source =
-        \\plugin_id = "hello"
+        \\id = "hello"
         \\name = "Hello Example"
         \\compression = "nope"
     ;
@@ -219,11 +219,11 @@ test "parseConfig fails on wrong value types" {
     // `version` and `author` are implemented keys, but carry values that are
     // not TOML strings.
     const source =
-        \\plugin_id = "hello"
+        \\id = "hello"
         \\name = "Hello Example"
         \\version = 1
         \\author = true
-        \\lib_path = "plugins/hello/hello_plugin.so"
+        \\path = "plugins/hello/hello_plugin.so"
     ;
     try std.testing.expectError(error.WrongValueType, PluginConfiguration.parseConfig(source));
 }
