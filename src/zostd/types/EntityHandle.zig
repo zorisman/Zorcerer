@@ -34,10 +34,11 @@ pub const EntityHandle = extern struct {
     ///
     /// `index` is the raw 16-bit field, not an `EdictIndex`; the caller is
     /// responsible for passing an index that is valid for the producer.
-    /// `serial` is stored unchanged in the high 16 bits. This function does not
-    /// check liveness and does not reject the invalid sentinel encoding.
-    pub fn fromParts(index: u16, serial: u16) EntityHandle {
-        return .{ .bits = @as(u32, index) | (@as(u32, serial) << serial_shift) };
+    /// `serial_number` is stored unchanged in the high 16 bits. This function
+    /// does not check liveness and does not reject the invalid sentinel
+    /// encoding.
+    pub fn fromParts(index: u16, serial_number: u16) EntityHandle {
+        return .{ .bits = @as(u32, index) | (@as(u32, serial_number) << serial_shift) };
     }
 
     /// Returns whether the value is not the invalid sentinel.
