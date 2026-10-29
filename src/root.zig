@@ -12,6 +12,8 @@ pub const abi = @import("PluginContext.zig");
 /// messages (src/io/Log.zig).
 pub const Log = @import("io/Log.zig");
 
+pub const Ipc = @import("Ipc.zig");
+
 // Compile-checks and unit-tests src/analyzers/VTableResolver.zig. Nothing
 // in production code references the resolver yet, so this branch of the
 // import graph is the only thing keeping it under the build's purview; it
