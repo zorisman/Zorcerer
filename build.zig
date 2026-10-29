@@ -105,6 +105,17 @@ fn analyzerIsUpToDate(io: std.Io, analyzer_path: []const u8) !bool {
     return true;
 }
 
+fn rawDataChanged(io: std.Io, toml_path: []const u8, indexes_path: []const u8) !bool {
+    const toml_file = try std.Io.Dir.openFileAbsolute(io, toml_path, .{});
+    const index_file = std.Io.Dir.openFileAbsolute(io, indexes_path, .{}) catch return true;
+
+    const toml_stat = try toml_file.stat(io);
+    const index_stat = try index_file.stat(io);
+
+    if (toml_stat.mtime.toMilliseconds() > index_stat.mtime.toMilliseconds()) return true;
+    return false;
+}
+
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{
         .default_target = .{
@@ -316,7 +327,22 @@ pub fn build(b: *std.Build) !void {
         "Build and run the Clang-based index analyzer (requires system Clang/LLVM development packages)",
     ) orelse false;
 
-    if (!should_skip_analyze) {
+    const should_force_analyze = b.option(
+        bool,
+        "force-analyze",
+        "Run the index analyzer even if config/raw_data.toml has not changed",
+    ) orelse false;
+
+    if (should_skip_analyze and should_force_analyze) {
+        std.debug.panic("[Zorcerer] FATAL: Incompatabile arguments", .{});
+    }
+
+    const raw_data_path = b.path("config/raw_data.toml").getPath(b);
+    const index_output_path = b.path("src/codegen_generated/engine_indexes.zig").getPath(b);
+
+    const should_analyze = !should_skip_analyze and (should_force_analyze or try rawDataChanged(io, raw_data_path, index_output_path));
+
+    if (should_analyze) {
         index_analyzer.addIndexAnalyzer(b);
 
         const toml_path = b.path("config/raw_data.toml").getPath(b);
