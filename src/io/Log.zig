@@ -17,8 +17,8 @@
 //! IPC-backed sink to plugins through abi.Logger.
 
 const std = @import("std");
-const abi = @import("../PluginContext.zig");
-const Ipc = @import("../Ipc.zig");
+const abi = @import("../core/PluginContext.zig");
+const Ipc = @import("../core/Ipc.zig");
 
 /// The captured Source SDK logging sink: the engine context paired with
 /// its LogPrint entry, exactly as Logger describes it. Null until setup() or

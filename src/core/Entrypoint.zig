@@ -80,53 +80,22 @@ const std = @import("std");
 const zjr = @import("zjr");
 const Ipc = @import("Ipc.zig");
 const VTableHooks = @import("hooks").VTableHook;
-const Indexes = @import("codegen_generated/engine_indexes.zig");
+const Indexes = @import("../codegen_generated/engine_indexes.zig");
 const Manager = @import("PluginManager.zig");
 const Log = @import("root.zig").Log;
 const abi = @import("root.zig").abi;
 const fork = @import("ForkProcess.zig");
-
-// Include Ipc.zig's in-process JSON-RPC tests in this module's test build.
-test {
-    _ = @import("Ipc.zig");
-}
-
-pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
-
-const iface_ok: c_int = 0;
-const iface_failed: c_int = 1;
-
-/// Version strings this plugin answers to, newest first. All of them get
-/// the same vtable - the padding described above is what makes that safe.
-const plugin_interface_versions = [_][]const u8{
-    Indexes.interfaceversion_iserverplugincallbacks,
-    Indexes.interfaceversion_iserverplugincallbacks_version_2,
-    Indexes.interfaceversion_iserverplugincallbacks_version_1,
-};
-
-const Slot = ?*const anyopaque;
-
-/// IVEngineServer interface version strings the engine module might
-/// answer with, newest first. Both these strings and the LogPrint slot
-/// index that logPrintOf() consumes come from the same codegen module,
-/// so engine probing and index use agree on which engine build the slot
-/// layout was recorded for. Order: the current build answers with the
-/// exact string the codegen generated for, while older recognized builds
-/// surface only through the fallback constants.
-const engine_interface_versions = [_][]const u8{
-    Indexes.interfaceversion_vengineserver,
-    Indexes.interfaceversion_vengineserver_version_22,
-    Indexes.interfaceversion_vengineserver_version_21,
-};
+const JsonRpc = @import("JsonRpc.zig");
+const Vsp = @import("Vsp.zig");
 
 /// An IServerPluginCallbacks instance is just a vptr as far as the engine
 /// is concerned - no RTTI header to worry about, since nothing does
 /// dynamic_cast/typeid on a plugin interface the engine loaded generically.
 const PluginObject = extern struct {
-    vptr: [*]const Slot,
+    vptr: [*]const Vsp.Slot,
 };
 
-var plugin_instance = PluginObject{ .vptr = &vtable };
+var plugin_instance = PluginObject{ .vptr = undefined };
 var engine: ?*anyopaque = null;
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
@@ -139,160 +108,6 @@ var plugin_manager = Manager.Manager.init();
 
 /// The forked plugin-manager process, or null while none runs.
 var manager_child: ?fork.ForkedChild = null;
-
-/// Pulls the engine's Source SDK console logging function out of a live
-/// IVEngineServer instance. `engine_interface` is the interface pointer
-/// the engine module factory probe in load() resolved; zig-hooks reads
-/// the virtual method table behind it, the slot that
-/// codegen_generated/engine_indexes.zig records under
-/// `IVEngineServer.log_print` is selected, and its contents are
-/// reinterpreted as `abi.Logger.PrintFn` - the signature that matches
-/// the LogPrint ABI that index was produced for (this pointer first, then
-/// one zero-terminated line).
-/// Returns the print function, or null when the recorded slot holds no
-/// entry: the running engine then does not match the index layout that
-/// every hook installation further down load() relies on.
-fn logPrintOf(engine_interface: *anyopaque) ?abi.Logger.PrintFn {
-    const slot = VTableHooks.vtableOf(engine_interface)[Indexes.IVEngineServer.log_print];
-    return @ptrCast(slot orelse return null);
-}
-
-test "logPrintOf resolves the slot the codegen recorded for LogPrint" {
-    const fake_log_print: abi.Logger.PrintFn = struct {
-        fn print(context: *anyopaque, message: [*:0]const u8) callconv(.c) void {
-            _ = context;
-            _ = message;
-        }
-    }.print;
-
-    // A fake IVEngineServer-shaped object: the first member is the vtable
-    // pointer, and enough trailing slots exist to reach the recorded
-    // LogPrint index.
-    var slots = [_]Slot{null} ** (Indexes.IVEngineServer.log_print + 1);
-    slots[Indexes.IVEngineServer.log_print] = @ptrCast(fake_log_print);
-    var fake = extern struct { vptr: [*]const Slot }{ .vptr = &slots };
-
-    const resolved = logPrintOf(@ptrCast(&fake)).?;
-    try std.testing.expectEqual(@intFromPtr(fake_log_print), @intFromPtr(resolved));
-}
-
-test "logPrintOf reports a recorded-but-empty LogPrint slot as null" {
-    var slots = [_]Slot{null} ** (Indexes.IVEngineServer.log_print + 1);
-    var fake = extern struct { vptr: [*]const Slot }{ .vptr = &slots };
-
-    try std.testing.expect(logPrintOf(@ptrCast(&fake)) == null);
-}
-
-/// What the listener should do after executing one operation notification.
-const RequestOutcome = enum {
-    /// Keep serving the channel.
-    continue_listening,
-    /// The child reported successful readiness.
-    ready,
-};
-
-/// Executes one operation notification received from the plugin manager.
-///
-/// `.stderr` messages are forwarded to the parent's log sink. `.ready` with
-/// `manager_ready_message` reports success. Any other readiness text means the
-/// child could not load its plugins: it is logged as a startup failure and
-/// returned as `error.PluginLoadFailed`, so `load()` refuses the plugin set.
-fn handleRequest(request: Ipc.Request) !RequestOutcome {
-    switch (request.operation) {
-        .stderr => {
-            Log.logLine("{s}", .{request.message});
-            return .continue_listening;
-        },
-        .ready => {
-            if (std.mem.eql(u8, request.message, fork.manager_ready_message)) {
-                return .ready;
-            }
-            Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{request.message});
-            return error.PluginLoadFailed;
-        },
-    }
-}
-
-/// Executes one JSON-RPC response received from the plugin manager.
-///
-/// Error responses are printed as diagnostics instead of being treated as
-/// results; the engine callbacks have no way to report the failure.
-///
-/// Errors: `error.UnexpectedResultType` when a successful response does not
-/// carry the event text as a JSON string.
-fn handleResponse(response: zjr.RpcResponse) !void {
-    if (response.hasErr()) {
-        std.debug.print(
-            "JSON-RPC error {d}: {s}\n",
-            .{ response.err().code, response.err().message },
-        );
-        return;
-    }
-
-    switch (response.result) {
-        .string => |text| std.debug.print("{s}", .{text}),
-        else => return error.UnexpectedResultType,
-    }
-}
-
-/// Verifies that a response answers the request the listener is waiting for.
-///
-/// Errors: `error.UnexpectedResponseId` when no response is expected yet or
-/// when the response carries a different ID.
-fn validateResponseId(actual: zjr.RpcId, expected_response_id: ?i64) !void {
-    const expected = expected_response_id orelse return error.UnexpectedResponseId;
-    if (!actual.eql(expected)) return error.UnexpectedResponseId;
-}
-
-/// Listener for the manager's messages: reads framed JSON-RPC messages from
-/// `socket` until the expected response or readiness arrives.
-///
-/// Notifications (`.stderr` log lines and `.ready`) are executed without a
-/// reply, so child logging cannot terminate the listener or satisfy a pending
-/// event exchange. Requests carrying an ID are answered with a JSON-RPC
-/// result, and responses are matched against `expected_response_id`.
-///
-/// `expected_response_id` is null while waiting for readiness: the listener
-/// returns after a successful `.ready` and fails with `error.PluginLoadFailed`
-/// on a failed readiness text. For event exchanges it is
-/// `Ipc.event_request_id`: the listener returns after handling that response.
-///
-/// Errors: `error.InvalidFrame` when the frame marker is missing,
-/// `error.EmptyMessage` for a zero-length payload, `error.UnexpectedResponseId`
-/// for a response that does not match a pending event, the framing errors of
-/// `Ipc.readFrame`, the JSON errors of `Ipc.parseRequest`/`Ipc.parseResponse`,
-/// and the response-shape errors of `handleResponse`.
-fn jsonListener(socket: std.os.linux.fd_t, expected_response_id: ?i64) !void {
-    const allocator = std.heap.page_allocator;
-
-    while (true) {
-        const frame = try Ipc.readFrame(socket);
-        if (!frame.framed) return error.InvalidFrame;
-        if (!frame.received) return error.EmptyMessage;
-
-        const request = Ipc.parseRequest(allocator, frame.text()) catch |err| switch (err) {
-            error.NotRpcRequest => {
-                var response = Ipc.parseResponse(allocator, frame.text());
-                defer response.deinit();
-                const rpc_response = try response.value();
-                try validateResponseId(rpc_response.id, expected_response_id);
-                try handleResponse(rpc_response);
-                return;
-            },
-            else => return err,
-        };
-        defer request.deinit();
-
-        const request_id = request.id();
-        const outcome = try handleRequest(request.value);
-
-        if (!request_id.isNotification()) {
-            try Ipc.sendResultResponse(socket, request_id, "\"OK\"");
-        }
-
-        if (outcome == .ready and expected_response_id == null) return;
-    }
-}
 
 /// Child body: loads the plugin manager, reports readiness to the parent, and
 /// then serves callback events until the parent closes the channel.
@@ -310,276 +125,13 @@ fn jsonListener(socket: std.os.linux.fd_t, expected_response_id: ?i64) !void {
 /// parent is effectively single-threaded when `forkChild` is called, which
 /// holds for the engine's VSP `Load` call.
 fn pluginManagerChild(fd: std.os.linux.fd_t) void {
-    // The engine sink captured before the fork must not be called from here.
-    plugin_manager.setIpcLogger(fd);
-
-    // `message` borrows `failure`, so the buffer lives until the send below.
-    var failure: [256]u8 = undefined;
-    const message: []const u8 = load: {
-        plugin_manager.loadPlugins() catch |err| {
-            break :load std.fmt.bufPrint(
-                &failure,
-                "plugin loading failed: {s}",
-                .{@errorName(err)},
-            ) catch "plugin loading failed";
-        };
-        break :load fork.manager_ready_message;
-    };
-
-    Ipc.sendReady(fd, message) catch {};
-    Manager.listenForEvents(fd);
-    plugin_manager.deinit();
-}
-
-/// Child used by the IPC tests: sends the same readiness message the
-/// plugin-manager child sends once it is ready.
-fn testReportChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
-}
-
-/// Child used by the logging test: forwards a plugin print over IPC.
-fn testLogChild(fd: std.os.linux.fd_t) void {
-    Log.setupIpc(fd);
-    Log.pluginPrint(undefined, "plugin log line\n");
-}
-
-test "child logging is sent over IPC" {
-    var child = try fork.forkChild(testLogChild);
-    defer child.finish() catch {};
-
-    const frame = try Ipc.readFrame(child.socket);
-    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
-    defer request.deinit();
-
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
-    try std.testing.expectEqualStrings("plugin log line\n", request.value.message);
-    try std.testing.expect(request.id().isNone());
-}
-
-test "forked child reports that it initialized" {
-    var child = try fork.forkChild(testReportChild);
-    defer child.finish() catch {};
-
-    const frame = try Ipc.readFrame(child.socket);
-    try std.testing.expect(frame.framed);
-}
-
-test "parent receives a JSON message from the child" {
-    var child = try fork.forkChild(testReportChild);
-    defer child.finish() catch {};
-
-    const frame = try Ipc.readFrame(child.socket);
-    try std.testing.expect(frame.received);
-
-    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
-    defer request.deinit();
-    try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
-    try std.testing.expectEqualStrings(fork.manager_ready_message, request.value.message);
-    try std.testing.expect(request.id().isNone());
-}
-
-test "child payload matches the serialized request" {
-    var child = try fork.forkChild(testReportChild);
-    defer child.finish() catch {};
-
-    const frame = try Ipc.readFrame(child.socket);
-    try std.testing.expect(frame.matches(
-        "{\"jsonrpc\": \"2.0\", \"method\": \"ready\", \"params\": {\"message\":\"Hello from fork\"}}",
-    ));
-}
-
-test "listener schema decodes the ready operation" {
-    const request = try Ipc.parseRequest(
-        std.testing.allocator,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"ready\",\"params\":{\"message\":\"Hello from fork\"}}",
-    );
-    defer request.deinit();
-
-    try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
-    try std.testing.expectEqualStrings("Hello from fork", request.value.message);
-}
-
-test "listener schema decodes the stderr operation" {
-    const request = try Ipc.parseRequest(
-        std.testing.allocator,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"a log line\"}}",
-    );
-    defer request.deinit();
-
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
-    try std.testing.expectEqualStrings("a log line", request.value.message);
-}
-
-test "successful readiness is accepted" {
-    try std.testing.expectEqual(
-        RequestOutcome.ready,
-        try handleRequest(.{ .operation = .ready, .message = fork.manager_ready_message }),
-    );
-}
-
-test "failed readiness is rejected" {
-    try std.testing.expectError(
-        error.PluginLoadFailed,
-        handleRequest(.{
-            .operation = .ready,
-            .message = "plugin loading failed: OutOfMemory",
-        }),
-    );
-}
-
-test "unexpected response IDs are rejected" {
-    try std.testing.expectError(
-        error.UnexpectedResponseId,
-        validateResponseId(zjr.RpcId.of(2), Ipc.event_request_id),
-    );
-    try std.testing.expectError(
-        error.UnexpectedResponseId,
-        validateResponseId(zjr.RpcId.of(Ipc.event_request_id), null),
-    );
-    try validateResponseId(zjr.RpcId.of(Ipc.event_request_id), Ipc.event_request_id);
-}
-
-test "listener schema rejects an unknown operation" {
-    try std.testing.expectError(
-        error.UnknownMethod,
-        Ipc.parseRequest(
-            std.testing.allocator,
-            "{\"jsonrpc\":\"2.0\",\"method\":\"stdout\",\"params\":{\"message\":\"x\"}}",
-        ),
-    );
-}
-
-test "listener schema ignores unknown JSON-RPC fields" {
-    const request = try Ipc.parseRequest(
-        std.testing.allocator,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"x\"},\"unexpected\":1}",
-    );
-    defer request.deinit();
-
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
-    try std.testing.expectEqualStrings("x", request.value.message);
-}
-
-test "event JSON matches the schema" {
-    const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
-        .{ .event = .pause, .name = "pause" },
-        .{ .event = .unpause, .name = "unpause" },
-        .{ .event = .levelInit, .name = "levelInit" },
-        .{ .event = .serverActivate, .name = "serverActivate" },
-        .{ .event = .levelShutdown, .name = "levelShutdown" },
-    };
-
-    var buffer: [128]u8 = undefined;
-    for (cases) |case| {
-        const text = try Ipc.encodeEvent(&buffer, case.event);
-
-        var expected_buffer: [64]u8 = undefined;
-        const expected = try std.fmt.bufPrint(
-            &expected_buffer,
-            "{{\"jsonrpc\": \"2.0\", \"method\": \"{s}\", \"id\": {d}}}",
-            .{ case.name, Ipc.event_request_id },
-        );
-        try std.testing.expectEqualStrings(expected, text);
-
-        const parsed = try Ipc.parseEvent(std.testing.allocator, text);
-        defer parsed.deinit();
-        try std.testing.expectEqual(case.event, parsed.value.event);
-        try std.testing.expect(parsed.id().eql(Ipc.event_request_id));
-    }
-}
-
-test "event schema rejects an unknown callback" {
-    try std.testing.expectError(
-        error.UnknownMethod,
-        Ipc.parseEvent(
-            std.testing.allocator,
-            "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":1}",
-        ),
-    );
-}
-
-test "manager answers every Entrypoint event with a JSON-RPC result" {
-    var child = try fork.forkChild(Manager.listenForEvents);
-    defer child.finish() catch {};
-
-    const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
-        .{ .event = .pause, .name = "pause" },
-        .{ .event = .unpause, .name = "unpause" },
-        .{ .event = .levelInit, .name = "levelInit" },
-        .{ .event = .serverActivate, .name = "serverActivate" },
-        .{ .event = .levelShutdown, .name = "levelShutdown" },
-    };
-
-    for (cases) |case| {
-        try Ipc.sendEvent(child.socket, case.event);
-
-        const frame = try Ipc.readFrame(child.socket);
-        try std.testing.expect(frame.received);
-
-        var response = Ipc.parseResponse(std.testing.allocator, frame.text());
-        defer response.deinit();
-        const rpc_response = try response.value();
-        try std.testing.expect(!rpc_response.hasErr());
-        try std.testing.expect(rpc_response.id.eql(Ipc.event_request_id));
-
-        var expected_buffer: [64]u8 = undefined;
-        const expected = try std.fmt.bufPrint(
-            &expected_buffer,
-            "Event is {s}",
-            .{case.name},
-        );
-        try std.testing.expectEqualStrings(expected, rpc_response.result.string);
-    }
-}
-
-test "manager ignores event notifications" {
-    var child = try fork.forkChild(Manager.listenForEvents);
-    defer child.finish() catch {};
-
-    // Neither a valid event notification nor an invalid one may produce a
-    // reply; only the following request is answered.
-    try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}");
-    try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}");
-    try Ipc.sendEvent(child.socket, .unpause);
-
-    const frame = try Ipc.readFrame(child.socket);
-    try std.testing.expect(frame.received);
-
-    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
-    defer response.deinit();
-    const rpc_response = try response.value();
-    try std.testing.expect(!rpc_response.hasErr());
-    try std.testing.expect(rpc_response.id.eql(Ipc.event_request_id));
-    try std.testing.expectEqualStrings("Event is unpause", rpc_response.result.string);
-}
-
-test "manager answers an unknown event instead of stalling" {
-    var child = try fork.forkChild(Manager.listenForEvents);
-    defer child.finish() catch {};
-
-    try Ipc.writeFrame(
-        child.socket,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":3}",
-    );
-
-    const frame = try Ipc.readFrame(child.socket);
-    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
-    defer response.deinit();
-    const rpc_response = try response.value();
-
-    try std.testing.expect(rpc_response.hasErr());
-    try std.testing.expect(rpc_response.id.eql(3));
-    try std.testing.expectEqual(
-        @as(i32, @intFromEnum(zjr.ErrorCode.MethodNotFound)),
-        rpc_response.err().code,
-    );
-    try std.testing.expectEqualStrings("Event is invalid", rpc_response.err().message);
+    _ = fd;
 }
 
 fn load(
     this: *anyopaque,
-    interface_factory: CreateInterfaceFn,
-    game_server_factory: CreateInterfaceFn,
+    interface_factory: Vsp.CreateInterfaceFn,
+    game_server_factory: Vsp.CreateInterfaceFn,
 ) callconv(.c) bool {
     _ = this;
     _ = game_server_factory;
@@ -607,7 +159,7 @@ fn load(
     // refused immediately.
     var probe_version_buf: [32]u8 = undefined;
     const engine_version: []const u8 = version: {
-        for (engine_interface_versions) |requested_version| {
+        for (Vsp.engine_interface_versions) |requested_version| {
             const engine_module_name = std.fmt.bufPrintZ(
                 &probe_version_buf,
                 "{s}",
@@ -625,9 +177,6 @@ fn load(
         return false;
     }
 
-    const print_fn = logPrintOf(engine.?) orelse return false;
-    Log.setup(.{ .context = engine.?, .print = print_fn });
-
     if (!std.mem.eql(u8, engine_version, Indexes.interfaceversion_vengineserver)) {
         Log.logLine(
             "[MyLoader] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
@@ -637,8 +186,6 @@ fn load(
     }
 
     Log.logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{engine_version});
-
-    plugin_manager.setLogger(engine.?, print_fn);
 
     if (manager_child != null) {
         Log.logLine("[MyLoader] plugin manager is already running; refusing a second one\n", .{});
@@ -655,7 +202,7 @@ fn load(
     // so it refuses the startup instead of returning a successful load. The
     // child keeps running (and the socket open) afterwards; unload() is what
     // closes the socket and reaps it.
-    jsonListener(manager_child.?.socket, null) catch |err| {
+    JsonRpc.jsonListener(manager_child.?.socket, null) catch |err| {
         if (err != error.PluginLoadFailed) {
             Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{@errorName(err)});
         }
@@ -722,94 +269,10 @@ fn sendManagerEvent(event: Ipc.Event) void {
         return;
     };
 
-    jsonListener(child.socket, Ipc.event_request_id) catch |err| {
+    JsonRpc.jsonListener(child.socket, Ipc.event_request_id) catch |err| {
         Log.logLine(
             "[MyLoader] handling the plugin manager's reply to {s} failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
         );
     };
-}
-
-fn pause(this: *anyopaque) callconv(.c) void {
-    _ = this;
-    sendManagerEvent(.pause);
-}
-
-fn unpause(this: *anyopaque) callconv(.c) void {
-    _ = this;
-    sendManagerEvent(.unpause);
-}
-
-fn getPluginDescription(this: *anyopaque) callconv(.c) [*:0]const u8 {
-    _ = this;
-    return "MyLoader foundation (Zig)";
-}
-
-fn levelInit(this: *anyopaque, map_name: [*:0]const u8) callconv(.c) void {
-    _ = this;
-    Log.logLine("[MyLoader] LevelInit: {s}\n", .{std.mem.span(map_name)});
-    sendManagerEvent(.levelInit);
-}
-
-fn serverActivate(
-    this: *anyopaque,
-    edict_list: *anyopaque,
-    edict_count: c_int,
-    client_max: c_int,
-) callconv(.c) void {
-    _ = this;
-    _ = edict_list;
-    Log.logLine("[MyLoader] ServerActivate: {d} edicts, {d} max clients\n", .{ edict_count, client_max });
-    sendManagerEvent(.serverActivate);
-}
-
-fn gameFrame(this: *anyopaque, simulating: bool) callconv(.c) void {
-    _ = this;
-    _ = simulating;
-}
-
-fn levelShutdown(this: *anyopaque) callconv(.c) void {
-    _ = this;
-    Log.logLine("[MyLoader] LevelShutdown\n", .{});
-    sendManagerEvent(.levelShutdown);
-}
-
-/// Placeholder for every method this foundation doesn't implement yet.
-/// Declared with zero parameters on purpose: the calling convention
-/// doesn't validate argument count on entry, so this safely ignores
-/// whatever registers/stack the real call set up and returns 0 in the
-/// return register - false / PLUGIN_CONTINUE / null, whichever the real
-/// signature expected. Replace the corresponding slot below once you
-/// actually need that callback to do something.
-fn genericStub() callconv(.c) usize {
-    return 0;
-}
-
-/// "More than enough" trailing slots for interface versions newer than
-/// what's implemented above. Raise this if your SDK header has more
-/// methods than this accounts for; see the module doc-comment.
-const stub_count = 20;
-
-const vtable = [_]Slot{
-    @ptrCast(&load),
-    @ptrCast(&unload),
-    @ptrCast(&pause),
-    @ptrCast(&unpause),
-    @ptrCast(&getPluginDescription),
-    @ptrCast(&levelInit),
-    @ptrCast(&serverActivate),
-    @ptrCast(&gameFrame),
-    @ptrCast(&levelShutdown),
-} ++ ([_]Slot{@ptrCast(&genericStub)} ** stub_count);
-
-export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {
-    const requested = std.mem.span(name);
-    for (plugin_interface_versions) |version| {
-        if (std.mem.eql(u8, requested, version)) {
-            if (return_code) |rc| rc.* = iface_ok;
-            return @ptrCast(&plugin_instance);
-        }
-    }
-    if (return_code) |rc| rc.* = iface_failed;
-    return null;
 }

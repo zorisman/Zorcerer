@@ -1,5 +1,3 @@
-pub const Indexes = @import("codegen_generated/engine_indexes.zig");
-
 const std = @import("std");
 
 /// ABI contract between the plugin manager (src/PluginManager.zig) and
@@ -10,9 +8,21 @@ pub const abi = @import("PluginContext.zig");
 
 /// Minimal Source SDK console logger for the plugin manager's own
 /// messages (src/io/Log.zig).
-pub const Log = @import("io/Log.zig");
+pub const Ipc = @import("core/Ipc.zig");
 
-pub const Ipc = @import("Ipc.zig");
+pub const io = struct {
+    pub const Log = @import("io/Log.zig");
+    pub const fs = @import("io/file_system.zig");
+};
+
+pub const codegen = struct {
+    pub const indexes = @import("codegen_generated/engine_indexes.zig");
+};
+
+const tests = struct {
+    const ipc_tests = @import("tests/ipc_tests.zig");
+    const entrypoint_tests = @import("tests/entrypoint_tests.zig");
+};
 
 // Compile-checks and unit-tests src/analyzers/VTableResolver.zig. Nothing
 // in production code references the resolver yet, so this branch of the
@@ -29,5 +39,5 @@ test "src/analyzers/VTableResolver.zig compiles and passes its unit tests" {
 // purview; it must keep compiling and testing against the real toolchain
 // even before hosting code starts calling it.
 test "src/io/FileSystem.zig compiles and passes its unit tests" {
-    std.testing.refAllDecls(@import("io/FileSystem.zig"));
+    std.testing.refAllDecls(@import("io/file_system.zig"));
 }

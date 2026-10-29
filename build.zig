@@ -185,7 +185,7 @@ pub fn build(b: *std.Build) !void {
     // (src/PluginConfiguration.zig), later shared between the manager and
     // the file access API in src/io/FileSystem.zig.
     const plugin_configuration = b.addModule("plugin-configuration", .{
-        .root_source_file = b.path("src/PluginConfiguration.zig"),
+        .root_source_file = b.path("src/core/PluginConfiguration.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -199,7 +199,7 @@ pub fn build(b: *std.Build) !void {
     // example-plugins/ and cannot reach it by file path (imports may not
     // escape a module's root directory), hence the module indirection.
     const plugin_context = b.addModule("plugin-context", .{
-        .root_source_file = b.path("src/PluginContext.zig"),
+        .root_source_file = b.path("src/core/PluginContext.zig"),
     });
 
     // Plugin-facing filesystem API (src/io/FileSystem.zig). Example plugins
@@ -219,7 +219,7 @@ pub fn build(b: *std.Build) !void {
         .name = "zorcerer",
         .linkage = .dynamic,
         .root_module = b.addModule("zorcerer", .{
-            .root_source_file = b.path("src/Entrypoint.zig"),
+            .root_source_file = b.path("src/core/Entrypoint.zig"),
             .target = target,
             .optimize = optimize,
             .pic = true,
