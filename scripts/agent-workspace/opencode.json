@@ -698,8 +698,6 @@
             { "action": "tool.use", "resource": "shell:git tag -a*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:git config --unset*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:git config --global --unset*", "effect": "deny" },
-            { "action": "tool.use", "resource": "shell:git worktree add*", "effect": "deny" },
-            { "action": "tool.use", "resource": "shell:git worktree remove*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:git submodule update*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:git submodule foreach*", "effect": "deny" },
             { "action": "tool.use", "resource": "shell:git filter-branch*", "effect": "deny" },
