@@ -3,6 +3,7 @@ const zjr = @import("zjr");
 const fork = @import("../core/ForkProcess.zig");
 const Ipc = @import("../core/Ipc.zig");
 const JsonRpc = @import("../core/JsonRpc.zig");
+const Manager = @import("../core/PluginManager.zig");
 const Log = @import("../io/Log.zig");
 
 test {
@@ -177,7 +178,7 @@ test "event schema rejects an unknown callback" {
 }
 
 test "manager answers every Entrypoint event with a JSON-RPC result" {
-    var child = try fork.forkChild(JsonRpc.Manager.listenForEvents);
+    var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
     const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
@@ -211,7 +212,7 @@ test "manager answers every Entrypoint event with a JSON-RPC result" {
 }
 
 test "manager ignores event notifications" {
-    var child = try fork.forkChild(JsonRpc.Manager.listenForEvents);
+    var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
     // Neither a valid event notification nor an invalid one may produce a
@@ -232,7 +233,7 @@ test "manager ignores event notifications" {
 }
 
 test "manager answers an unknown event instead of stalling" {
-    var child = try fork.forkChild(JsonRpc.Manager.listenForEvents);
+    var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
     try Ipc.writeFrame(

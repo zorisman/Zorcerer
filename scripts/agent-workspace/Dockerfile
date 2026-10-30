@@ -78,8 +78,7 @@ RUN set -eux; \
         curl \
         unzip; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    curl -fsSL https://opencode.ai/v2/install -o /tmp/opencode-install.sh; \
-    OPENCODE_INSTALL_DIR=/opt/opencode bash /tmp/opencode-install.sh; \
+    OPENCODE_INSTALL_DIR=/opt/opencode curl -fsSL https://opencode.ai/v2/install | bash; \
     if [ ! -x /opt/opencode/opencode ]; then \
         found="$(command -v opencode || true)"; \
         if [ -z "$found" ]; then \

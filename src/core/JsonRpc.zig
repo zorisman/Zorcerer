@@ -1,7 +1,7 @@
 const std = @import("std");
 const zjr = @import("zjr");
 const Ipc = @import("Ipc.zig");
-const Log = @import("root").Log;
+const Log = @import("../root.zig").io.Log;
 const fork = @import("ForkProcess.zig");
 
 /// Executes one JSON-RPC response received from the plugin manager.
@@ -30,7 +30,7 @@ fn handleResponse(response: zjr.RpcResponse) !void {
 ///
 /// Errors: `error.UnexpectedResponseId` when no response is expected yet or
 /// when the response carries a different ID.
-fn validateResponseId(actual: zjr.RpcId, expected_response_id: ?i64) !void {
+pub fn validateResponseId(actual: zjr.RpcId, expected_response_id: ?i64) !void {
     const expected = expected_response_id orelse return error.UnexpectedResponseId;
     if (!actual.eql(expected)) return error.UnexpectedResponseId;
 }
@@ -75,7 +75,7 @@ pub fn jsonListener(socket: std.os.linux.fd_t, expected_response_id: ?i64) !void
         defer request.deinit();
 
         const request_id = request.id();
-        const outcome = try handleNotification(request.value);
+        const outcome = try handleRequest(request.value);
 
         if (!request_id.isNotification()) {
             try Ipc.sendResultResponse(socket, request_id, "\"OK\"");
@@ -86,7 +86,7 @@ pub fn jsonListener(socket: std.os.linux.fd_t, expected_response_id: ?i64) !void
 }
 
 /// What the listener should do after executing one operation notification.
-const RequestOutcome = enum {
+pub const RequestOutcome = enum {
     /// Keep serving the channel.
     continue_listening,
     /// The child reported successful readiness.
@@ -99,7 +99,7 @@ const RequestOutcome = enum {
 /// `manager_ready_message` reports success. Any other readiness text means the
 /// child could not load its plugins: it is logged as a startup failure and
 /// returned as `error.PluginLoadFailed`, so `load()` refuses the plugin set.
-fn handleNotification(request: Ipc.Request) !RequestOutcome {
+pub fn handleRequest(request: Ipc.Request) !RequestOutcome {
     switch (request.operation) {
         .stderr => {
             Log.logLine("{s}", .{request.message});

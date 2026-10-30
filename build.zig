@@ -183,7 +183,7 @@ pub fn build(b: *std.Build) !void {
 
     // Configuration of a single plugin's TOML manifest
     // (src/PluginConfiguration.zig), later shared between the manager and
-    // the file access API in src/io/FileSystem.zig.
+    // the file access API in src/io/file_system.zig.
     const plugin_configuration = b.addModule("plugin-configuration", .{
         .root_source_file = b.path("src/core/PluginConfiguration.zig"),
         .target = target,
@@ -202,13 +202,13 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("src/core/PluginContext.zig"),
     });
 
-    // Plugin-facing filesystem API (src/io/FileSystem.zig). Example plugins
+    // Plugin-facing filesystem API (src/io/file_system.zig). Example plugins
     // live outside src/ and cannot import it by file path for the same
     // reason as plugin-context, so it is exposed as a module. Resolving
     // URI schemes needs the same plugin-configuration module the manager
     // uses, hence the import below.
     const zorcerer_filesystem = b.addModule("zorcerer-filesystem", .{
-        .root_source_file = b.path("src/io/FileSystem.zig"),
+        .root_source_file = b.path("src/io/file_system.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -219,7 +219,7 @@ pub fn build(b: *std.Build) !void {
         .name = "zorcerer",
         .linkage = .dynamic,
         .root_module = b.addModule("zorcerer", .{
-            .root_source_file = b.path("src/core/Entrypoint.zig"),
+            .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
             .pic = true,

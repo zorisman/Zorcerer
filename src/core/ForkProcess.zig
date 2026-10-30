@@ -7,6 +7,10 @@ const std = @import("std");
 /// process afterwards, so the child never returns into the parent's stack.
 pub const ChildMain = *const fn (fd: std.os.linux.fd_t) void;
 
+/// Readiness text the plugin-manager child sends once it has loaded its
+/// plugins. The parent treats any other readiness text as a startup failure.
+pub const manager_ready_message = "Hello from fork";
+
 /// A forked child plus the parent's end of the IPC socket pair.
 pub const ForkedChild = struct {
     /// Process id of the child.

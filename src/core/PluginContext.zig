@@ -49,3 +49,7 @@ pub const LoadFn = *const fn (host: *const HostApi) callconv(.c) c_int;
 
 /// Plugin's `unload` export; called only when load() returned 0.
 pub const UnloadFn = *const fn (host: *const HostApi) callconv(.c) c_int;
+
+/// Optional plugin `onEvent` export. The manager looks it up but does not
+/// require it; a plugin that omits it still loads normally.
+pub const OnEventFn = *const fn (host: *const HostApi) callconv(.c) c_int;

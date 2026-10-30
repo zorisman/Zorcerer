@@ -61,7 +61,8 @@ pub const VTable = struct {
 };
 
 const std = @import("std");
-const Indexes = @import("../codegen_generated/engine_indexes.zig");
+const root = @import("../root.zig");
+const Indexes = root.codegen.indexes;
 
 /// Version strings this plugin answers to, newest first. All of them get
 /// the same vtable - the padding described above is what makes that safe.
@@ -84,8 +85,10 @@ pub const engine_interface_versions = [_][]const u8{
     Indexes.interfaceversion_vengineserver_version_21,
 };
 
-const iface_ok: c_int = 0;
-const iface_failed: c_int = 1;
+/// `CreateInterface` success code returned through its optional out-parameter.
+pub const iface_ok: c_int = 0;
+/// `CreateInterface` failure code returned through its optional out-parameter.
+pub const iface_failed: c_int = 1;
 
 pub const Slot = ?*const anyopaque;
 pub const CreateInterfaceFn = *const fn (name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque;
@@ -147,15 +150,3 @@ fn genericStub() callconv(.c) usize {
 /// what's implemented above. Raise this if your SDK header has more
 /// methods than this accounts for; see the module doc-comment.
 const stub_count = 20;
-
-export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {
-    const requested = std.mem.span(name);
-    for (plugin_interface_versions) |version| {
-        if (std.mem.eql(u8, requested, version)) {
-            if (return_code) |rc| rc.* = iface_ok;
-            return @ptrCast(&plugin_instance);
-        }
-    }
-    if (return_code) |rc| rc.* = iface_failed;
-    return null;
-}

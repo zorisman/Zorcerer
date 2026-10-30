@@ -1,6 +1,6 @@
 const std = @import("std");
 const zjr = @import("zjr");
-const ipc = @import("root").Ipc;
+const ipc = @import("../core/Ipc.zig");
 
 /// In-process JSON-RPC listener used by tests.
 ///

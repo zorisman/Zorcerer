@@ -80,10 +80,11 @@ const std = @import("std");
 const zjr = @import("zjr");
 const Ipc = @import("Ipc.zig");
 const VTableHooks = @import("hooks").VTableHook;
-const Indexes = @import("../codegen_generated/engine_indexes.zig");
+const root = @import("../root.zig");
+const Indexes = root.codegen.indexes;
 const Manager = @import("PluginManager.zig");
-const Log = @import("root.zig").Log;
-const abi = @import("root.zig").abi;
+const Log = root.io.Log;
+const abi = root.abi;
 const fork = @import("ForkProcess.zig");
 const JsonRpc = @import("JsonRpc.zig");
 const Vsp = @import("Vsp.zig");
@@ -275,4 +276,17 @@ fn sendManagerEvent(event: Ipc.Event) void {
             .{ @tagName(event), @errorName(err) },
         );
     };
+}
+
+
+export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {
+    const requested = std.mem.span(name);
+    for (Vsp.plugin_interface_versions) |version| {
+        if (std.mem.eql(u8, requested, version)) {
+            if (return_code) |rc| rc.* = Vsp.iface_ok;
+            return @ptrCast(&plugin_instance);
+        }
+    }
+    if (return_code) |rc| rc.* = Vsp.iface_failed;
+    return null;
 }

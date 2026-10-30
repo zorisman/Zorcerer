@@ -1,8 +1,9 @@
 const std = @import("std");
 const Ipc = @import("Ipc.zig");
 const toml = @import("toml");
-const abi = @import("root.zig").abi;
-const Log = @import("root.zig").Log;
+const root = @import("../root.zig");
+const abi = root.abi;
+const Log = root.io.Log;
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 const zlua = @import("zlua");
 
@@ -157,10 +158,10 @@ pub const Manager = struct {
         self.clearManifestResult();
 
         const io = self.threaded_io.io();
-        var root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
-        defer root.close(io);
+        var plugin_root_dir = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
+        defer plugin_root_dir.close(io);
 
-        var walker = try root.walk(self.allocator);
+        var walker = try plugin_root_dir.walk(self.allocator);
         defer walker.deinit();
 
         var manifests: std.ArrayList(Manifest) = .empty;
@@ -255,16 +256,16 @@ pub const Manager = struct {
         var managed_plugins: std.ArrayList(*PluginConfiguration) = .empty;
 
         const io = self.threaded_io.io();
-        var root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
-        defer root.close(io);
+        var plugin_root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
+        defer plugin_root.close(io);
 
-        var dirs = root.iterate();
+        var dirs = plugin_root.iterate();
         while (try dirs.next(io)) |dir| {
             if (dir.kind != .directory) {
                 continue;
             }
 
-            var plugin_dir = root.openDir(io, dir.name, .{ .iterate = true }) catch |err| {
+            var plugin_dir = plugin_root.openDir(io, dir.name, .{ .iterate = true }) catch |err| {
                 Log.logLine("[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n", .{ plugins_directory, dir.name, @errorName(err) });
                 continue;
             };
@@ -320,8 +321,6 @@ pub const Manager = struct {
             return;
         };
 
-        // Both exports are required: load() binds the plugin, and unload()
-        // is what lets the manager ever release it again.
         const load_fn = lib.lookup(abi.LoadFn, "load") orelse {
             Log.logLine("[zorcerer] {s}: missing load() export, skipping\n", .{path});
             lib.close();
@@ -333,6 +332,11 @@ pub const Manager = struct {
             lib.close();
             return;
         };
+
+        const on_event_fn = lib.lookup(abi.OnEventFn, "onEvent") orelse {
+            return;
+        };
+        _ = on_event_fn;
 
         try self.plugins.append(self.allocator, .{
             .path = path,
@@ -448,7 +452,7 @@ pub const Manager = struct {
         var keep_plugin_id = false;
         defer if (!keep_plugin_id) self.allocator.free(plugin_id);
 
-        const root = std.Io.Dir.path.join(
+        const plugin_root = std.Io.Dir.path.join(
             self.allocator,
             &.{ plugins_directory, dir_name },
         ) catch |err| {
@@ -459,7 +463,7 @@ pub const Manager = struct {
             return;
         };
         var keep_root = false;
-        defer if (!keep_root) self.allocator.free(root);
+        defer if (!keep_root) self.allocator.free(plugin_root);
 
         var runtime = zlua.runtime.Runtime.init(self.allocator) catch |err| {
             Log.logLine(
@@ -474,7 +478,7 @@ pub const Manager = struct {
         // The runtime borrows these slices, so they must outlive it. They are
         // moved into the manager's LuaScript entry on success.
         runtime.setPluginId(plugin_id);
-        runtime.setPluginRoot(root);
+        runtime.setPluginRoot(plugin_root);
         runtime.setHost(.{ .context = self, .log = luaLog });
         runtime.openSafeLibs();
         runtime.installZostd();
@@ -503,7 +507,7 @@ pub const Manager = struct {
 
         self.lua_scripts.append(self.allocator, .{
             .plugin_id = plugin_id,
-            .root = root,
+            .root = plugin_root,
             .path = script_path,
             .runtime = runtime,
         }) catch |err| {
