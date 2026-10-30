@@ -1,44 +1,44 @@
 pub const VTable = struct {
-    load: *fn (
+    load: *const fn (
         this: *anyopaque,
         interface_factory: CreateInterfaceFn,
         game_server_factory: CreateInterfaceFn,
     ) callconv(.c) void,
 
-    unload: *fn (
+    unload: *const fn (
         this: *anyopaque,
     ) callconv(.c) void,
 
-    pause: *fn (
+    pause: *const fn (
         this: *anyopaque,
     ) callconv(.c) void = VspDefaults.pause,
 
-    unpause: *fn (
+    unpause: *const fn (
         this: *anyopaque,
     ) callconv(.c) void = VspDefaults.unpause,
 
-    getPluginDescription: *fn (
+    getPluginDescription: *const fn (
         this: *anyopaque,
     ) callconv(.c) [*:0]const u8 = VspDefaults.getPluginDescription,
 
-    levelInit: *fn (
+    levelInit: *const fn (
         this: *anyopaque,
         map_name: [*:0]const u8
     ) callconv(.c) void = VspDefaults.levelInit,
 
-    serverActivate: *fn (
+    serverActivate: *const fn (
         this: *anyopaque,
         edict_list: *anyopaque,
         edict_count: c_int,
         client_max: c_int,
     ) callconv(.c) void = VspDefaults.serverActivate,
 
-    gameFrame: *fn (
+    gameFrame: *const fn (
         this: *anyopaque,
         simulating: bool
     ) callconv(.c) void = VspDefaults.gameFrame,
 
-    levelShutdown: *fn (
+    levelShutdown: *const fn (
         this: *anyopaque
     ) callconv(.c) void = VspDefaults.levelShutdown,
 
