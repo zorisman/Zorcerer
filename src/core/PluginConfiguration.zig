@@ -1,7 +1,8 @@
 //! Configuration of a single plugin as it appears in the plugin's `.toml`
 //! manifest file. Provides `PluginConfiguration.parseConfig()` to turn the
-//! raw TOML text of such a manifest into a validated `PluginConfiguration`,
-//! and generic helpers to read arbitrary TOML (see `readToml()`).
+//! raw TOML text of such a manifest into a validated, caller-owned
+//! `PluginConfiguration`, and generic helpers to read arbitrary TOML (see
+//! `readToml()`).
 
 const std = @import("std");
 const toml = @import("toml");
@@ -13,13 +14,26 @@ const toml = @import("toml");
 /// this struct; a superfluous key in the manifest is treated as an unknown
 /// (not implemented) key.
 ///
-/// Slices: each field points into memory parsed and owned by
-/// `parseConfig()`, see its documentation for lifetime details.
+/// Ownership: `parseConfig()` returns a configuration whose strings are
+/// allocated with the caller's allocator. The caller must release them with
+/// `deinit()`; a configuration built directly from literals does not need
+/// `deinit()`.
 pub const PluginConfiguration = struct {
     /// Hard upper limit on the raw TOML text size of a manifest that
     /// `parseConfig()` accepts: 4 KiB. Manifests that exceed it are
     /// rejected with `error.FileSizeOverflow`.
     pub const max_config_size: usize = 4 * 1024;
+
+    /// Maximum accepted length of `id`, in bytes.
+    pub const max_id_len: usize = 64;
+    /// Maximum accepted length of `name`, in bytes.
+    pub const max_name_len: usize = 128;
+    /// Maximum accepted length of `version`, in bytes.
+    pub const max_version_len: usize = 64;
+    /// Maximum accepted length of `author`, in bytes.
+    pub const max_author_len: usize = 128;
+    /// Maximum accepted length of `path`, in bytes.
+    pub const max_path_len: usize = 1024;
 
     /// Every key that is allowed to appear (as a top-level key) inside a
     /// manifest's TOML file; each entry must correspond 1:1 to a field of
@@ -35,7 +49,8 @@ pub const PluginConfiguration = struct {
     };
 
     /// Unique identifier of the plugin, also the name of the directory the
-    /// plugin is loaded from.
+    /// plugin is loaded from. Must match `[A-Za-z0-9_-]+` and the plugin's
+    /// directory name.
     id: []const u8,
     /// Human-readable display name of the plugin.
     name: []const u8,
@@ -46,12 +61,18 @@ pub const PluginConfiguration = struct {
     /// Path to the plugin's `.so` library, relative to the plugin directory.
     path: []const u8,
 
-    /// Parses the raw TOML text of a plugin manifest into a
+    /// Parses and validates the raw TOML text of a plugin manifest into a
     /// `PluginConfiguration`.
     ///
     /// Every top-level key must be a field of this struct and every field
-    /// must be a top-level string value; otherwise an error is returned and
-    /// the configuration cannot be used.
+    /// must be a top-level string value; the values must additionally pass
+    /// `validateValues()`. Otherwise an error is returned and the
+    /// configuration cannot be used.
+    ///
+    /// Parameters:
+    /// - `allocator`: owns every string of the returned configuration; the
+    ///   caller must call `deinit()` with the same allocator.
+    /// - `toml_text`: the complete manifest file contents.
     ///
     /// Errors:
     /// - `error.FileSizeOverflow` if the manifest text is larger than
@@ -60,20 +81,21 @@ pub const PluginConfiguration = struct {
     ///   that has no corresponding field in this struct.
     /// - `error.WrongValueType` if a known key's value is not a TOML string.
     /// - `error.MissingRequiredField` if a known key is absent entirely.
+    /// - `error.InvalidValue` if a value is empty, too long, or fails the
+    ///   identifier/path rules of `validateValues()`.
     /// - Any error the TOML parser itself can report for malformed input
     ///   (see `toml.Parser(Table).parseString`).
+    /// - `error.OutOfMemory` if duplicating the parsed strings fails.
     ///
     /// Side effects: before failing with `error.KeysNotImplemented`, every
     /// unknown key is reported to the user with `std.log.warn`; the
     /// failure is not otherwise observable via `error_info` or the like,
     /// since keys are known only from the manifest text.
     ///
-    /// No allocator is passed: `parseConfig` parses into an arena whose
-    /// memory is intentionally retained on success so that the returned
-    /// strings stay valid for the rest of the process' lifetime. Plugin
-    /// configuration is read once at startup, so this trade is deemed
-    /// appropriate; on error the arena is fully released.
-    pub fn parseConfig(toml_text: []const u8) !@This() {
+    /// Memory: the TOML parser's temporary arena and the manifest text are
+    /// not retained. On success the returned strings are owned by
+    /// `allocator`; on any error nothing is retained.
+    pub fn parseConfig(allocator: std.mem.Allocator, toml_text: []const u8) !@This() {
         if (toml_text.len > max_config_size) {
             return error.FileSizeOverflow;
         }
@@ -82,13 +104,11 @@ pub const PluginConfiguration = struct {
         // `toml.Parser(Table)` on a mapped struct silently drops
         // superfluous manifest keys, while `parseConfig` must reject them
         // with `error.KeysNotImplemented`.
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        errdefer arena.deinit();
-
-        var parser = toml.Parser(toml.Table).init(arena.allocator());
+        var parser = toml.Parser(toml.Table).init(allocator);
         defer parser.deinit();
 
-        const parsed = try parser.parseString(toml_text);
+        var parsed = try parser.parseString(toml_text);
+        defer parsed.deinit();
         const table = parsed.value;
 
         // Reject every manifest key that the struct does not have a field
@@ -96,6 +116,7 @@ pub const PluginConfiguration = struct {
         // unknown keys are collected first so the user can be told about
         // every problem in one go, not only about the first one.
         var unknown_keys: std.ArrayList([]const u8) = .empty;
+        defer unknown_keys.deinit(allocator);
         var it = table.iterator();
         while (it.next()) |entry| {
             var known = false;
@@ -105,7 +126,7 @@ pub const PluginConfiguration = struct {
                     break;
                 }
             }
-            if (!known) try unknown_keys.append(arena.allocator(), entry.key_ptr.*);
+            if (!known) try unknown_keys.append(allocator, entry.key_ptr.*);
         }
         if (unknown_keys.items.len != 0) {
             for (unknown_keys.items) |key| {
@@ -114,17 +135,132 @@ pub const PluginConfiguration = struct {
             return error.KeysNotImplemented;
         }
 
-        var result: @This() = undefined;
+        // Bind the parser-owned string slices first. They stay valid until
+        // `parsed.deinit()` at the end of this function; the validated
+        // values are duplicated into `allocator` before then.
+        var parsed_values: @This() = undefined;
         inline for (std.meta.fields(@This())) |field| {
             const value = table.get(field.name) orelse return error.MissingRequiredField;
             switch (value) {
-                .string => |str| @field(result, field.name) = str,
+                .string => |str| @field(parsed_values, field.name) = str,
                 else => return error.WrongValueType,
             }
         }
-        return result;
+
+        try parsed_values.validateValues();
+
+        const id = try allocator.dupe(u8, parsed_values.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, parsed_values.name);
+        errdefer allocator.free(name);
+        const version = try allocator.dupe(u8, parsed_values.version);
+        errdefer allocator.free(version);
+        const author = try allocator.dupe(u8, parsed_values.author);
+        errdefer allocator.free(author);
+        const path = try allocator.dupe(u8, parsed_values.path);
+        errdefer allocator.free(path);
+
+        return .{
+            .id = id,
+            .name = name,
+            .version = version,
+            .author = author,
+            .path = path,
+        };
+    }
+
+    /// Checks the values of an already parsed configuration.
+    ///
+    /// `id` must be non-empty, at most `max_id_len` bytes, and consist only
+    /// of ASCII letters, digits, `_` and `-`. `name`, `version` and `author`
+    /// must be non-empty and fit their length limits. `path` must be a
+    /// relative path that stays inside the plugin directory, is at most
+    /// `max_path_len` bytes, and names a `.so` file.
+    ///
+    /// Errors: `error.InvalidValue` when any of the rules above is
+    /// violated.
+    ///
+    /// Side effects: none.
+    pub fn validateValues(self: @This()) !void {
+        if (self.id.len == 0 or self.id.len > max_id_len or !isValidId(self.id)) {
+            return error.InvalidValue;
+        }
+        if (self.name.len == 0 or self.name.len > max_name_len) {
+            return error.InvalidValue;
+        }
+        if (self.version.len == 0 or self.version.len > max_version_len) {
+            return error.InvalidValue;
+        }
+        if (self.author.len == 0 or self.author.len > max_author_len) {
+            return error.InvalidValue;
+        }
+        try validateLibraryPath(self.path);
+    }
+
+    /// Checks the invariants that require the plugin's directory name.
+    ///
+    /// `id` is the plugin's directory name by contract, so it must match
+    /// `dir_name` exactly. Directory-dependent validation is deliberately
+    /// separate from `validateValues()` so a manifest can be validated
+    /// before its location is known.
+    ///
+    /// Errors: `error.InvalidValue` when `id` and `dir_name` differ.
+    ///
+    /// Side effects: none.
+    pub fn validateForDirectory(self: @This(), dir_name: []const u8) !void {
+        if (!std.mem.eql(u8, self.id, dir_name)) {
+            return error.InvalidValue;
+        }
+    }
+
+    /// Releases every string owned by this configuration.
+    ///
+    /// `allocator` must be the allocator passed to `parseConfig()`.
+    /// Configurations built from literals must not be passed here.
+    ///
+    /// Side effects: frees `id`, `name`, `version`, `author` and `path`.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.version);
+        allocator.free(self.author);
+        allocator.free(self.path);
     }
 };
+
+/// Returns whether `id` consists only of ASCII letters, digits, `_` and `-`.
+fn isValidId(id: []const u8) bool {
+    for (id) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Validates a manifest library path that is relative to the plugin
+/// directory.
+///
+/// The path must be non-empty, at most `PluginConfiguration.max_path_len`
+/// bytes, relative (no leading `/`), free of `..` components, and end in
+/// `.so`. A leading `./` is allowed.
+///
+/// Errors: `error.InvalidValue` when any rule is violated.
+fn validateLibraryPath(path: []const u8) !void {
+    if (path.len == 0 or path.len > PluginConfiguration.max_path_len) {
+        return error.InvalidValue;
+    }
+    if (path[0] == '/' or !std.mem.endsWith(u8, path, ".so")) {
+        return error.InvalidValue;
+    }
+
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) {
+            return error.InvalidValue;
+        }
+    }
+}
 
 /// Reads all keys of a TOML text, starting at `node`, into a
 /// callee-defined struct type.
@@ -156,12 +292,13 @@ pub const PluginConfiguration = struct {
 ///   or TOML parser can produce (see `toml.Parser(T).parseString` and
 ///   `toml.Parser(T).parseStringIntoNode`).
 ///
-/// Memory: like `parseConfig()`, `T`'s mappings reference an arena kept
-/// (`Parsed(T).arena`) intact on success so the returned value's slices
-/// stay valid for the rest of the process' lifetime; on any error return,
-/// the arena is fully released. This is the same trade `parseConfig()`
-/// makes and expects bounded callers accordingly (config is read once at
-/// startup).
+/// Memory: `T`'s mappings reference an arena kept (`Parsed(T).arena`)
+/// intact on success so the returned value's slices stay valid for the rest
+/// of the process' lifetime; on any error return, the arena is fully
+/// released. The arena is therefore intentionally leaked, and callers must
+/// keep using this helper only for the bounded set of startup-time files it
+/// was written for. Use `PluginConfiguration.parseConfig()` when owned,
+/// releasable strings are required.
 pub fn readToml(comptime T: type, raw_toml: []const u8, node: ?[]const u8) !T {
     var parser = toml.Parser(T).init(std.heap.page_allocator);
     defer parser.deinit();
@@ -178,22 +315,24 @@ pub fn readToml(comptime T: type, raw_toml: []const u8, node: ?[]const u8) !T {
 }
 
 test "parseConfig parses fully correct TOML" {
-    const config = try PluginConfiguration.parseConfig(
+    const source =
         \\id = "hello"
         \\name = "Hello Example"
         \\version = "0.1.0"
         \\author = "Zorcerer"
-        \\path = "plugins/hello/hello_plugin.so"
+        \\path = "./hello_plugin.so"
         \\
         \\# Both comments and blank lines are fine.
         \\# All exactly five keys must be present.
-    );
+    ;
+    var config = try PluginConfiguration.parseConfig(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("hello", config.id);
     try std.testing.expectEqualStrings("Hello Example", config.name);
     try std.testing.expectEqualStrings("0.1.0", config.version);
     try std.testing.expectEqualStrings("Zorcerer", config.author);
-    try std.testing.expectEqualStrings("plugins/hello/hello_plugin.so", config.path);
+    try std.testing.expectEqualStrings("./hello_plugin.so", config.path);
 }
 
 test "parseConfig fails on partially implemented keys" {
@@ -212,7 +351,10 @@ test "parseConfig fails on partially implemented keys" {
         \\name = "Hello Example"
         \\compression = "nope"
     ;
-    try std.testing.expectError(error.KeysNotImplemented, PluginConfiguration.parseConfig(source));
+    try std.testing.expectError(
+        error.KeysNotImplemented,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
 }
 
 test "parseConfig fails on wrong value types" {
@@ -223,15 +365,92 @@ test "parseConfig fails on wrong value types" {
         \\name = "Hello Example"
         \\version = 1
         \\author = true
-        \\path = "plugins/hello/hello_plugin.so"
+        \\path = "./hello_plugin.so"
     ;
-    try std.testing.expectError(error.WrongValueType, PluginConfiguration.parseConfig(source));
+    try std.testing.expectError(
+        error.WrongValueType,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
+}
+
+test "parseConfig fails on missing keys" {
+    const source =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+    ;
+    try std.testing.expectError(
+        error.MissingRequiredField,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
+}
+
+test "parseConfig rejects invalid values" {
+    const allocator = std.testing.allocator;
+
+    const empty_id =
+        \\id = ""
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+    ;
+    try std.testing.expectError(error.InvalidValue, PluginConfiguration.parseConfig(allocator, empty_id));
+
+    const invalid_id =
+        \\id = "hello/world"
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+    ;
+    try std.testing.expectError(error.InvalidValue, PluginConfiguration.parseConfig(allocator, invalid_id));
+
+    const empty_name =
+        \\id = "hello"
+        \\name = ""
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+    ;
+    try std.testing.expectError(error.InvalidValue, PluginConfiguration.parseConfig(allocator, empty_name));
+
+    const absolute_path =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "/absolute/hello_plugin.so"
+    ;
+    try std.testing.expectError(error.InvalidValue, PluginConfiguration.parseConfig(allocator, absolute_path));
+
+    const parent_path =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "../hello_plugin.so"
+    ;
+    try std.testing.expectError(error.InvalidValue, PluginConfiguration.parseConfig(allocator, parent_path));
+
+    const non_library_path =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.txt"
+    ;
+    try std.testing.expectError(error.InvalidValue, PluginConfiguration.parseConfig(allocator, non_library_path));
 }
 
 test "parseConfig rejects oversized manifests" {
     try std.testing.expectError(
         error.FileSizeOverflow,
-        PluginConfiguration.parseConfig("a" ** (PluginConfiguration.max_config_size + 1)),
+        PluginConfiguration.parseConfig(
+            std.testing.allocator,
+            "a" ** (PluginConfiguration.max_config_size + 1),
+        ),
     );
 }
 
@@ -241,7 +460,25 @@ test "parseConfig accepts manifests up to max_config_size" {
     // missing required fields (not on its size).
     const source = "#" ++ "x" ** (PluginConfiguration.max_config_size - 2) ++ "\n";
     try std.testing.expectEqual(PluginConfiguration.max_config_size, source.len);
-    try std.testing.expectError(error.MissingRequiredField, PluginConfiguration.parseConfig(source));
+    try std.testing.expectError(
+        error.MissingRequiredField,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
+}
+
+test "validateForDirectory requires the id to match the directory" {
+    const source =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+    ;
+    var config = try PluginConfiguration.parseConfig(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
+
+    try config.validateForDirectory("hello");
+    try std.testing.expectError(error.InvalidValue, config.validateForDirectory("other"));
 }
 
 test "known_keys covers every field of the struct" {

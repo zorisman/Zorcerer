@@ -22,8 +22,10 @@ const ExamplePluginInstall = struct {
 ///
 /// The artifact's emitted shared library is copied under `library_name`. If
 /// `example-plugins/<source_dir>/manifest.toml` exists, it is copied next to
-/// the library as `manifest.toml`; a missing manifest is allowed because not
-/// every example plugin is managed through one.
+/// the library as `manifest.toml`. Packaging without a manifest is allowed so
+/// examples that are not managed through one can still be installed; at
+/// runtime, however, a plugin directory that provides native libraries must
+/// contain a valid manifest or its libraries are skipped.
 ///
 /// `tests_step` is made a dependency of the install steps so that the default
 /// install target never packages a plugin unless the project's tests passed.

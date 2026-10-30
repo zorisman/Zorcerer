@@ -168,22 +168,21 @@ pub fn setZorcererRoot(path: []const u8) void {
 ///   directory (see `setGameRoot`); read-only, routed to the engine
 ///   filesystem (`.scheme == .game`).
 /// - `"plugin://<tail>"` resolves `<tail>` against the calling plugin's
-///   root directory, which is derived from the directory component of
-///   `ctx.config.path` underneath the configured Zorcerer root (see
+///   root directory, `<zorcerer_root>/plugins/<ctx.config.id>` (see
 ///   `setZorcererRoot`); read and write, no execute, routed to `std.Io`
-///   (`.scheme == .plugin`).
+///   (`.scheme == .plugin`). The plugin configuration's `id` is the plugin
+///   directory name, so no information from `config.path` is needed.
 /// - Any other URI format is not a supported scheme.
 ///
 /// Parameters:
-/// - `ctx`: the query's plugin context; `config.path` determines the
-///   plugin root for `plugin://` URIs.
+/// - `ctx`: the query's plugin context; `config.id` names the plugin
+///   directory for `plugin://` URIs.
 /// - `path`: the raw URI as forwarded by a plugin.
 ///
 /// Returns the validated `ZorcererPath`, or:
 /// - `error.OperationNotAllowed` if the URI does not start with a supported
 ///   scheme prefix, if a URI tail contains a `..` path component (parent
-///   traversal), or if the plugin's `path` does not contain a directory
-///   component (so no plugin root can be derived).
+///   traversal), or if the plugin's `id` is empty.
 /// - `error.RootNotConfigured` if the requested scheme's root directory has
 ///   not been configured yet.
 /// - `error.OutOfMemory` for path allocation failures.
@@ -207,14 +206,14 @@ pub fn parsePath(ctx: *PluginContext, path: []const u8) !ZorcererPath {
     }
 
     // `plugin://` targets the calling plugin's own directory and is
-    // read/write only.
+    // read/write only. `id` is the plugin directory name by contract.
     if (std.mem.startsWith(u8, path, plugin_scheme)) {
         const root = zorcerer_root orelse return error.RootNotConfigured;
-        const lib_directory = std.Io.Dir.path.dirname(ctx.config.path) orelse
-            return error.OperationNotAllowed;
+        if (ctx.config.id.len == 0) return error.OperationNotAllowed;
         return ZorcererPath{
             .absolute_path = try joinRelativeParts(alloc, root, &.{
-                lib_directory,
+                "plugins",
+                ctx.config.id,
                 path[plugin_scheme.len..],
             }),
             .permissions = read_write_permissions,
@@ -1544,7 +1543,7 @@ fn mockContext() PluginContext {
             .name = "Hello Example",
             .version = "0.1.0",
             .author = "Zorcerer",
-            .path = "plugins/hello/hello_plugin.so",
+            .path = "./hello_plugin.so",
         },
     };
 }

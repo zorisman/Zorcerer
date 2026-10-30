@@ -1,6 +1,5 @@
 const std = @import("std");
 const Ipc = @import("Ipc.zig");
-const toml = @import("toml");
 const root = @import("../root.zig");
 const abi = root.abi;
 const Log = root.io.Log;
@@ -19,14 +18,8 @@ const zlua = @import("zlua");
 /// directories (readdir reports them as sym_link entries) are not scanned.
 const plugins_directory = "tf/addons/zorcerer/plugins";
 
-/// Metadata described by a plugin manifest.
-pub const Manifest = struct {
-    id: []const u8,
-    name: []const u8,
-    version: []const u8,
-    author: []const u8,
-    file: []const u8,
-};
+/// Name of the manifest file inside every plugin directory.
+const manifest_name = "manifest.toml";
 
 /// One plugin .so held in the manager's cache.
 pub const Plugin = struct {
@@ -62,8 +55,9 @@ pub const LuaScript = struct {
 };
 
 /// Minimal plugin manager.
-/// readConfig() returns parsed manifests owned by the manager. The returned
-/// data remains valid until the next readConfig() call or deinit().
+/// readConfig() returns validated plugin configurations owned by the
+/// manager. The returned data remains valid until the next readConfig()
+/// call or deinit().
 ///
 /// Independently of manifests, loadPlugins() discovers each directory's
 /// `main.lua` (see LuaScript) and its plugin libraries (see plugins_directory
@@ -71,14 +65,17 @@ pub const LuaScript = struct {
 /// reverses that for every plugin that became active, then releases the cache. Plugins only ever talk to the host through
 /// src/PluginContext.zig, so no plugin-defined code needs direct links into the
 /// process. A plugin is skipped (with a log line through the logger) when
-/// its directory cannot be opened, dlopen() fails or an export is missing.
+/// its directory cannot be opened, its manifest is missing or invalid,
+/// dlopen() fails or an export is missing.
 pub const Manager = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
 
     // init() does not accept std.Io, so use the single-threaded adapter for this prototype.
     threaded_io: std.Io.Threaded = .init_single_threaded,
 
-    manifest_result: ?[]Manifest = null,
+    /// Validated manifests retained by readConfig()/loadPlugins(). Owned by
+    /// the manager; released by clearManifestResult().
+    manifest_result: ?[]PluginConfiguration = null,
 
     /// How to print into the server console, captured by setLogger() and
     /// handed to every plugin inside HostApi. Null until setLogger().
@@ -97,7 +94,7 @@ pub const Manager = struct {
     }
 
     /// Unloads every plugin remembered by loadPlugins() and frees all
-    /// parsed manifests retained by the manager.
+    /// validated manifests retained by the manager.
     /// This can be called with defer.
     pub fn deinit(self: *@This()) void {
         self.unloadAll();
@@ -107,98 +104,161 @@ pub const Manager = struct {
         self.clearManifestResult();
     }
 
-    fn freeManifest(self: *@This(), manifest: Manifest) void {
-        self.allocator.free(manifest.id);
-        self.allocator.free(manifest.name);
-        self.allocator.free(manifest.version);
-        self.allocator.free(manifest.author);
-        self.allocator.free(manifest.file);
-    }
-
+    /// Releases every configuration retained by readConfig() and clears the
+    /// cached slice.
+    ///
+    /// Side effects: deinitializes every configuration's strings and frees
+    /// the slice.
     fn clearManifestResult(self: *@This()) void {
         if (self.manifest_result) |manifests| {
-            for (manifests) |manifest| {
-                self.freeManifest(manifest);
+            for (manifests) |*manifest| {
+                manifest.deinit(self.allocator);
             }
             self.allocator.free(manifests);
             self.manifest_result = null;
         }
     }
 
-    fn duplicateManifest(self: *@This(), manifest: Manifest) !Manifest {
-        const id = try self.allocator.dupe(u8, manifest.id);
-        errdefer self.allocator.free(id);
-
-        const name = try self.allocator.dupe(u8, manifest.name);
-        errdefer self.allocator.free(name);
-
-        const version = try self.allocator.dupe(u8, manifest.version);
-        errdefer self.allocator.free(version);
-
-        const author = try self.allocator.dupe(u8, manifest.author);
-        errdefer self.allocator.free(author);
-
-        const file = try self.allocator.dupe(u8, manifest.file);
-        errdefer self.allocator.free(file);
-
-        return .{
-            .id = id,
-            .name = name,
-            .version = version,
-            .author = author,
-            .file = file,
-        };
-    }
-
-    /// Finds and parses every .toml file under plugins_directory into Manifest.
-    /// The order follows filesystem traversal order and is not guaranteed.
-    /// The returned slice and its strings are owned by the manager and remain
-    /// valid until the next readConfig() call or deinit().
-    pub fn readConfig(self: *@This()) ![]const Manifest {
+    /// Reads and validates the manifest of every plugin directory directly
+    /// inside plugins_directory.
+    ///
+    /// Directories with an unreadable manifest or invalid contents are
+    /// logged and skipped; so is a directory that provides native libraries
+    /// but no manifest. Lua-only directories without a manifest are skipped
+    /// silently. The remaining directories are still returned. The order
+    /// follows filesystem iteration order and is not guaranteed.
+    ///
+    /// Returns a slice owned by the manager whose strings remain valid until
+    /// the next readConfig() call or deinit().
+    ///
+    /// Errors: `error.FileNotFound` when plugins_directory itself does not
+    /// exist, `error.AccessDenied` and other I/O errors when it cannot be
+    /// opened, and `error.OutOfMemory` when retaining the result fails. A
+    /// broken individual manifest never fails the whole read.
+    pub fn readConfig(self: *@This()) ![]const PluginConfiguration {
         self.clearManifestResult();
 
         const io = self.threaded_io.io();
-        var plugin_root_dir = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
-        defer plugin_root_dir.close(io);
+        var plugin_root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
+        defer plugin_root.close(io);
 
-        var walker = try plugin_root_dir.walk(self.allocator);
-        defer walker.deinit();
-
-        var manifests: std.ArrayList(Manifest) = .empty;
+        var configurations: std.ArrayList(PluginConfiguration) = .empty;
         errdefer {
-            for (manifests.items) |manifest| {
-                self.freeManifest(manifest);
+            for (configurations.items) |*configuration| {
+                configuration.deinit(self.allocator);
             }
-            manifests.deinit(self.allocator);
+            configurations.deinit(self.allocator);
         }
 
-        while (try walker.next(io)) |entry| {
-            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".toml")) {
+        var dirs = plugin_root.iterate();
+        while (try dirs.next(io)) |dir| {
+            if (dir.kind != .directory) continue;
+
+            var configuration = self.readPluginManifest(dir.name) catch |err| {
+                if (err == error.OutOfMemory) return err;
+
+                // A directory without a manifest is only an error when it
+                // actually provides native libraries. Lua-only directories
+                // are legitimate and must stay silent.
+                if (err == error.FileNotFound) {
+                    const has_native = self.directoryHasNativeLibrary(dir.name) catch |scan_err| {
+                        if (scan_err == error.OutOfMemory) return scan_err;
+                        Log.logLine(
+                            "[zorcerer] {s}/{s}: could not inspect directory ({s}), skipping\n",
+                            .{ plugins_directory, dir.name, @errorName(scan_err) },
+                        );
+                        continue;
+                    };
+                    if (!has_native) continue;
+                }
+
+                logManifestFailure(dir.name, err);
                 continue;
-            }
-
-            const full_path = try std.Io.Dir.path.join(
-                self.allocator,
-                &.{ plugins_directory, entry.path },
-            );
-            defer self.allocator.free(full_path);
-
-            var parser = toml.Parser(Manifest).init(self.allocator);
-            defer parser.deinit();
-
-            var parsed = try parser.parseFile(io, full_path);
-            defer parsed.deinit();
-
-            const manifest = try self.duplicateManifest(parsed.value);
-            manifests.append(self.allocator, manifest) catch |err| {
-                self.freeManifest(manifest);
+            };
+            configurations.append(self.allocator, configuration) catch |err| {
+                configuration.deinit(self.allocator);
                 return err;
             };
         }
 
-        const owned_result = try manifests.toOwnedSlice(self.allocator);
+        const owned_result = try configurations.toOwnedSlice(self.allocator);
         self.manifest_result = owned_result;
         return owned_result;
+    }
+
+    /// Reads, parses, and validates `<plugins_directory>/<dir_name>/manifest.toml`.
+    ///
+    /// Returns a configuration owned by the manager's allocator. Any error
+    /// leaves no allocated state behind.
+    ///
+    /// Errors: filesystem errors from reading the manifest,
+    /// `error.FileSizeOverflow`, `error.KeysNotImplemented`,
+    /// `error.MissingRequiredField`, `error.WrongValueType`,
+    /// `error.InvalidValue` from validation, `error.OutOfMemory`, and any
+    /// TOML parser error.
+    fn readPluginManifest(self: *@This(), dir_name: []const u8) !PluginConfiguration {
+        const io = self.threaded_io.io();
+        const path = try std.Io.Dir.path.join(
+            self.allocator,
+            &.{ plugins_directory, dir_name, manifest_name },
+        );
+        defer self.allocator.free(path);
+
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .unlimited);
+        defer self.allocator.free(raw);
+
+        var configuration = try PluginConfiguration.parseConfig(self.allocator, raw);
+        errdefer configuration.deinit(self.allocator);
+        try configuration.validateForDirectory(dir_name);
+        return configuration;
+    }
+
+    /// Reports whether `<plugins_directory>/<dir_name>` contains at least
+    /// one `.so` file directly inside it.
+    ///
+    /// Used to distinguish a Lua-only directory (no manifest required) from
+    /// a native plugin directory whose manifest is missing.
+    ///
+    /// Errors: filesystem errors from opening or iterating the directory and
+    /// `error.OutOfMemory` when building the path.
+    fn directoryHasNativeLibrary(self: *@This(), dir_name: []const u8) !bool {
+        const io = self.threaded_io.io();
+        const path = try std.Io.Dir.path.join(
+            self.allocator,
+            &.{ plugins_directory, dir_name },
+        );
+        defer self.allocator.free(path);
+
+        var plugin_dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        defer plugin_dir.close(io);
+
+        var files = plugin_dir.iterate();
+        while (try files.next(io)) |file| {
+            if (file.kind == .file and std.mem.endsWith(u8, file.name, ".so")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Logs why one plugin directory's manifest was rejected. Keeps the
+    /// scenario names from docs/architecture/plugin-context.md visible in
+    /// the server console.
+    fn logManifestFailure(dir_name: []const u8, err: anyerror) void {
+        const reason: []const u8 = switch (err) {
+            error.FileNotFound => "manifest.toml not found",
+            error.MissingRequiredField => "manifest is missing required keys",
+            error.KeysNotImplemented => "manifest has unknown keys",
+            error.WrongValueType,
+            error.InvalidValue,
+            error.FileSizeOverflow,
+            => "manifest has invalid values",
+            else => "manifest could not be read or parsed",
+        };
+        Log.logLine(
+            "[zorcerer] {s}/{s}/{s}: {s} ({s}), native plugins skipped\n",
+            .{ plugins_directory, dir_name, manifest_name, reason, @errorName(err) },
+        );
     }
 
     /// Captures how the manager and every plugin send messages into the
@@ -230,13 +290,19 @@ pub const Manager = struct {
         return .{ .logger = if (self.logger) |*logger| logger else null };
     }
 
-    /// Iterates the directories inside plugins_directory, loads each
-    /// directory's `main.lua` into its own ZLua runtime, opens every .so file
-    /// directly inside them, looks up the plugin ABI's load()/unload()
-    /// exports (src/PluginContext.zig), adds the library into the cache and
-    /// calls its load(). Lua scripts do not require a manifest; native
-    /// plugins still do. Sketchy entities are skipped with a log line instead
-    /// of aborting the whole scan; everything cached until then is unloaded on
+    /// Loads every plugin discovered under plugins_directory.
+    ///
+    /// First, each directory's `main.lua` is loaded into its own ZLua
+    /// runtime; Lua scripts do not require a manifest. Then every manifest
+    /// is read and validated through readConfig(), and for each valid
+    /// configuration every .so file directly inside that plugin directory is
+    /// opened, its `load()`/`unload()` exports (src/PluginContext.zig) are
+    /// looked up, it is added to the cache and its `load()` is called.
+    ///
+    /// Directories whose manifest is missing or invalid are logged and
+    /// skipped for native plugins; other directories are still loaded.
+    /// Sketchy entities are likewise skipped with a log line instead of
+    /// aborting the whole scan; everything cached until then is unloaded on
     /// the way out if a fatal error aborts the scan.
     pub fn loadPlugins(self: *@This()) !void {
         if (self.plugins.items.len != 0 or self.lua_scripts.items.len != 0) {
@@ -246,57 +312,29 @@ pub const Manager = struct {
         event_manager = self;
         errdefer self.unloadAll();
 
-        // Plugin configurations parsed from each plugin directory's
-        // manifest.toml, in filesystem discovery order. The list holds
-        // owner-allocated pointers, but their manifest strings are owned by
-        // PluginConfiguration.parseConfig()'s internal arena, which stays
-        // valid for the process' lifetime.
-        // TODO: retain this list on the manager and release it in unloadAll()/
-        // deinit(); for now it is only filled so the manifest state is read.
-        var managed_plugins: std.ArrayList(*PluginConfiguration) = .empty;
-
         const io = self.threaded_io.io();
         var plugin_root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
         defer plugin_root.close(io);
 
+        // Lua scripts are independent of the native plugin ABI and do not
+        // need a manifest. A directory may contain both a script and
+        // managed .so plugins.
         var dirs = plugin_root.iterate();
         while (try dirs.next(io)) |dir| {
-            if (dir.kind != .directory) {
-                continue;
-            }
+            if (dir.kind != .directory) continue;
+            self.loadLuaScript(dir.name);
+        }
 
-            var plugin_dir = plugin_root.openDir(io, dir.name, .{ .iterate = true }) catch |err| {
-                Log.logLine("[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n", .{ plugins_directory, dir.name, @errorName(err) });
+        // Only directories with a valid manifest participate in native
+        // plugin loading. readConfig() logs and skips every rejected
+        // manifest, so failures here are per-plugin, not fatal.
+        const configurations = try self.readConfig();
+        for (configurations) |configuration| {
+            var plugin_dir = plugin_root.openDir(io, configuration.id, .{ .iterate = true }) catch |err| {
+                Log.logLine("[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n", .{ plugins_directory, configuration.id, @errorName(err) });
                 continue;
             };
             defer plugin_dir.close(io);
-
-            // Lua scripts are independent of the native plugin ABI and do
-            // not need a manifest. A directory may contain both a script and
-            // managed .so plugins.
-            self.loadLuaScript(dir.name);
-
-            // Plugins that carry a manifest.toml are managed: parse the
-            // manifest and remember its configuration. A directory without
-            // a readable manifest stays unmanaged and is only picked up
-            // through its .so file(s).
-            const manifest_name = "manifest.toml";
-
-            const manifest_toml = plugin_dir.readFileAlloc(io, manifest_name, self.allocator, .unlimited) catch {
-                Log.logLine("[Zorcerer] Failed to load manifest for {s}, skipping native plugins.\n", .{dir.name});
-                continue;
-            };
-            defer self.allocator.free(manifest_toml);
-
-            const configuration = PluginConfiguration.parseConfig(manifest_toml) catch |err| {
-                Log.logLine("[zorcerer] {s}/{s}: {s} parse failed ({s}), plugin skipped\n", .{ plugins_directory, dir.name, manifest_name, @errorName(err) });
-                continue;
-            };
-
-            const configuration_ptr = try self.allocator.create(PluginConfiguration);
-            configuration_ptr.* = configuration;
-
-            try managed_plugins.append(self.allocator, configuration_ptr);
 
             var files = plugin_dir.iterate();
             while (try files.next(io)) |file| {
@@ -304,7 +342,7 @@ pub const Manager = struct {
                     continue;
                 }
 
-                try self.cachePlugin(dir.name, file.name);
+                try self.cachePlugin(configuration.id, file.name);
             }
         }
     }

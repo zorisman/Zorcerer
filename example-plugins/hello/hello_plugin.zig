@@ -57,9 +57,9 @@ const report_uri = "plugin://hello.txt";
 /// Directory whose non-directory entries the report lists.
 const materials_uri = "game://materials";
 
-/// Builds the context `filesystem.parsePath()` needs. Only `lib_path`
-/// affects URI resolution: it is relative to the Zorcerer root, so
-/// `plugin://` resolves to this plugin's directory (`plugins/hello`).
+/// Builds the context `filesystem.parsePath()` needs. `id` names the plugin
+/// directory, so `plugin://` resolves to `plugins/hello` under the Zorcerer
+/// root; `path` is this plugin's library relative to that directory.
 fn pluginContext() filesystem.PluginContext {
     return .{
         .config = .{
@@ -67,7 +67,7 @@ fn pluginContext() filesystem.PluginContext {
             .name = "Hello Example",
             .version = "0.1.0",
             .author = "Zorcerer",
-            .path = "plugins/hello/hello_plugin.so",
+            .path = "./hello_plugin.so",
         },
     };
 }

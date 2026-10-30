@@ -212,7 +212,7 @@ fn load(
         return false;
     };
 
-    const manifests: ?[]const Manager.Manifest = plugin_manager.readConfig() catch null;
+    const manifests = plugin_manager.readConfig() catch null;
     if (manifests) |m| {
         for (m) |manifest| {
             std.debug.print("\n{s}: {s}\n", .{ manifest.id, manifest.version });
