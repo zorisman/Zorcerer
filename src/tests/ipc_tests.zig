@@ -150,7 +150,7 @@ test "mock JSON-RPC request/response flow" {
         .integer => |value| @as(f64, @floatFromInt(value)),
         else => return error.UnexpectedResultType,
     };
-    std.debug.print("mockAddTwoNumbers result: {}\n", .{add_result});
+    std.log.info("mockAddTwoNumbers result: {}\n", .{add_result});
     try std.testing.expectEqual(@as(f64, 6.0), add_result);
 
     var read_response = try sender.call("mockReadStruct", .{ .text = "Hello" }, zjr.RpcId.of(8));
@@ -159,6 +159,6 @@ test "mock JSON-RPC request/response flow" {
     try std.testing.expect(!read.hasErr());
     try std.testing.expect(read.id.eql(8));
     const read_result = read.result.string;
-    std.debug.print("mockReadStruct result: {s}\n", .{read_result});
+    std.log.info("mockReadStruct result: {s}\n", .{read_result});
     try std.testing.expectEqualStrings("Hello", read_result);
 }
