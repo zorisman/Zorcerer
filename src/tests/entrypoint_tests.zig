@@ -1,10 +1,22 @@
 const std = @import("std");
 const zjr = @import("zjr");
+const Entrypoint = @import("../core/Entrypoint.zig");
+const Vsp = @import("../core/Vsp.zig");
 const fork = @import("../core/ForkProcess.zig");
 const Ipc = @import("../core/Ipc.zig");
 const JsonRpc = @import("../core/JsonRpc.zig");
 const Manager = @import("../core/PluginManager.zig");
 const Log = @import("../io/Log.zig");
+
+/// Mirrors Entrypoint.PluginObject so tests can inspect the published vtable.
+const PluginObject = extern struct {
+    vptr: [*]const Vsp.Slot,
+};
+
+/// Factory that resolves no engine interface; `load` refuses it immediately.
+fn noEngineInterface(_: [*:0]const u8, _: ?*c_int) callconv(.c) ?*anyopaque {
+    return null;
+}
 
 test {
     _ = @import("zjr");
@@ -20,6 +32,40 @@ fn testReportChild(fd: std.os.linux.fd_t) void {
 fn testLogChild(fd: std.os.linux.fd_t) void {
     Log.setupIpc(fd);
     Log.pluginPrint(undefined, "plugin log line\n");
+}
+
+test "CreateInterface publishes a populated VSP vtable" {
+    for (Vsp.plugin_interface_versions) |version| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrintZ(&name_buffer, "{s}", .{version});
+
+        var return_code: c_int = -1;
+        const interface_ptr = Entrypoint.CreateInterface(name.ptr, &return_code) orelse
+            return error.ExpectedInterface;
+        try std.testing.expectEqual(Vsp.iface_ok, return_code);
+
+        const object: *const PluginObject = @ptrCast(@alignCast(interface_ptr));
+        for (object.vptr[0..Vsp.VTable.slot_count]) |slot| {
+            try std.testing.expect(slot != null);
+        }
+
+        const description: *const fn (*anyopaque) callconv(.c) [*:0]const u8 =
+            @ptrCast(object.vptr[4].?);
+        try std.testing.expectEqualStrings("Zorcerer", std.mem.span(description(interface_ptr)));
+
+        const load: *const fn (
+            *anyopaque,
+            Vsp.CreateInterfaceFn,
+            Vsp.CreateInterfaceFn,
+        ) callconv(.c) bool = @ptrCast(object.vptr[0].?);
+        try std.testing.expect(!load(interface_ptr, noEngineInterface, noEngineInterface));
+    }
+}
+
+test "CreateInterface rejects unknown interface versions" {
+    var return_code: c_int = -1;
+    try std.testing.expect(Entrypoint.CreateInterface("IServerPluginCallbacks999", &return_code) == null);
+    try std.testing.expectEqual(Vsp.iface_failed, return_code);
 }
 
 test "child logging is sent over IPC" {

@@ -96,7 +96,26 @@ const PluginObject = extern struct {
     vptr: [*]const Vsp.Slot,
 };
 
-var plugin_instance = PluginObject{ .vptr = undefined };
+/// VSP callbacks this Entrypoint implements. `Vsp.VTable` owns the slot
+/// order; this instance only selects the concrete functions.
+const plugin_vtable = Vsp.VTable{
+    .load = load,
+    .unload = unload,
+    .pause = pause,
+    .unpause = unpause,
+    .getPluginDescription = getPluginDescription,
+    .levelInit = levelInit,
+    .serverActivate = serverActivate,
+    .levelShutdown = levelShutdown,
+};
+
+/// Stable storage for the slot array generated from `plugin_vtable`. It must
+/// outlive the engine's use of the plugin instance, so it lives in a global
+/// rather than on `CreateInterface`'s stack. `CreateInterface` fills it
+/// before publishing `plugin_instance` to the engine.
+var source_vtable: [Vsp.VTable.slot_count]Vsp.Slot = undefined;
+
+var plugin_instance = PluginObject{ .vptr = &source_vtable };
 var engine: ?*anyopaque = null;
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
@@ -180,21 +199,21 @@ fn load(
 
     if (!std.mem.eql(u8, engine_version, Indexes.interfaceversion_vengineserver)) {
         Log.logLine(
-            "[MyLoader] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
+            "[Zorcerer] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
             .{ Indexes.interfaceversion_vengineserver, engine_version },
         );
         return false;
     }
 
-    Log.logLine("[MyLoader] Load() reached, engine version confirmed: {s}\n", .{engine_version});
+    Log.logLine("[Zorcerer] Load() reached, engine version confirmed: {s}\n", .{engine_version});
 
     if (manager_child != null) {
-        Log.logLine("[MyLoader] plugin manager is already running; refusing a second one\n", .{});
+        Log.logLine("[Zorcerer] plugin manager is already running; refusing a second one\n", .{});
         return false;
     }
 
     manager_child = fork.forkChild(pluginManagerChild) catch |err| {
-        Log.logLine("[MyLoader] forking the plugin manager failed: {s}\n", .{@errorName(err)});
+        Log.logLine("[Zorcerer] forking the plugin manager failed: {s}\n", .{@errorName(err)});
         return false;
     };
 
@@ -205,7 +224,7 @@ fn load(
     // closes the socket and reaps it.
     JsonRpc.jsonListener(manager_child.?.socket, null) catch |err| {
         if (err != error.PluginLoadFailed) {
-            Log.logLine("[MyLoader] plugin manager startup failed: {s}\n", .{@errorName(err)});
+            Log.logLine("[Zorcerer] plugin manager startup failed: {s}\n", .{@errorName(err)});
         }
         if (manager_child) |*child| child.finish() catch {};
         manager_child = null;
@@ -224,13 +243,13 @@ fn load(
 
 fn unload(this: *anyopaque) callconv(.c) void {
     _ = this;
-    Log.logLine("[MyLoader] unloading, removing demo hooks.\n", .{});
+    Log.logLine("[Zorcerer] unloading, removing demo hooks.\n", .{});
 
     if (manager_child) |*child| {
         // Closing our end is the shutdown signal: the child's event listener
         // sees EOF, unloads its plugins and exits, so finish() can reap it.
         child.finish() catch |err| {
-            Log.logLine("[MyLoader] plugin manager shutdown failed: {s}\n", .{@errorName(err)});
+            Log.logLine("[Zorcerer] plugin manager shutdown failed: {s}\n", .{@errorName(err)});
         };
         manager_child = null;
     }
@@ -264,7 +283,7 @@ fn sendManagerEvent(event: Ipc.Event) void {
 
     Ipc.sendEvent(child.socket, event) catch |err| {
         Log.logLine(
-            "[MyLoader] sending the {s} event to the plugin manager failed: {s}\n",
+            "[Zorcerer] sending the {s} event to the plugin manager failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
         );
         return;
@@ -272,17 +291,69 @@ fn sendManagerEvent(event: Ipc.Event) void {
 
     JsonRpc.jsonListener(child.socket, Ipc.event_request_id) catch |err| {
         Log.logLine(
-            "[MyLoader] handling the plugin manager's reply to {s} failed: {s}\n",
+            "[Zorcerer] handling the plugin manager's reply to {s} failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
         );
     };
 }
 
+/// VSP `Pause` callback: notifies the manager that the game was paused.
+fn pause(this: *anyopaque) callconv(.c) void {
+    _ = this;
+    sendManagerEvent(.pause);
+}
 
-export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {
+/// VSP `UnPause` callback: notifies the manager that the game was unpaused.
+fn unpause(this: *anyopaque) callconv(.c) void {
+    _ = this;
+    sendManagerEvent(.unpause);
+}
+
+/// VSP `GetPluginDescription` callback: returns the text the engine shows in
+/// `plugin_print`. The returned string is static and needs no release.
+fn getPluginDescription(this: *anyopaque) callconv(.c) [*:0]const u8 {
+    _ = this;
+    return "Zorcerer";
+}
+
+/// VSP `LevelInit` callback: logs the map and notifies the manager.
+/// `map_name` is the engine-owned, zero-terminated map name; it is only read
+/// during this call.
+fn levelInit(this: *anyopaque, map_name: [*:0]const u8) callconv(.c) void {
+    _ = this;
+    Log.logLine("[Zorcerer] LevelInit: {s}\n", .{std.mem.span(map_name)});
+    sendManagerEvent(.levelInit);
+}
+
+/// VSP `ServerActivate` callback: logs the edict and client limits and
+/// notifies the manager. `edict_list` is deliberately ignored because the
+/// manager receives no engine memory across the process boundary.
+fn serverActivate(
+    this: *anyopaque,
+    edict_list: *anyopaque,
+    edict_count: c_int,
+    client_max: c_int,
+) callconv(.c) void {
+    _ = this;
+    _ = edict_list;
+    Log.logLine("[Zorcerer] ServerActivate: {d} edicts, {d} max clients\n", .{ edict_count, client_max });
+    sendManagerEvent(.serverActivate);
+}
+
+/// VSP `LevelShutdown` callback: logs the shutdown and notifies the manager.
+fn levelShutdown(this: *anyopaque) callconv(.c) void {
+    _ = this;
+    Log.logLine("[Zorcerer] LevelShutdown\n", .{});
+    sendManagerEvent(.levelShutdown);
+}
+
+pub export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {
     const requested = std.mem.span(name);
     for (Vsp.plugin_interface_versions) |version| {
         if (std.mem.eql(u8, requested, version)) {
+            // Initialize before publishing the instance: the engine uses the
+            // vptr as soon as CreateInterface returns.
+            source_vtable = plugin_vtable.intoSourceVTable();
             if (return_code) |rc| rc.* = Vsp.iface_ok;
             return @ptrCast(&plugin_instance);
         }

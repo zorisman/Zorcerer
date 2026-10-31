@@ -1,9 +1,17 @@
+/// Typed description of the `IServerPluginCallbacks` methods the Entrypoint
+/// implements. Field order is the Source vtable slot order; `intoSourceVTable`
+/// turns one into the flat pointer array the engine consumes.
+///
+/// Every callback receives the plugin instance pointer as `this`; the
+/// Entrypoint ignores it because its state is process-global.
 pub const VTable = struct {
+    /// Slot 0: called once by the engine to let the plugin initialize.
+    /// Returning false tells the engine the plugin refused to load.
     load: *const fn (
         this: *anyopaque,
         interface_factory: CreateInterfaceFn,
         game_server_factory: CreateInterfaceFn,
-    ) callconv(.c) void,
+    ) callconv(.c) bool,
 
     unload: *const fn (
         this: *anyopaque,
@@ -23,7 +31,7 @@ pub const VTable = struct {
 
     levelInit: *const fn (
         this: *anyopaque,
-        map_name: [*:0]const u8
+        map_name: [*:0]const u8,
     ) callconv(.c) void = VspDefaults.levelInit,
 
     serverActivate: *const fn (
@@ -35,28 +43,44 @@ pub const VTable = struct {
 
     gameFrame: *const fn (
         this: *anyopaque,
-        simulating: bool
+        simulating: bool,
     ) callconv(.c) void = VspDefaults.gameFrame,
 
     levelShutdown: *const fn (
-        this: *anyopaque
+        this: *anyopaque,
     ) callconv(.c) void = VspDefaults.levelShutdown,
 
+    /// Number of leading slots described by named fields, in vtable order.
+    pub const implemented_count = 9;
 
-    pub fn intoSourceVTable(self: *@This()) []const Slot {
-        const vtable = [_]Slot{
-            self.VTable.load,
-            self.VTable.unload,
-            self.VTable.pause,
-            self.VTable.unpause,
-            self.VTable.getPluginDescription,
-            self.VTable.levelInit,
-            self.VTable.serverActivate,
-            self.VTable.gameFrame,
-            self.VTable.levelShutdown,
-        } ++ ([_]Slot{@ptrCast(&genericStub)} ** stub_count);
+    /// Total number of slots in a generated vtable, including the padding
+    /// that makes it safe for interface versions newer than the implemented
+    /// methods.
+    pub const slot_count = implemented_count + stub_count;
 
-        return vtable;
+    /// Converts this description into the flat slot array the engine reads
+    /// through the plugin instance's vptr.
+    ///
+    /// The returned array is a value, not a view into `self`, so it stays
+    /// independent of the `VTable` and of this call's stack frame. The caller
+    /// must store it somewhere with a stable address (for example a global)
+    /// before publishing a pointer to it to the engine.
+    pub fn intoSourceVTable(self: *const @This()) [slot_count]Slot {
+        var source: [slot_count]Slot = undefined;
+        source[0] = @ptrCast(self.load);
+        source[1] = @ptrCast(self.unload);
+        source[2] = @ptrCast(self.pause);
+        source[3] = @ptrCast(self.unpause);
+        source[4] = @ptrCast(self.getPluginDescription);
+        source[5] = @ptrCast(self.levelInit);
+        source[6] = @ptrCast(self.serverActivate);
+        source[7] = @ptrCast(self.gameFrame);
+        source[8] = @ptrCast(self.levelShutdown);
+
+        for (source[implemented_count..]) |*slot| {
+            slot.* = @ptrCast(&genericStub);
+        }
+        return source;
     }
 };
 
@@ -132,7 +156,6 @@ const VspDefaults = struct {
     pub fn levelShutdown(this: *anyopaque) callconv(.c) void {
         _ = this;
     }
-
 };
 
 /// Placeholder for every method this foundation doesn't implement yet.
