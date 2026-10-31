@@ -51,8 +51,15 @@ Scenarios:
     3. Invalid or missing `load`/`unload` symbols (`missing_symbol`)
     
 4. Instance creation
-Sending to the Plugin Manager successful instance creation event
-On error: Stop loading. Send to the Plugin Manager error of corresponding scenario.
+The manager opens the library named by the manifest, builds the plugin's
+`PluginContext`, and calls its `load(ctx)`. A zero return value marks the
+plugin active and emits an `instance_created` manager event carrying the
+plugin id, the library path, and the context that was handed to `load()`.
+The same context stays valid until the plugin is unloaded.
+
+On error: Stop loading the plugin and its transitive dependents, emit a
+`library_rejected` manager event with `invalid_configuration`, close the
+library, and release the context.
 Scenarios:
 
 5. Initialization - Preparing for runtime

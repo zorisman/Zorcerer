@@ -78,6 +78,20 @@ pub const ManagerEvent = union(enum) {
         /// Details about the rejected dependency edge or cycle.
         rejection: PluginDependency.Rejection,
     },
+    /// The plugin's dynamic library was opened, its context was created,
+    /// and its `load()` returned 0. The plugin is now active and remains
+    /// cached until `unloadAll()`.
+    ///
+    /// The event carries the same context that was handed to `load()`; it is
+    /// owned by the manager and stays valid until the plugin is unloaded.
+    instance_created: struct {
+        /// Id of the activated plugin.
+        plugin_id: []const u8,
+        /// Library path the manager opened for this plugin.
+        path: []const u8,
+        /// Context handed to the plugin's `load()` and `unload()`.
+        context: *const abi.PluginContext,
+    },
     /// The plugin's dynamic library could not be opened, loaded, or did not
     /// expose the required ABI symbols. The plugin and its transitively
     /// dependent plugins are skipped.
@@ -571,6 +585,11 @@ pub const Manager = struct {
         }
 
         plugin.active = true;
+        self.notifyManagerEvent(.{ .instance_created = .{
+            .plugin_id = plugin.context.plugin.id.slice(),
+            .path = plugin.path,
+            .context = plugin.context,
+        } });
         return true;
     }
 
@@ -620,6 +639,12 @@ pub const Manager = struct {
                         .{ rejected.plugin_id, rejected.rejection.reason.text() },
                     );
                 }
+            },
+            .instance_created => |created| {
+                Log.logLine(
+                    "[zorcerer] {s}: instance created ({s})\n",
+                    .{ created.plugin_id, created.path },
+                );
             },
             .library_rejected => |rejected| {
                 if (rejected.detail) |detail| {
@@ -931,4 +956,117 @@ fn respondInvalidEvent(fd: std.os.linux.fd_t, request_json: []const u8) bool {
         return false;
     };
     return true;
+}
+
+// --- Tests -------------------------------------------------------------------
+
+/// Captures the manager events a test cares about. Borrowed payloads are
+/// inspected inside the callback and only stable values are retained.
+const TestEventCollector = struct {
+    /// Whether `.instance_created` was observed.
+    saw_instance_created: bool = false,
+    /// Whether `.library_rejected` with `.invalid_configuration` was observed.
+    saw_invalid_configuration: bool = false,
+    /// Plugin id carried by the last `.instance_created` event.
+    plugin_id: []const u8 = "",
+    /// Context carried by the last `.instance_created` event.
+    context: ?*const abi.PluginContext = null,
+
+    /// `ManagerListener.notify` implementation that records the event.
+    fn notify(raw_context: ?*anyopaque, event: ManagerEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(raw_context.?));
+        switch (event) {
+            .instance_created => |created| {
+                self.saw_instance_created = true;
+                self.plugin_id = created.plugin_id;
+                self.context = created.context;
+            },
+            .library_rejected => |rejected| {
+                if (rejected.reason == .invalid_configuration) {
+                    self.saw_invalid_configuration = true;
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+/// Plugin load() that succeeds.
+fn testLoadSuccess(_: *abi.PluginContext) callconv(.c) c_int {
+    return 0;
+}
+
+/// Plugin load() that reports a rejected instance.
+fn testLoadFailure(_: *abi.PluginContext) callconv(.c) c_int {
+    return 1;
+}
+
+/// Plugin unload() used by the fake library.
+fn testUnload(_: *abi.PluginContext) callconv(.c) c_int {
+    return 0;
+}
+
+/// Builds a plugin record whose library exports the test callbacks.
+///
+/// The handle is never used because the tests call only `load()` through
+/// `activatePlugin`.
+fn testPlugin(context: *abi.PluginContext, load: abi.LoadFn) Plugin {
+    return .{
+        .path = "test-plugin.so",
+        .library = .{
+            .handle = undefined,
+            .load = load,
+            .unload = testUnload,
+        },
+        .context = context,
+    };
+}
+
+/// Builds the minimal context `activatePlugin` needs.
+fn testPluginContext() abi.PluginContext {
+    return .{
+        .abi_version = abi.abi_version,
+        .struct_size = @sizeOf(abi.PluginContext),
+        .logger = null,
+        .plugin = .{
+            .id = abi.Text.fromSlice("test-plugin"),
+            .name = abi.Text.fromSlice("Test Plugin"),
+            .version = abi.Text.fromSlice("1.0.0"),
+            .author = abi.Text.fromSlice("Zorcerer"),
+            .library_path = abi.Text.fromSlice("test-plugin.so"),
+        },
+    };
+}
+
+test "activatePlugin reports instance creation after a successful load" {
+    var manager = Manager.init();
+    defer manager.deinit();
+
+    var collector = TestEventCollector{};
+    manager.setManagerListener(.{ .context = &collector, .notify = TestEventCollector.notify });
+
+    var context = testPluginContext();
+    var plugin = testPlugin(&context, testLoadSuccess);
+
+    try std.testing.expect(manager.activatePlugin(&plugin));
+    try std.testing.expect(plugin.active);
+    try std.testing.expect(collector.saw_instance_created);
+    try std.testing.expectEqualStrings("test-plugin", collector.plugin_id);
+    try std.testing.expect(collector.context == &context);
+}
+
+test "activatePlugin reports a rejected instance when load fails" {
+    var manager = Manager.init();
+    defer manager.deinit();
+
+    var collector = TestEventCollector{};
+    manager.setManagerListener(.{ .context = &collector, .notify = TestEventCollector.notify });
+
+    var context = testPluginContext();
+    var plugin = testPlugin(&context, testLoadFailure);
+
+    try std.testing.expect(!manager.activatePlugin(&plugin));
+    try std.testing.expect(!plugin.active);
+    try std.testing.expect(collector.saw_invalid_configuration);
+    try std.testing.expect(!collector.saw_instance_created);
 }
