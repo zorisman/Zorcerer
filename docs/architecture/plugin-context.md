@@ -12,11 +12,21 @@ Scenarios:
 3. .toml not found
 
 2. Dependency resolution
-Awaiting for dependencies, if the plugin has any. Event "Awaiting dependencies"
+Native plugins may declare an optional `[dependencies]` table in
+`manifest.toml`. Keys are plugin ids and values are semantic-version
+requirements (`*`, exact `1.2.3`, `^1.2.3`, `~1.2.3`, and `>`, `>=`, `<`,
+`<=` comparators). The manager validates the graph, emits an "Awaiting
+dependencies" event to its in-process listener, and loads plugins in
+dependency-first order. Plugins whose dependencies are missing, version-
+mismatched, cyclic, or failed to load are skipped together with their
+transitive dependents; unrelated plugins continue loading.
 
-On error: Stop loading. Send to the Plugin Manager error of corresponding scenario.
+On error: Stop loading the affected plugin subtree. Send to the Plugin Manager error of corresponding scenario.
 Scenarios:
 1. Dependencies not found
+2. Dependency version mismatch
+3. Dependency cycle
+4. Dependency failed to load
 
 3. Dynlib loading
 On error: Stop loading. Send to the Plugin Manager error of corresponding scenario. 

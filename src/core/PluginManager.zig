@@ -4,6 +4,7 @@ const root = @import("../root.zig");
 const abi = root.abi;
 const Log = root.io.Log;
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
+const PluginDependency = @import("PluginDependency.zig");
 const zlua = @import("zlua");
 
 /// Plugin directory relative to the process working directory.
@@ -54,19 +55,61 @@ pub const LuaScript = struct {
     runtime: zlua.runtime.Runtime,
 };
 
+/// One dependency-resolution event emitted by the manager.
+///
+/// Payload slices borrow the manager's validated configurations and are only
+/// valid for the duration of the listener callback. A listener that needs to
+/// retain them must copy the data.
+pub const DependencyEvent = union(enum) {
+    /// The manager reached a plugin that declares dependencies and passed
+    /// graph validation. The event is delivered immediately before its
+    /// dynamic library is opened.
+    awaiting_dependencies: struct {
+        /// Id of the plugin whose dependencies are being processed.
+        plugin_id: []const u8,
+        /// Dependencies declared by that plugin, sorted by id.
+        dependencies: []const PluginConfiguration.Dependency,
+    },
+    /// The plugin will not be loaded because a dependency is missing,
+    /// mismatched, part of a cycle, or failed to load.
+    dependency_rejected: struct {
+        /// Id of the plugin that will be skipped.
+        plugin_id: []const u8,
+        /// Details about the rejected dependency edge or cycle.
+        rejection: PluginDependency.Rejection,
+    },
+};
+
+/// In-process sink for dependency-resolution events.
+///
+/// The manager and the loaded plugins live in the same process, so this is a
+/// direct Zig callback rather than an IPC message. The plugin itself cannot
+/// receive `awaiting_dependencies`: dependency resolution happens before its
+/// dynamic library is opened.
+pub const DependencyListener = struct {
+    /// Opaque value passed back to `notify`; may be null.
+    context: ?*anyopaque,
+    /// Called synchronously for every dependency event.
+    notify: *const fn (context: ?*anyopaque, event: DependencyEvent) void,
+};
+
 /// Minimal plugin manager.
+///
 /// readConfig() returns validated plugin configurations owned by the
 /// manager. The returned data remains valid until the next readConfig()
 /// call or deinit().
 ///
 /// Independently of manifests, loadPlugins() discovers each directory's
 /// `main.lua` (see LuaScript) and its plugin libraries (see plugins_directory
-/// and Plugin), caches them and calls each plugin's load(); unloadAll()
-/// reverses that for every plugin that became active, then releases the cache. Plugins only ever talk to the host through
-/// src/PluginContext.zig, so no plugin-defined code needs direct links into the
-/// process. A plugin is skipped (with a log line through the logger) when
-/// its directory cannot be opened, its manifest is missing or invalid,
-/// dlopen() fails or an export is missing.
+/// and Plugin), resolves the native plugins' dependency graph, caches them
+/// in dependency-first order and calls each plugin's load(); unloadAll()
+/// reverses that for every plugin that became active, then releases the
+/// cache. Plugins only ever talk to the host through src/PluginContext.zig,
+/// so no plugin-defined code needs direct links into the process. A plugin is
+/// skipped (with a log line through the logger, or a DependencyListener
+/// event) when its directory cannot be opened, its manifest is missing or
+/// invalid, a dependency cannot be satisfied, dlopen() fails, or an export
+/// is missing.
 pub const Manager = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
 
@@ -80,6 +123,10 @@ pub const Manager = struct {
     /// How to print into the server console, captured by setLogger() and
     /// handed to every plugin inside HostApi. Null until setLogger().
     logger: ?abi.Logger = null,
+
+    /// Optional in-process observer for dependency-resolution events.
+    /// When null, events are logged through the manager's logger.
+    dependency_listener: ?DependencyListener = null,
 
     /// Cached plugin libraries: filled by loadPlugins(), emptied and
     /// released by unloadAll().
@@ -284,6 +331,17 @@ pub const Manager = struct {
         self.logger = .{ .context = self, .print = Log.pluginPrint };
     }
 
+    /// Installs the in-process observer for dependency-resolution events.
+    ///
+    /// Passing a listener replaces any previous one; there is no separate
+    /// clear function because the caller can keep its own lifetime and stop
+    /// observing by installing a no-op listener. The listener is called
+    /// synchronously from loadPlugins() on the manager's thread, and its
+    /// event payload borrows the manager's manifests.
+    pub fn setDependencyListener(self: *@This(), listener: DependencyListener) void {
+        self.dependency_listener = listener;
+    }
+
     /// Builds the HostApi handed to plugin entry points. The returned
     /// value borrows self.logger and is only valid while self lives.
     fn hostApi(self: *@This()) abi.HostApi {
@@ -294,16 +352,24 @@ pub const Manager = struct {
     ///
     /// First, each directory's `main.lua` is loaded into its own ZLua
     /// runtime; Lua scripts do not require a manifest. Then every manifest
-    /// is read and validated through readConfig(), and for each valid
-    /// configuration every .so file directly inside that plugin directory is
-    /// opened, its `load()`/`unload()` exports (src/PluginContext.zig) are
-    /// looked up, it is added to the cache and its `load()` is called.
+    /// is read and validated through readConfig(), the native dependency
+    /// graph is resolved, and each accepted plugin directory is loaded in
+    /// dependency-first order: every .so file directly inside it is opened,
+    /// its `load()`/`unload()` exports (src/PluginContext.zig) are looked up,
+    /// it is added to the cache and its `load()` is called.
     ///
-    /// Directories whose manifest is missing or invalid are logged and
-    /// skipped for native plugins; other directories are still loaded.
-    /// Sketchy entities are likewise skipped with a log line instead of
-    /// aborting the whole scan; everything cached until then is unloaded on
-    /// the way out if a fatal error aborts the scan.
+    /// Manifests that fail validation are logged and skipped for native
+    /// plugins. Plugins with a missing dependency, a version mismatch, a
+    /// dependency cycle, or a dependency that failed to load are reported
+    /// through the DependencyListener (or the log when no listener is
+    /// installed) and skipped together with their transitive dependents.
+    /// Other plugins are still loaded. Everything cached until then is
+    /// unloaded on the way out if a fatal error aborts the scan.
+    ///
+    /// Individual plugin rejections are not fatal: loadPlugins() returns
+    /// successfully even when every native plugin is skipped. Only global
+    /// failures such as `error.OutOfMemory` or an unreadable plugin root
+    /// propagate.
     pub fn loadPlugins(self: *@This()) !void {
         if (self.plugins.items.len != 0 or self.lua_scripts.items.len != 0) {
             return error.AlreadyLoaded;
@@ -329,52 +395,134 @@ pub const Manager = struct {
         // plugin loading. readConfig() logs and skips every rejected
         // manifest, so failures here are per-plugin, not fatal.
         const configurations = try self.readConfig();
-        for (configurations) |configuration| {
-            var plugin_dir = plugin_root.openDir(io, configuration.id, .{ .iterate = true }) catch |err| {
-                Log.logLine("[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n", .{ plugins_directory, configuration.id, @errorName(err) });
-                continue;
-            };
-            defer plugin_dir.close(io);
 
-            var files = plugin_dir.iterate();
-            while (try files.next(io)) |file| {
-                if (file.kind != .file or !std.mem.endsWith(u8, file.name, ".so")) {
-                    continue;
-                }
+        var resolution = try PluginDependency.resolve(self.allocator, configurations);
+        defer resolution.deinit(self.allocator);
 
-                try self.cachePlugin(configuration.id, file.name);
+        // Ids that must not satisfy dependents: statically rejected plugins
+        // and plugins that fail while their library is loaded.
+        var unavailable = std.StringHashMap(void).init(self.allocator);
+        defer unavailable.deinit();
+
+        // Static graph failures are known before any dynamic library is
+        // opened, so report them first, in manifest order.
+        for (resolution.rejected) |rejection| {
+            const configuration = configurations[rejection.plugin_index];
+            self.notifyDependencyEvent(.{ .dependency_rejected = .{
+                .plugin_id = configuration.id,
+                .rejection = rejection,
+            } });
+            try unavailable.put(configuration.id, {});
+        }
+
+        for (resolution.order) |configuration_index| {
+            const configuration = configurations[configuration_index];
+
+            if (configuration.dependencies.len != 0) {
+                self.notifyDependencyEvent(.{ .awaiting_dependencies = .{
+                    .plugin_id = configuration.id,
+                    .dependencies = configuration.dependencies,
+                } });
             }
+
+            var failed_dependency: ?[]const u8 = null;
+            for (configuration.dependencies) |dependency| {
+                if (unavailable.contains(dependency.id)) {
+                    failed_dependency = dependency.id;
+                    break;
+                }
+            }
+            if (failed_dependency) |dependency_id| {
+                self.notifyDependencyEvent(.{ .dependency_rejected = .{
+                    .plugin_id = configuration.id,
+                    .rejection = .{
+                        .plugin_index = configuration_index,
+                        .reason = .dependency_rejected,
+                        .dependency_id = dependency_id,
+                    },
+                } });
+                try unavailable.put(configuration.id, {});
+                continue;
+            }
+
+            const loaded = try self.loadPluginDirectory(plugin_root, configuration.id);
+            if (!loaded) try unavailable.put(configuration.id, {});
         }
     }
 
-    /// Opens one .so file, resolves its exports, adds it into the cache and
-    /// activates it. Failures remove the plugin from the scan (and free
-    /// everything attached to it) instead of failing loadPlugins().
-    fn cachePlugin(self: *@This(), dir_name: []const u8, file_name: []const u8) !void {
-        const path = try std.Io.Dir.path.join(self.allocator, &.{ plugins_directory, dir_name, file_name });
-        errdefer self.allocator.free(path);
-
-        var lib = std.DynLib.open(path) catch |err| {
-            Log.logLine("[zorcerer] {s}: dlopen failed ({s}), skipping\n", .{ path, @errorName(err) });
-            return;
+    /// Loads every `.so` file directly inside one plugin directory.
+    ///
+    /// Returns true when the plugin directory completed its load step: all
+    /// libraries opened and every `load()` returned zero. A directory with no
+    /// `.so` files is a successful no-op, matching the loader's historical
+    /// treatment of manifest-only plugin directories. Failures are logged by
+    /// `cachePlugin()` and make the whole directory unavailable to dependents,
+    /// even when another library in the same directory loaded successfully.
+    ///
+    /// Errors: `error.OutOfMemory` when caching or path construction fails.
+    fn loadPluginDirectory(
+        self: *@This(),
+        plugin_root: std.Io.Dir,
+        dir_name: []const u8,
+    ) !bool {
+        const io = self.threaded_io.io();
+        var plugin_dir = plugin_root.openDir(io, dir_name, .{ .iterate = true }) catch |err| {
+            Log.logLine(
+                "[zorcerer] {s}/{s}: openDir failed ({s}), skipping\n",
+                .{ plugins_directory, dir_name, @errorName(err) },
+            );
+            return false;
         };
+        defer plugin_dir.close(io);
+
+        var all_loaded = true;
+        var files = plugin_dir.iterate();
+        while (try files.next(io)) |file| {
+            if (file.kind != .file or !std.mem.endsWith(u8, file.name, ".so")) {
+                continue;
+            }
+
+            const loaded = try self.cachePlugin(dir_name, file.name);
+            if (!loaded) all_loaded = false;
+        }
+        return all_loaded;
+    }
+
+    /// Opens one .so file, resolves its exports, adds it into the cache and
+    /// activates it.
+    ///
+    /// A library that cannot be opened or lacks the required exports is
+    /// logged and reported as not loaded; the manager keeps no state for it.
+    /// A library whose `load()` fails stays in the cache as inactive so that
+    /// unloadAll() can still close it, but it is reported as not loaded.
+    ///
+    /// Errors: `error.OutOfMemory` when path construction or caching fails.
+    fn cachePlugin(self: *@This(), dir_name: []const u8, file_name: []const u8) !bool {
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ plugins_directory, dir_name, file_name });
+        var path_owned = false;
+        defer if (!path_owned) self.allocator.free(path);
+
+        const lib = std.DynLib.open(path) catch |err| {
+            Log.logLine("[zorcerer] {s}: dlopen failed ({s}), skipping\n", .{ path, @errorName(err) });
+            return false;
+        };
+        var lib_owned = false;
+        defer if (!lib_owned) lib.close();
 
         const load_fn = lib.lookup(abi.LoadFn, "load") orelse {
             Log.logLine("[zorcerer] {s}: missing load() export, skipping\n", .{path});
-            lib.close();
-            return;
+            return false;
         };
 
         const unload_fn = lib.lookup(abi.UnloadFn, "unload") orelse {
             Log.logLine("[zorcerer] {s}: missing unload() export, skipping\n", .{path});
-            lib.close();
-            return;
+            return false;
         };
 
-        const on_event_fn = lib.lookup(abi.OnEventFn, "onEvent") orelse {
-            return;
-        };
-        _ = on_event_fn;
+        // `onEvent` is optional and not required for loading. Dependency
+        // events are manager-side and never reach the plugin, so they are
+        // not looked up here. Looking it up used to return early and skip
+        // every plugin that did not export it (including the example plugin).
 
         try self.plugins.append(self.allocator, .{
             .path = path,
@@ -382,27 +530,84 @@ pub const Manager = struct {
             .load = load_fn,
             .unload = unload_fn,
         });
+        path_owned = true;
+        lib_owned = true;
 
-        self.activatePlugin(&self.plugins.items[self.plugins.items.len - 1]);
+        return self.activatePlugin(&self.plugins.items[self.plugins.items.len - 1]);
     }
 
-    /// Calls the plugin's load() with the host API; a nonzero status marks
-    /// it inactive so unloadAll() leaves it (and its unload()) alone.
-    fn activatePlugin(self: *@This(), plugin: *Plugin) void {
+    /// Calls the plugin's load() with the host API.
+    ///
+    /// Returns true when the plugin returned zero and was marked active. A
+    /// nonzero status leaves it inactive so unloadAll() skips its unload()
+    /// hook but still closes the library.
+    fn activatePlugin(self: *@This(), plugin: *Plugin) bool {
         var host = self.hostApi();
         const status = plugin.load(&host);
         if (status != 0) {
             Log.logLine("[zorcerer] {s}: load() returned {d}, not marked active\n", .{ plugin.path, status });
-            return;
+            return false;
         }
 
         plugin.active = true;
+        return true;
     }
 
-    /// Runs every active native plugin's unload() in reverse discovery order
-    /// (last loaded unloads first), dlcloses every cached library and releases
-    /// the cache. Lua scripts are notified with `on_unload` in reverse load
-    /// order, then their runtimes and owned strings are released.
+    /// Delivers one dependency event to the installed listener, or logs it
+    /// when no listener is installed.
+    ///
+    /// The default logging path keeps dependency decisions visible in the
+    /// server console without requiring an observer. When a listener is
+    /// installed, it owns presentation; the manager does not log in addition.
+    fn notifyDependencyEvent(self: *@This(), event: DependencyEvent) void {
+        if (self.dependency_listener) |listener| {
+            listener.notify(listener.context, event);
+            return;
+        }
+
+        switch (event) {
+            .awaiting_dependencies => |awaiting| {
+                Log.logLine(
+                    "[zorcerer] {s}: awaiting dependencies\n",
+                    .{awaiting.plugin_id},
+                );
+                for (awaiting.dependencies) |dependency| {
+                    Log.logLine(
+                        "[zorcerer]   {s} {s}\n",
+                        .{ dependency.id, dependency.requirement },
+                    );
+                }
+            },
+            .dependency_rejected => |rejected| {
+                if (rejected.rejection.dependency_id) |dependency_id| {
+                    if (rejected.rejection.required) |required| {
+                        if (rejected.rejection.found_version) |found| {
+                            Log.logLine(
+                                "[zorcerer] {s}: {s} requires {s}, found {s}\n",
+                                .{ rejected.plugin_id, dependency_id, required, found },
+                            );
+                            return;
+                        }
+                    }
+                    Log.logLine(
+                        "[zorcerer] {s}: {s} ({s})\n",
+                        .{ rejected.plugin_id, dependency_id, rejected.rejection.reason.text() },
+                    );
+                } else {
+                    Log.logLine(
+                        "[zorcerer] {s}: {s}\n",
+                        .{ rejected.plugin_id, rejected.rejection.reason.text() },
+                    );
+                }
+            },
+        }
+    }
+
+    /// Runs every active native plugin's unload() in reverse load order
+    /// (last loaded unloads first, so dependents unload before their
+    /// dependencies), dlcloses every cached library and releases the cache.
+    /// Lua scripts are notified with `on_unload` in reverse load order, then
+    /// their runtimes and owned strings are released.
     /// loadPlugins() can be used again afterwards.
     pub fn unloadAll(self: *@This()) void {
         const host = self.hostApi();

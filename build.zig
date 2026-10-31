@@ -194,6 +194,17 @@ pub fn build(b: *std.Build) !void {
     });
     plugin_configuration.addImport("toml", toml);
 
+    // Dependency graph calculation for validated plugin manifests
+    // (src/core/PluginDependency.zig). Kept as its own module so the
+    // resolver can be tested without the manager or the filesystem.
+    const plugin_dependency = b.addModule("plugin-dependency", .{
+        .root_source_file = b.path("src/core/PluginDependency.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_dependency.addImport("plugin-configuration", plugin_configuration);
+
     // ABI contract between the plugin manager and plugin modules
     // (src/PluginContext.zig). The manager imports it through src/root.zig
     // (`abi`); plugin compilations import it as this module, so every side
@@ -273,6 +284,10 @@ pub fn build(b: *std.Build) !void {
         .name = "plugin-configuration-tests",
         .root_module = plugin_configuration,
     });
+    const plugin_dependency_tests = b.addTest(.{
+        .name = "plugin-dependency-tests",
+        .root_module = plugin_dependency,
+    });
     const zlua_tests = b.addTest(.{
         .name = "zlua-tests",
         .root_module = zlua,
@@ -291,6 +306,7 @@ pub fn build(b: *std.Build) !void {
     compile_modules_step.dependOn(&hooks_tests.step);
     compile_modules_step.dependOn(&toml_tests.step);
     compile_modules_step.dependOn(&plugin_configuration_tests.step);
+    compile_modules_step.dependOn(&plugin_dependency_tests.step);
     compile_modules_step.dependOn(&zlua_tests.step);
     compile_modules_step.dependOn(&hello_plugin.step);
 
@@ -305,6 +321,9 @@ pub fn build(b: *std.Build) !void {
 
     const run_plugin_configuration_tests = b.addRunArtifact(plugin_configuration_tests);
     run_plugin_configuration_tests.step.dependOn(compile_modules_step);
+
+    const run_plugin_dependency_tests = b.addRunArtifact(plugin_dependency_tests);
+    run_plugin_dependency_tests.step.dependOn(compile_modules_step);
 
     const run_zlua_tests = b.addRunArtifact(zlua_tests);
     run_zlua_tests.step.dependOn(compile_modules_step);
@@ -321,6 +340,7 @@ pub fn build(b: *std.Build) !void {
     // tests_step.dependOn(&run_toml_tests.step);
 
     tests_step.dependOn(&run_plugin_configuration_tests.step);
+    tests_step.dependOn(&run_plugin_dependency_tests.step);
     tests_step.dependOn(&run_zlua_tests.step);
 
     const should_skip_analyze = b.option(

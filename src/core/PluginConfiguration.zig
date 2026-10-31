@@ -3,9 +3,14 @@
 //! raw TOML text of such a manifest into a validated, caller-owned
 //! `PluginConfiguration`, and generic helpers to read arbitrary TOML (see
 //! `readToml()`).
+//!
+//! Besides the required identity keys, a manifest may contain an optional
+//! `[dependencies]` table. Its keys are plugin ids and its values are version
+//! requirements; see `VersionRequirement` for the accepted grammar.
 
 const std = @import("std");
 const toml = @import("toml");
+const VersionRequirement = @import("VersionRequirement.zig").VersionRequirement;
 
 /// A single plugin's configuration, parsed from its manifest TOML file.
 ///
@@ -35,6 +40,38 @@ pub const PluginConfiguration = struct {
     /// Maximum accepted length of `path`, in bytes.
     pub const max_path_len: usize = 1024;
 
+    /// Maximum number of entries accepted in the optional `[dependencies]`
+    /// table.
+    pub const max_dependencies: usize = 32;
+
+    /// One entry of the manifest's optional `[dependencies]` table.
+    ///
+    /// Ownership: when parsed from a manifest, both strings belong to the
+    /// containing `PluginConfiguration` and are released by its `deinit()`.
+    /// Literal configurations borrow them instead.
+    pub const Dependency = struct {
+        /// Plugin id of the dependency. Must satisfy the same identifier
+        /// rules as `PluginConfiguration.id`.
+        id: []const u8,
+        /// Raw version requirement text from the manifest, for example
+        /// `"^1.2.0"`. `VersionRequirement.parse()` validates it.
+        requirement: []const u8,
+
+        /// Returns whether `version` satisfies this dependency's requirement.
+        ///
+        /// Both the requirement and `version` are expected to have been
+        /// validated by `parseConfig()`/`validateValues()`. Invalid text
+        /// yields false rather than an error, so graph resolution can report
+        /// a normal version mismatch.
+        ///
+        /// Side effects: none.
+        pub fn matches(self: @This(), version: []const u8) bool {
+            const parsed_version = std.SemanticVersion.parse(version) catch return false;
+            const parsed_requirement = VersionRequirement.parse(self.requirement) catch return false;
+            return parsed_requirement.matches(parsed_version);
+        }
+    };
+
     /// Every key that is allowed to appear (as a top-level key) inside a
     /// manifest's TOML file; each entry must correspond 1:1 to a field of
     /// this struct, see the struct's invariant above. Any parsed manifest
@@ -46,6 +83,7 @@ pub const PluginConfiguration = struct {
         "version",
         "author",
         "path",
+        "dependencies",
     };
 
     /// Unique identifier of the plugin, also the name of the directory the
@@ -60,13 +98,21 @@ pub const PluginConfiguration = struct {
     author: []const u8,
     /// Path to the plugin's `.so` library, relative to the plugin directory.
     path: []const u8,
+    /// Optional dependencies declared under the manifest's `[dependencies]`
+    /// table. Empty when the table is absent. When the configuration comes
+    /// from `parseConfig()`, the strings are owned by the configuration.
+    /// Configurations built directly from literals borrow their strings and
+    /// must not be passed to `deinit()`.
+    dependencies: []const Dependency = &.{},
 
     /// Parses and validates the raw TOML text of a plugin manifest into a
     /// `PluginConfiguration`.
     ///
-    /// Every top-level key must be a field of this struct and every field
-    /// must be a top-level string value; the values must additionally pass
-    /// `validateValues()`. Otherwise an error is returned and the
+    /// Every required top-level key must be a field of this struct and every
+    /// required field must be a top-level string value; the values must
+    /// additionally pass `validateValues()`. The optional `[dependencies]`
+    /// table maps plugin ids to version requirement strings and is parsed
+    /// into `dependencies`. Otherwise an error is returned and the
     /// configuration cannot be used.
     ///
     /// Parameters:
@@ -79,10 +125,11 @@ pub const PluginConfiguration = struct {
     ///   `max_config_size` (4 KiB).
     /// - `error.KeysNotImplemented` if the manifest contains a top-level key
     ///   that has no corresponding field in this struct.
-    /// - `error.WrongValueType` if a known key's value is not a TOML string.
-    /// - `error.MissingRequiredField` if a known key is absent entirely.
+    /// - `error.WrongValueType` if a known key's value is not a TOML string,
+    ///   or if `dependencies` is not a table of string values.
+    /// - `error.MissingRequiredField` if a required key is absent entirely.
     /// - `error.InvalidValue` if a value is empty, too long, or fails the
-    ///   identifier/path rules of `validateValues()`.
+    ///   identifier/path/version/dependency rules of `validateValues()`.
     /// - Any error the TOML parser itself can report for malformed input
     ///   (see `toml.Parser(Table).parseString`).
     /// - `error.OutOfMemory` if duplicating the parsed strings fails.
@@ -137,15 +184,22 @@ pub const PluginConfiguration = struct {
 
         // Bind the parser-owned string slices first. They stay valid until
         // `parsed.deinit()` at the end of this function; the validated
-        // values are duplicated into `allocator` before then.
+        // values are duplicated into `allocator` before then. `dependencies`
+        // is the one field whose manifest value is a table rather than a
+        // string, so it is parsed separately below.
         var parsed_values: @This() = undefined;
         inline for (std.meta.fields(@This())) |field| {
+            if (comptime std.mem.eql(u8, field.name, "dependencies")) continue;
             const value = table.get(field.name) orelse return error.MissingRequiredField;
             switch (value) {
                 .string => |str| @field(parsed_values, field.name) = str,
                 else => return error.WrongValueType,
             }
         }
+
+        const dependencies = try parseDependencies(allocator, table.get("dependencies"));
+        errdefer freeDependencies(allocator, dependencies);
+        parsed_values.dependencies = dependencies;
 
         try parsed_values.validateValues();
 
@@ -166,16 +220,20 @@ pub const PluginConfiguration = struct {
             .version = version,
             .author = author,
             .path = path,
+            .dependencies = dependencies,
         };
     }
 
     /// Checks the values of an already parsed configuration.
     ///
     /// `id` must be non-empty, at most `max_id_len` bytes, and consist only
-    /// of ASCII letters, digits, `_` and `-`. `name`, `version` and `author`
-    /// must be non-empty and fit their length limits. `path` must be a
-    /// relative path that stays inside the plugin directory, is at most
-    /// `max_path_len` bytes, and names a `.so` file.
+    /// of ASCII letters, digits, `_` and `-`. `name` and `author` must be
+    /// non-empty and fit their length limits. `version` must be a semantic
+    /// version. `path` must be a relative path that stays inside the plugin
+    /// directory, is at most `max_path_len` bytes, and names a `.so` file.
+    /// `dependencies` must contain at most `max_dependencies` entries; every
+    /// entry needs a valid, unique id different from this plugin's own id,
+    /// and a requirement accepted by `VersionRequirement.parse()`.
     ///
     /// Errors: `error.InvalidValue` when any of the rules above is
     /// violated.
@@ -191,10 +249,26 @@ pub const PluginConfiguration = struct {
         if (self.version.len == 0 or self.version.len > max_version_len) {
             return error.InvalidValue;
         }
+        _ = std.SemanticVersion.parse(self.version) catch return error.InvalidValue;
         if (self.author.len == 0 or self.author.len > max_author_len) {
             return error.InvalidValue;
         }
         try validateLibraryPath(self.path);
+
+        if (self.dependencies.len > max_dependencies) return error.InvalidValue;
+        for (self.dependencies, 0..) |dependency, index| {
+            if (dependency.id.len == 0 or dependency.id.len > max_id_len or
+                !isValidId(dependency.id))
+            {
+                return error.InvalidValue;
+            }
+            if (std.mem.eql(u8, dependency.id, self.id)) return error.InvalidValue;
+            for (self.dependencies[0..index]) |earlier| {
+                if (std.mem.eql(u8, dependency.id, earlier.id)) return error.InvalidValue;
+            }
+            _ = VersionRequirement.parse(dependency.requirement) catch
+                return error.InvalidValue;
+        }
     }
 
     /// Checks the invariants that require the plugin's directory name.
@@ -218,15 +292,109 @@ pub const PluginConfiguration = struct {
     /// `allocator` must be the allocator passed to `parseConfig()`.
     /// Configurations built from literals must not be passed here.
     ///
-    /// Side effects: frees `id`, `name`, `version`, `author` and `path`.
+    /// Side effects: frees `id`, `name`, `version`, `author`, `path` and
+    /// every dependency id and requirement string.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.version);
         allocator.free(self.author);
         allocator.free(self.path);
+        freeDependencies(allocator, self.dependencies);
     }
 };
+
+/// Parses the manifest's optional `[dependencies]` table.
+///
+/// A missing table yields an empty slice. Each table value must be a string
+/// accepted by `VersionRequirement.parse()`. The returned slice and all of
+/// its strings are owned by `allocator`; the caller must release them with
+/// `freeDependencies()`. Entries are sorted by dependency id so graph
+/// processing and error reporting are deterministic.
+///
+/// Errors: `error.WrongValueType` when the value is not a table or an entry
+/// is not a string, `error.InvalidValue` for an invalid requirement or too
+/// many entries, and `error.OutOfMemory` when allocation fails.
+fn parseDependencies(
+    allocator: std.mem.Allocator,
+    value: ?toml.Value,
+) ![]const PluginConfiguration.Dependency {
+    const table_value = value orelse return &.{};
+    const dependency_table = switch (table_value) {
+        .table => |table| table,
+        else => return error.WrongValueType,
+    };
+
+    if (dependency_table.count() > PluginConfiguration.max_dependencies) {
+        return error.InvalidValue;
+    }
+    if (dependency_table.count() == 0) return &.{};
+
+    var dependencies = try allocator.alloc(
+        PluginConfiguration.Dependency,
+        dependency_table.count(),
+    );
+    var filled: usize = 0;
+    errdefer {
+        for (dependencies[0..filled]) |dependency| {
+            allocator.free(dependency.id);
+            allocator.free(dependency.requirement);
+        }
+        allocator.free(dependencies);
+    }
+
+    var iterator = dependency_table.iterator();
+    while (iterator.next()) |entry| {
+        const requirement = switch (entry.value_ptr.*) {
+            .string => |text| text,
+            else => return error.WrongValueType,
+        };
+        _ = VersionRequirement.parse(requirement) catch return error.InvalidValue;
+
+        const id = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(id);
+        const requirement_copy = try allocator.dupe(u8, requirement);
+        errdefer allocator.free(requirement_copy);
+
+        dependencies[filled] = .{
+            .id = id,
+            .requirement = requirement_copy,
+        };
+        filled += 1;
+    }
+
+    std.mem.sort(
+        PluginConfiguration.Dependency,
+        dependencies,
+        {},
+        dependencyLessThan,
+    );
+    return dependencies;
+}
+
+/// Releases a dependency slice produced by `parseDependencies()`.
+///
+/// The empty slice returned for a missing `[dependencies]` table carries no
+/// allocation and is left untouched.
+fn freeDependencies(
+    allocator: std.mem.Allocator,
+    dependencies: []const PluginConfiguration.Dependency,
+) void {
+    for (dependencies) |dependency| {
+        allocator.free(dependency.id);
+        allocator.free(dependency.requirement);
+    }
+    if (dependencies.len != 0) allocator.free(dependencies);
+}
+
+/// Orders dependencies by id for deterministic manifest output.
+fn dependencyLessThan(
+    _: void,
+    left: PluginConfiguration.Dependency,
+    right: PluginConfiguration.Dependency,
+) bool {
+    return std.mem.order(u8, left.id, right.id) == .lt;
+}
 
 /// Returns whether `id` consists only of ASCII letters, digits, `_` and `-`.
 fn isValidId(id: []const u8) bool {
@@ -333,6 +501,137 @@ test "parseConfig parses fully correct TOML" {
     try std.testing.expectEqualStrings("0.1.0", config.version);
     try std.testing.expectEqualStrings("Zorcerer", config.author);
     try std.testing.expectEqualStrings("./hello_plugin.so", config.path);
+    try std.testing.expectEqual(@as(usize, 0), config.dependencies.len);
+}
+
+test "parseConfig parses an optional dependency table" {
+    const source =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2.3"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+        \\
+        \\[dependencies]
+        \\util = "~0.4.3"
+        \\core = "^1.2.0"
+        \\anything = "*"
+    ;
+    var config = try PluginConfiguration.parseConfig(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), config.dependencies.len);
+    // Entries are sorted by id for deterministic processing.
+    try std.testing.expectEqualStrings("anything", config.dependencies[0].id);
+    try std.testing.expectEqualStrings("*", config.dependencies[0].requirement);
+    try std.testing.expectEqualStrings("core", config.dependencies[1].id);
+    try std.testing.expectEqualStrings("^1.2.0", config.dependencies[1].requirement);
+    try std.testing.expectEqualStrings("util", config.dependencies[2].id);
+    try std.testing.expectEqualStrings("~0.4.3", config.dependencies[2].requirement);
+}
+
+test "parseConfig rejects malformed dependency tables" {
+    const wrong_type =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2.3"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+        \\dependencies = ["core"]
+    ;
+    try std.testing.expectError(
+        error.WrongValueType,
+        PluginConfiguration.parseConfig(std.testing.allocator, wrong_type),
+    );
+
+    const wrong_entry_type =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2.3"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+        \\
+        \\[dependencies]
+        \\core = 1
+    ;
+    try std.testing.expectError(
+        error.WrongValueType,
+        PluginConfiguration.parseConfig(std.testing.allocator, wrong_entry_type),
+    );
+
+    const invalid_requirement =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2.3"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+        \\
+        \\[dependencies]
+        \\core = "not a version"
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, invalid_requirement),
+    );
+
+    const invalid_id =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2.3"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+        \\
+        \\[dependencies]
+        \\"bad/id" = "1.0.0"
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, invalid_id),
+    );
+
+    const self_dependency =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2.3"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+        \\
+        \\[dependencies]
+        \\hello = "1.0.0"
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, self_dependency),
+    );
+}
+
+test "parseConfig requires semantic versions" {
+    const source =
+        \\id = "hello"
+        \\name = "Hello Example"
+        \\version = "1.2"
+        \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
+}
+
+test "validateValues rejects duplicate dependencies" {
+    const config = PluginConfiguration{
+        .id = "hello",
+        .name = "Hello Example",
+        .version = "1.2.3",
+        .author = "Zorcerer",
+        .path = "./hello_plugin.so",
+        .dependencies = &.{
+            .{ .id = "core", .requirement = "^1.0.0" },
+            .{ .id = "core", .requirement = "^2.0.0" },
+        },
+    };
+    try std.testing.expectError(error.InvalidValue, config.validateValues());
 }
 
 test "parseConfig fails on partially implemented keys" {
