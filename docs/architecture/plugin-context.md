@@ -45,24 +45,38 @@ On error: Stop loading the plugin and its transitive dependents, emit a
 with unrelated plugins.
 Scenarios:
     1. Dynamic library not found (`library_not_found`)
-    2. Invalid configuration: the file is not a usable dynamic library, or
-       the plugin rejects the context / returns nonzero from `load()`
+    2. Invalid configuration: the file is not a usable dynamic library
        (`invalid_configuration`)
     3. Invalid or missing `load`/`unload` symbols (`missing_symbol`)
     
 4. Instance creation
-The manager opens the library named by the manifest, builds the plugin's
-`PluginContext`, and calls its `load(ctx)`. A zero return value marks the
-plugin active and emits an `instance_created` manager event carrying the
-plugin id, the library path, and the context that was handed to `load()`.
-The same context stays valid until the plugin is unloaded.
+The manager opens the library named by the manifest, resolves its
+`load`/`unload` exports, builds the plugin's `PluginContext`, and caches the
+instance. It then emits an `instance_created` manager event carrying the
+plugin id, the library path, and the context that initialization will hand to
+`load()`. The plugin starts in the `created` state; `load()` is not called
+yet, and the context stays valid until the plugin is unloaded.
 
-On error: Stop loading the plugin and its transitive dependents, emit a
-`library_rejected` manager event with `invalid_configuration`, close the
-library, and release the context.
+On error: Stop creating the plugin and its transitive dependents, emit a
+`library_rejected` manager event with the structured reason, and leave no
+library or context allocated.
 Scenarios:
 
 5. Initialization - Preparing for runtime
+The manager calls each created plugin's `load(ctx)` in dependency-first order.
+It emits `initialization_started` before the call and
+`initialization_finished` after a zero return, then marks the plugin
+`initialized`. A nonzero return emits `library_rejected` with
+`invalid_configuration`, marks the plugin `failed`, and skips its transitive
+dependents with `dependency_rejected`. Failed instances stay cached so
+`unloadAll()` can close the library and release the context, but their
+`unload()` hook is not called.
+
+After the initialization pass completes, the manager emits `runtime_entered`
+and dispatches `on_runtime_entered` to loaded Lua scripts.
+Scenarios:
+1. `load()` returns nonzero (`invalid_configuration`)
+2. A dependency failed to initialize (`dependency_rejected`)
 
 6. Runtime
     1. Event hooking

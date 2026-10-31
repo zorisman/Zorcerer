@@ -25,6 +25,23 @@ const manifest_name = "manifest.toml";
 
 /// One plugin .so held in the manager's cache.
 pub const Plugin = struct {
+    /// Position of this plugin in the manager's lifecycle. Creation and
+    /// initialization are separate phases; only an `initialized` plugin has
+    /// had its load() hook called and must have unload() called.
+    pub const State = enum {
+        /// The library is open and the context exists, but load() has not
+        /// run yet. Instances can stay in this state when a fatal error
+        /// aborts the scan before the initialization pass.
+        created,
+        /// load() returned zero; the plugin participates in the runtime and
+        /// its unload() must run.
+        initialized,
+        /// load() returned nonzero, or a dependency prevented
+        /// initialization. The library and context are still owned by the
+        /// manager until unloadAll(), but unload() is skipped.
+        failed,
+    };
+
     /// Path the library was opened with (joined from plugins_directory and
     /// the manifest's library path). Owned by the manager.
     path: []const u8,
@@ -33,8 +50,20 @@ pub const Plugin = struct {
     /// ABI context handed to load()/unload(). Owned by the manager; its
     /// `Text` fields borrow `manifest_result`.
     context: *abi.PluginContext,
-    /// Whether load() succeeded, i.e. whether unload() must still be run.
-    active: bool = false,
+    /// Current lifecycle state; see `State`.
+    state: State = .created,
+};
+
+/// Bookkeeping entry for one plugin accepted by the creation pass.
+///
+/// The initialization pass walks these entries in the same dependency-first
+/// order. `plugin_index` addresses the manager's `plugins` list and stays
+/// valid because that list is not appended to between the two passes.
+const CreatedPlugin = struct {
+    /// Index into the validated configurations returned by readConfig().
+    configuration_index: usize,
+    /// Index into `Manager.plugins`.
+    plugin_index: usize,
 };
 
 /// One Lua script loaded directly by the manager.
@@ -78,20 +107,41 @@ pub const ManagerEvent = union(enum) {
         /// Details about the rejected dependency edge or cycle.
         rejection: PluginDependency.Rejection,
     },
-    /// The plugin's dynamic library was opened, its context was created,
-    /// and its `load()` returned 0. The plugin is now active and remains
-    /// cached until `unloadAll()`.
+    /// The plugin's dynamic library was opened and its context was created.
+    /// The instance remains cached until `unloadAll()`; initialization, and
+    /// therefore the `load()` hook, happens afterwards.
     ///
-    /// The event carries the same context that was handed to `load()`; it is
-    /// owned by the manager and stays valid until the plugin is unloaded.
+    /// The carried context is owned by the manager and stays valid until the
+    /// plugin is unloaded.
     instance_created: struct {
-        /// Id of the activated plugin.
+        /// Id of the plugin whose instance was created.
         plugin_id: []const u8,
         /// Library path the manager opened for this plugin.
         path: []const u8,
-        /// Context handed to the plugin's `load()` and `unload()`.
+        /// Context that initialization will hand to `load()`.
         context: *const abi.PluginContext,
     },
+    /// The manager is about to call the plugin's `load()` hook.
+    initialization_started: struct {
+        /// Id of the plugin being initialized.
+        plugin_id: []const u8,
+        /// Library path the manager opened for this plugin.
+        path: []const u8,
+    },
+    /// The plugin's `load()` hook returned zero. The plugin is ready for the
+    /// runtime and its `unload()` must run on teardown.
+    initialization_finished: struct {
+        /// Id of the initialized plugin.
+        plugin_id: []const u8,
+        /// Library path the manager opened for this plugin.
+        path: []const u8,
+        /// Context handed to `load()` and reserved for `unload()`.
+        context: *const abi.PluginContext,
+    },
+    /// Every accepted plugin has finished its initialization pass, so the
+    /// manager is entering the runtime phase. Emitted once per successful
+    /// loadPlugins() call.
+    runtime_entered,
     /// The plugin's dynamic library could not be opened, loaded, or did not
     /// expose the required ABI symbols. The plugin and its transitively
     /// dependent plugins are skipped.
@@ -129,10 +179,11 @@ pub const ManagerListener = struct {
 ///
 /// Independently of manifests, loadPlugins() discovers each directory's
 /// `main.lua` (see LuaScript) and its plugin libraries (see plugins_directory
-/// and Plugin), resolves the native plugins' dependency graph, caches them
-/// in dependency-first order and calls each plugin's load(); unloadAll()
-/// reverses that for every plugin that became active, then releases the
-/// cache. Plugins only ever talk to the host through src/core/PluginContext.zig,
+/// and Plugin), resolves the native plugins' dependency graph, creates each
+/// accepted instance in dependency-first order, then initializes them by
+/// calling their load(). After the initialization pass it enters the runtime
+/// phase; unloadAll() reverses that for every initialized plugin, then
+/// releases the cache. Plugins only ever talk to the host through src/core/PluginContext.zig,
 /// so no plugin-defined code needs direct links into the process. A plugin is
 /// skipped (with a log line through the logger, or a ManagerListener event)
 /// when its directory cannot be opened, its manifest is missing or invalid,
@@ -404,20 +455,23 @@ pub const Manager = struct {
     /// First, each directory's `main.lua` is loaded into its own ZLua
     /// runtime; Lua scripts do not require a manifest. Then every manifest
     /// is read and validated through readConfig(), the native dependency
-    /// graph is resolved, and each accepted plugin is loaded in
-    /// dependency-first order: only the library named by the manifest's
-    /// `path` is opened, its `load()`/`unload()` exports
-    /// (src/core/PluginContext.zig) are resolved, a per-plugin context is
-    /// stored, and its `load(ctx)` is called.
+    /// graph is resolved, and each accepted plugin passes through two
+    /// dependency-first phases: creation (open the manifest's `path`, resolve
+    /// its `load()`/`unload()` exports, build the per-plugin context) and
+    /// initialization (call `load(ctx)`).
+    ///
+    /// After every accepted plugin has been initialized, the manager emits
+    /// `runtime_entered` and dispatches `on_runtime_entered` to loaded Lua
+    /// scripts.
     ///
     /// Manifests that fail validation are logged and skipped for native
     /// plugins. Plugins with a missing dependency, a version mismatch, a
-    /// dependency cycle, a dependency that failed to load, or a rejected
-    /// dynamic library are reported through the ManagerListener (or the log
-    /// when no listener is installed) and skipped together with their
-    /// transitive dependents. Other plugins are still loaded. Everything
-    /// cached until then is unloaded on the way out if a fatal error aborts
-    /// the scan.
+    /// dependency cycle, a dependency that failed to create or initialize,
+    /// or a rejected dynamic library are reported through the ManagerListener
+    /// (or the log when no listener is installed) and skipped together with
+    /// their transitive dependents. Other plugins are still loaded.
+    /// Everything cached until then is unloaded on the way out if a fatal
+    /// error aborts the scan.
     ///
     /// Individual plugin rejections are not fatal: loadPlugins() returns
     /// successfully even when every native plugin is skipped. Only global
@@ -459,8 +513,9 @@ pub const Manager = struct {
         var resolution = try PluginDependency.resolve(self.allocator, configurations);
         defer resolution.deinit(self.allocator);
 
-        // Ids that must not satisfy dependents: statically rejected plugins
-        // and plugins that fail while their library is loaded.
+        // Ids that must not satisfy dependents: statically rejected plugins,
+        // plugins whose library could not be created, and plugins whose
+        // initialization failed.
         var unavailable = std.StringHashMap(void).init(self.allocator);
         defer unavailable.deinit();
 
@@ -474,6 +529,13 @@ pub const Manager = struct {
             } });
             try unavailable.put(configuration.id, {});
         }
+
+        // Creation pass: open every accepted library and build its instance
+        // in dependency-first order. load() is deliberately not called yet;
+        // initialization is a separate phase so a creation failure and an
+        // initialization failure remain distinguishable.
+        var created: std.ArrayList(CreatedPlugin) = .empty;
+        defer created.deinit(self.allocator);
 
         for (resolution.order) |configuration_index| {
             const configuration = configurations[configuration_index];
@@ -505,25 +567,69 @@ pub const Manager = struct {
                 continue;
             }
 
-            const loaded = try self.loadPlugin(&configuration);
-            if (!loaded) try unavailable.put(configuration.id, {});
+            const plugin_index = try self.createPlugin(&configuration);
+            if (plugin_index) |index| {
+                try created.append(self.allocator, .{
+                    .configuration_index = configuration_index,
+                    .plugin_index = index,
+                });
+            } else {
+                try unavailable.put(configuration.id, {});
+            }
         }
+
+        // Initialization pass: call each created plugin's load() in the same
+        // dependency-first order. A failure here is reported after creation
+        // and makes the plugin unavailable to its dependents.
+        for (created.items) |entry| {
+            const configuration = configurations[entry.configuration_index];
+            const plugin = &self.plugins.items[entry.plugin_index];
+
+            var failed_dependency: ?[]const u8 = null;
+            for (configuration.dependencies) |dependency| {
+                if (unavailable.contains(dependency.id)) {
+                    failed_dependency = dependency.id;
+                    break;
+                }
+            }
+            if (failed_dependency) |dependency_id| {
+                plugin.state = .failed;
+                self.notifyManagerEvent(.{ .dependency_rejected = .{
+                    .plugin_id = configuration.id,
+                    .rejection = .{
+                        .plugin_index = entry.configuration_index,
+                        .reason = .dependency_rejected,
+                        .dependency_id = dependency_id,
+                    },
+                } });
+                try unavailable.put(configuration.id, {});
+                continue;
+            }
+
+            if (!self.initializePlugin(plugin)) {
+                try unavailable.put(configuration.id, {});
+            }
+        }
+
+        self.notifyManagerEvent(.runtime_entered);
+        self.dispatchEvent("on_runtime_entered");
     }
 
-    /// Opens one plugin's manifest library, builds its context, adds it to
-    /// the cache and activates it.
+    /// Opens one plugin's manifest library, builds its context, and adds the
+    /// inactive instance to the cache.
     ///
     /// Only `configuration.path` is opened; other `.so` files in the same
     /// directory are ignored. A library that cannot be opened or lacks the
     /// required exports is reported through a `library_rejected` event and
-    /// leaves no cached state. A library whose `load()` returns nonzero stays
-    /// cached as inactive so unloadAll() can still close it and release its
-    /// context, but it is reported through the same event and makes the
-    /// plugin unavailable to dependents.
+    /// leaves no cached state. On success the instance starts in
+    /// `.created`; its `load()` hook is run later by `initializePlugin()`.
+    ///
+    /// Returns the new plugin's index in `plugins`, or null when the library
+    /// was rejected and nothing was cached.
     ///
     /// Errors: `error.OutOfMemory` when path construction, context
     /// allocation, or caching fails.
-    fn loadPlugin(self: *@This(), configuration: *const PluginConfiguration) !bool {
+    fn createPlugin(self: *@This(), configuration: *const PluginConfiguration) !?usize {
         const path = try std.Io.Dir.path.join(
             self.allocator,
             &.{ plugins_directory, configuration.id, configuration.path },
@@ -540,7 +646,7 @@ pub const Manager = struct {
                     .reason = rejection.reason,
                     .detail = rejection.detail,
                 } });
-                return false;
+                return null;
             },
             .loaded => |loaded| {
                 var library = loaded;
@@ -552,6 +658,7 @@ pub const Manager = struct {
                 defer if (context_owned) self.allocator.destroy(context);
                 context.* = self.buildContext(configuration);
 
+                const plugin_index = self.plugins.items.len;
                 try self.plugins.append(self.allocator, .{
                     .path = path,
                     .library = library,
@@ -561,21 +668,32 @@ pub const Manager = struct {
                 library_owned = false;
                 context_owned = false;
 
-                return self.activatePlugin(&self.plugins.items[self.plugins.items.len - 1]);
+                self.notifyManagerEvent(.{ .instance_created = .{
+                    .plugin_id = context.plugin.id.slice(),
+                    .path = path,
+                    .context = context,
+                } });
+                return plugin_index;
             },
         }
     }
 
-    /// Calls the plugin's load() with its context.
+    /// Runs one plugin's initialization phase by calling its load() hook.
     ///
-    /// Returns true when the plugin returned zero and was marked active. A
-    /// nonzero status leaves it inactive so unloadAll() skips its unload()
+    /// Returns true when the plugin returned zero and reached `.initialized`.
+    /// A nonzero status leaves it `.failed` so unloadAll() skips its unload()
     /// hook but still closes the library and frees the context. The failure
     /// is reported as `.invalid_configuration`, the closest structured
     /// category for a plugin that rejects the host or cannot initialize.
-    fn activatePlugin(self: *@This(), plugin: *Plugin) bool {
+    fn initializePlugin(self: *@This(), plugin: *Plugin) bool {
+        self.notifyManagerEvent(.{ .initialization_started = .{
+            .plugin_id = plugin.context.plugin.id.slice(),
+            .path = plugin.path,
+        } });
+
         const status = plugin.library.load(plugin.context);
         if (status != 0) {
+            plugin.state = .failed;
             self.notifyManagerEvent(.{ .library_rejected = .{
                 .plugin_id = plugin.context.plugin.id.slice(),
                 .path = plugin.path,
@@ -584,8 +702,8 @@ pub const Manager = struct {
             return false;
         }
 
-        plugin.active = true;
-        self.notifyManagerEvent(.{ .instance_created = .{
+        plugin.state = .initialized;
+        self.notifyManagerEvent(.{ .initialization_finished = .{
             .plugin_id = plugin.context.plugin.id.slice(),
             .path = plugin.path,
             .context = plugin.context,
@@ -646,6 +764,21 @@ pub const Manager = struct {
                     .{ created.plugin_id, created.path },
                 );
             },
+            .initialization_started => |started| {
+                Log.logLine(
+                    "[zorcerer] {s}: initializing ({s})\n",
+                    .{ started.plugin_id, started.path },
+                );
+            },
+            .initialization_finished => |finished| {
+                Log.logLine(
+                    "[zorcerer] {s}: initialized\n",
+                    .{finished.plugin_id},
+                );
+            },
+            .runtime_entered => {
+                Log.logLine("[zorcerer] initialization complete, entering runtime\n", .{});
+            },
             .library_rejected => |rejected| {
                 if (rejected.detail) |detail| {
                     Log.logLine(
@@ -667,7 +800,7 @@ pub const Manager = struct {
         }
     }
 
-    /// Runs every active native plugin's unload() in reverse load order
+    /// Runs every initialized native plugin's unload() in reverse load order
     /// (last loaded unloads first, so dependents unload before their
     /// dependencies), dlcloses every cached library and releases the cache.
     /// Lua scripts are notified with `on_unload` in reverse load order, then
@@ -679,8 +812,7 @@ pub const Manager = struct {
             remaining -= 1;
             const plugin = &self.plugins.items[remaining];
 
-            if (plugin.active) {
-                plugin.active = false;
+            if (plugin.state == .initialized) {
                 const status = plugin.library.unload(plugin.context);
                 if (status != 0) {
                     Log.logLine("[zorcerer] {s}: unload() returned {d}\n", .{ plugin.path, status });
@@ -963,23 +1095,34 @@ fn respondInvalidEvent(fd: std.os.linux.fd_t, request_json: []const u8) bool {
 /// Captures the manager events a test cares about. Borrowed payloads are
 /// inspected inside the callback and only stable values are retained.
 const TestEventCollector = struct {
-    /// Whether `.instance_created` was observed.
-    saw_instance_created: bool = false,
+    /// Whether `.initialization_started` was observed.
+    saw_initialization_started: bool = false,
+    /// Whether `.initialization_finished` was observed.
+    saw_initialization_finished: bool = false,
+    /// Whether `.runtime_entered` was observed.
+    saw_runtime_entered: bool = false,
     /// Whether `.library_rejected` with `.invalid_configuration` was observed.
     saw_invalid_configuration: bool = false,
-    /// Plugin id carried by the last `.instance_created` event.
+    /// Plugin id carried by the last initialization event.
     plugin_id: []const u8 = "",
-    /// Context carried by the last `.instance_created` event.
+    /// Context carried by the last `.initialization_finished` event.
     context: ?*const abi.PluginContext = null,
 
     /// `ManagerListener.notify` implementation that records the event.
     fn notify(raw_context: ?*anyopaque, event: ManagerEvent) void {
         const self: *@This() = @ptrCast(@alignCast(raw_context.?));
         switch (event) {
-            .instance_created => |created| {
-                self.saw_instance_created = true;
-                self.plugin_id = created.plugin_id;
-                self.context = created.context;
+            .initialization_started => |started| {
+                self.saw_initialization_started = true;
+                self.plugin_id = started.plugin_id;
+            },
+            .initialization_finished => |finished| {
+                self.saw_initialization_finished = true;
+                self.plugin_id = finished.plugin_id;
+                self.context = finished.context;
+            },
+            .runtime_entered => {
+                self.saw_runtime_entered = true;
             },
             .library_rejected => |rejected| {
                 if (rejected.reason == .invalid_configuration) {
@@ -1009,7 +1152,7 @@ fn testUnload(_: *abi.PluginContext) callconv(.c) c_int {
 /// Builds a plugin record whose library exports the test callbacks.
 ///
 /// The handle is never used because the tests call only `load()` through
-/// `activatePlugin`.
+/// `initializePlugin`.
 fn testPlugin(context: *abi.PluginContext, load: abi.LoadFn) Plugin {
     return .{
         .path = "test-plugin.so",
@@ -1022,7 +1165,7 @@ fn testPlugin(context: *abi.PluginContext, load: abi.LoadFn) Plugin {
     };
 }
 
-/// Builds the minimal context `activatePlugin` needs.
+/// Builds the minimal context `initializePlugin` needs.
 fn testPluginContext() abi.PluginContext {
     return .{
         .abi_version = abi.abi_version,
@@ -1038,7 +1181,7 @@ fn testPluginContext() abi.PluginContext {
     };
 }
 
-test "activatePlugin reports instance creation after a successful load" {
+test "initializePlugin reports started and finished events on success" {
     var manager = Manager.init();
     defer manager.deinit();
 
@@ -1048,14 +1191,15 @@ test "activatePlugin reports instance creation after a successful load" {
     var context = testPluginContext();
     var plugin = testPlugin(&context, testLoadSuccess);
 
-    try std.testing.expect(manager.activatePlugin(&plugin));
-    try std.testing.expect(plugin.active);
-    try std.testing.expect(collector.saw_instance_created);
+    try std.testing.expect(manager.initializePlugin(&plugin));
+    try std.testing.expectEqual(Plugin.State.initialized, plugin.state);
+    try std.testing.expect(collector.saw_initialization_started);
+    try std.testing.expect(collector.saw_initialization_finished);
     try std.testing.expectEqualStrings("test-plugin", collector.plugin_id);
     try std.testing.expect(collector.context == &context);
 }
 
-test "activatePlugin reports a rejected instance when load fails" {
+test "initializePlugin reports a failed initialization when load fails" {
     var manager = Manager.init();
     defer manager.deinit();
 
@@ -1065,8 +1209,20 @@ test "activatePlugin reports a rejected instance when load fails" {
     var context = testPluginContext();
     var plugin = testPlugin(&context, testLoadFailure);
 
-    try std.testing.expect(!manager.activatePlugin(&plugin));
-    try std.testing.expect(!plugin.active);
+    try std.testing.expect(!manager.initializePlugin(&plugin));
+    try std.testing.expectEqual(Plugin.State.failed, plugin.state);
+    try std.testing.expect(collector.saw_initialization_started);
+    try std.testing.expect(!collector.saw_initialization_finished);
     try std.testing.expect(collector.saw_invalid_configuration);
-    try std.testing.expect(!collector.saw_instance_created);
+}
+
+test "runtime_entered reaches the manager listener" {
+    var manager = Manager.init();
+    defer manager.deinit();
+
+    var collector = TestEventCollector{};
+    manager.setManagerListener(.{ .context = &collector, .notify = TestEventCollector.notify });
+
+    manager.notifyManagerEvent(.runtime_entered);
+    try std.testing.expect(collector.saw_runtime_entered);
 }
