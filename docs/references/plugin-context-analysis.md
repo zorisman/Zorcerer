@@ -1,6 +1,14 @@
 # `PluginContext.zig` review
 
-Current file: `src/core/PluginContext.zig` (51 lines). It is a very small ABI contract:
+> Status update: the contract has since moved to ABI version 2. It replaces
+> `HostApi` with `PluginContext` (`abi_version`, `struct_size`, `logger`,
+> embedded `PluginInfo` with `Text` fields), meeting the identity and
+> size-negotiation recommendations below. The review is kept as historical
+> context for the remaining P0 items (native events and host-mediated engine
+> access).
+
+The reviewed v1 file was `src/core/PluginContext.zig` (51 lines). It was a
+very small ABI contract:
 
 - `abi_version`
 - `Logger`

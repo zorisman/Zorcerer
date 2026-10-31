@@ -1,10 +1,10 @@
 const std = @import("std");
 
 /// ABI contract between the plugin manager (src/PluginManager.zig) and
-/// every plugin it loads (see src/PluginContext.zig and
-/// example-plugins/hello/hello_plugin.zig; plugin compilations get the
-/// same declarations through the `plugin-context` build module).
-pub const abi = @import("core/PluginContext.zig");
+/// every plugin it loads (see src/core/PluginContext.zig and
+/// example-plugins/hello/hello_plugin.zig). Both sides import the same
+/// `plugin-context` build module so their declarations stay identical.
+pub const abi = @import("plugin-context");
 pub const Ipc = @import("core/Ipc.zig");
 
 // Force the VSP entrypoint into the library: its exported `CreateInterface`

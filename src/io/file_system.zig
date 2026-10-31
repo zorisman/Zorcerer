@@ -20,7 +20,7 @@
 
 const std = @import("std");
 
-const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
+const abi = @import("plugin-context");
 
 /// URI scheme prefix targeting the running game's `tf` directory; the path
 /// tail is relative to that directory. Resolved paths are routed to the
@@ -71,19 +71,6 @@ pub const ZorcererPath = struct {
     /// Which backend the path's I/O routes to (see `File`).
     scheme: Scheme,
 };
-/// Placeholder for the runtime context of the plugin that performs the
-/// filesystem query.
-///
-/// Warning: this is a temporary stand-in; the project already ships
-/// `src/PluginContext.zig` as the plugin ABI contract, and this placeholder
-/// is expected to be replaced by (or merged with) a full host-side runtime
-/// context once that side of the ABI is fleshed out.
-pub const PluginContext = struct {
-    /// Configuration of the plugin making the query, as loaded from its
-    /// manifest (see `PluginConfiguration`).
-    config: PluginConfiguration,
-};
-
 /// Absolute path to the `tf` directory backing `game://` URIs, or `null`
 /// while unconfigured. Must be set with `setGameRoot()` before
 /// `parsePath()` encounters a `game://` URI. The pointer must remain valid
@@ -168,15 +155,15 @@ pub fn setZorcererRoot(path: []const u8) void {
 ///   directory (see `setGameRoot`); read-only, routed to the engine
 ///   filesystem (`.scheme == .game`).
 /// - `"plugin://<tail>"` resolves `<tail>` against the calling plugin's
-///   root directory, `<zorcerer_root>/plugins/<ctx.config.id>` (see
+///   root directory, `<zorcerer_root>/plugins/<ctx.plugin.id>` (see
 ///   `setZorcererRoot`); read and write, no execute, routed to `std.Io`
-///   (`.scheme == .plugin`). The plugin configuration's `id` is the plugin
-///   directory name, so no information from `config.path` is needed.
+///   (`.scheme == .plugin`). The plugin context's `id` is the plugin
+///   directory name, so no information from the library path is needed.
 /// - Any other URI format is not a supported scheme.
 ///
 /// Parameters:
-/// - `ctx`: the query's plugin context; `config.id` names the plugin
-///   directory for `plugin://` URIs.
+/// - `ctx`: the ABI context of the plugin making the query; `plugin.id`
+///   names the plugin directory for `plugin://` URIs.
 /// - `path`: the raw URI as forwarded by a plugin.
 ///
 /// Returns the validated `ZorcererPath`, or:
@@ -192,7 +179,7 @@ pub fn setZorcererRoot(path: []const u8) void {
 /// `absolute_path` stays valid for the process' lifetime. Because the
 /// arena only grows, this module is only used for the bounded number of
 /// path resolutions performed during startup.
-pub fn parsePath(ctx: *PluginContext, path: []const u8) !ZorcererPath {
+pub fn parsePath(ctx: *abi.PluginContext, path: []const u8) !ZorcererPath {
     const alloc = path_arena.allocator();
 
     // `game://` targets the game's `tf` directory and is read-only.
@@ -209,11 +196,12 @@ pub fn parsePath(ctx: *PluginContext, path: []const u8) !ZorcererPath {
     // read/write only. `id` is the plugin directory name by contract.
     if (std.mem.startsWith(u8, path, plugin_scheme)) {
         const root = zorcerer_root orelse return error.RootNotConfigured;
-        if (ctx.config.id.len == 0) return error.OperationNotAllowed;
+        const plugin_id = ctx.plugin.id.slice();
+        if (plugin_id.len == 0) return error.OperationNotAllowed;
         return ZorcererPath{
             .absolute_path = try joinRelativeParts(alloc, root, &.{
                 "plugins",
-                ctx.config.id,
+                plugin_id,
                 path[plugin_scheme.len..],
             }),
             .permissions = read_write_permissions,
@@ -1533,17 +1521,20 @@ const test_game_root = "/steamapps/team fortress 2/tf";
 /// and enumerations.
 const test_io = std.testing.io;
 
-/// Returns a mocked plugin context whose configuration resembles a
-/// `hello` plugin living under `plugins/hello/`. Only the fields relevant
-/// to `parsePath()` carry mock data.
-fn mockContext() PluginContext {
-    return PluginContext{
-        .config = PluginConfiguration{
-            .id = "hello",
-            .name = "Hello Example",
-            .version = "0.1.0",
-            .author = "Zorcerer",
-            .path = "./hello_plugin.so",
+/// Returns a mocked ABI context whose identity resembles a `hello` plugin
+/// living under `plugins/hello/`. Only the fields relevant to `parsePath()`
+/// carry mock data.
+fn mockContext() abi.PluginContext {
+    return .{
+        .abi_version = abi.abi_version,
+        .struct_size = @sizeOf(abi.PluginContext),
+        .logger = null,
+        .plugin = .{
+            .id = abi.Text.fromSlice("hello"),
+            .name = abi.Text.fromSlice("Hello Example"),
+            .version = abi.Text.fromSlice("0.1.0"),
+            .author = abi.Text.fromSlice("Zorcerer"),
+            .library_path = abi.Text.fromSlice("./hello_plugin.so"),
         },
     };
 }

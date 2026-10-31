@@ -1,9 +1,9 @@
 # ## Bottom line
 
-**The native plugin ABI is currently `load()` + `unload()` + a logger — enough to open a `.so`, not enough to write a useful plugin.**
+**The native plugin ABI is currently `load()` + `unload()` + a logger + plugin identity (ABI version 2) — enough to open a `.so` and identify it, not yet enough to deliver runtime events.**
 
 - More ABI **surface** is needed: events, plugin identity/config, host-mediated engine access, and file/service access.
-- More exported **symbols** are not necessarily needed. Keeping `load`/`unload` as the only plugin exports and growing a versioned `HostApi` function table is the cleaner direction.
+- More exported **symbols** are not necessarily needed. Keeping `load`/`unload` as the only plugin exports and growing the versioned `PluginContext` contract is the cleaner direction.
 - The Source-side VSP vtable is layout-correct for `ISERVERPLUGINCALLBACKS003`, but most callbacks are stubs. That is safe for loading/unloading, but the engine events plugins would care about never reach native plugins at all.
 
 Note: `PluginManager.zig` has no functions literally named `load()`/`unload()`; the manager-side equivalents are `loadPlugins()` / `unloadAll()`, while `load()`/`unload()` are the plugin-exported entry points in `PluginContext.zig`.
@@ -53,35 +53,39 @@ So, for **loading**: no additional VSP slots are required. For **useful event de
 
 ## 2. Native plugin loading flow
 
-`Manager.loadPlugins()` (`PluginManager.zig:240-309`) does:
+`Manager.loadPlugins()` does:
 
-1. Refuses if anything is already loaded.
-2. Iterates directories under `tf/addons/zorcerer/plugins`.
-3. Calls `loadLuaScript(dir.name)` unconditionally (`PluginManager.zig:276`).
-4. Reads `manifest.toml`; **if it is missing or unreadable, it `continue`s and skips the directory’s `.so` files entirely** (`PluginManager.zig:284-287`). This contradicts the comment at `PluginManager.zig:278-281`, which says such directories are “only picked up through [their] `.so` file(s).”
-5. Parses the manifest through `PluginConfiguration.parseConfig()` (`PluginManager.zig:290-293`).
-6. Stores the parsed configuration in a local `managed_plugins` list (`PluginManager.zig:295-298`). That list is never freed or retained — the TODO at `PluginManager.zig:253-254` acknowledges the leak.
-7. Scans `.so` files and calls `cachePlugin()` (`PluginManager.zig:300-307`).
+1. Refuses if a native plugin or Lua script is already loaded.
+2. Iterates directories under `tf/addons/zorcerer/plugins` and loads each `main.lua`.
+3. Reads and validates every `manifest.toml` through `readConfig()`.
+4. Resolves the native dependency graph and reports static rejections.
+5. Walks the dependency-first order; for each accepted configuration it opens
+   only the library named by `manifest.path`, looks up `load`/`unload`, and
+   calls `load(ctx)` with a per-plugin `PluginContext`.
+6. Rejects a failed library and every transitive dependent; unrelated plugins
+   continue loading.
 
-`cachePlugin()` (`PluginManager.zig:314-345`):
+`PluginLibrary.open()` (`src/core/PluginLibrary.zig`) owns the dlopen handle
+and reports structured rejections: `library_not_found`,
+`invalid_configuration`, or `missing_symbol`. The manager turns them into a
+`library_rejected` event.
 
-1. Joins the path.
-2. `std.DynLib.open()`.
-3. Looks up both `load` and `unload` exports; a plugin missing either is skipped.
-4. Appends a `Plugin` record.
-5. Calls `activatePlugin()`.
+`unloadAll()` walks native plugins in reverse order, calls `unload(ctx)` only
+for active plugins, always closes the library, frees the context, and frees the
+path, then notifies and tears down Lua scripts.
 
-`activatePlugin()` (`PluginManager.zig:349-358`) builds `HostApi` containing only the logger, calls `plugin.load(&host)`, and marks the plugin active only when the return value is `0`.
-
-`unloadAll()` (`PluginManager.zig:365-400`) walks native plugins in reverse order, calls `unload()` only for active plugins, always `dlclose()`s and frees the path, then notifies and tears down Lua scripts.
-
-The ABI itself is in `PluginContext.zig:26-51`:
+The ABI itself is in `src/core/PluginContext.zig` (version 2):
 
 ```zig
-HostApi { abi_version, logger }
-load(host) -> int
-unload(host) -> int
+PluginContext { abi_version, struct_size, logger, plugin: PluginInfo }
+PluginInfo { id, name, version, author, library_path }  // Text = ptr + len
+load(ctx: *PluginContext) -> int
+unload(ctx: *PluginContext) -> int
 ```
+
+Context strings borrow the manager's validated manifest and stay valid until
+after `unload()`. Plugins must check `abi_version` and `struct_size` before
+reading the remaining fields.
 
 ---
 
@@ -95,7 +99,7 @@ unload(host) -> int
 | LevelInit/ServerActivate/LevelShutdown | **no** | yes |
 | GameFrame | **no** | **no** |
 | Client callbacks | **no** | **no** |
-| Plugin id / root / manifest data | **no** | id and root only |
+| Plugin id / manifest data | id, name, version, author, library path | id and root only |
 | Engine commands / cvars / game FS | **no** | `server_command` exists but is not wired by the manager |
 | IPC/event payloads | **no** | only event name, payload always `nil` |
 
@@ -109,7 +113,7 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 2. **Manifest data is parsed but not used.** `lib_path` is never consulted; every `.so` in the directory is loaded (`PluginManager.zig:300-307`). `managed_plugins` is leaked.
 3. **No manifest means no native plugin.** A `.so` without `manifest.toml` is skipped, despite `build.zig:24-26` saying a missing manifest is allowed.
 4. **`game_server_factory` is ignored** (`Entrypoint.zig:702-703`). It is the normal route to server-side interfaces such as `ServerGameDLL`, `ServerGameClients`, and `ServerGameEnts`.
-5. **Fork boundary blocks direct engine access.** The child inherits engine pointers, but calling them after `fork()` is unsafe (`Log.zig:13-16`). Any engine operation for plugins must be mediated by the parent over IPC, not by passing raw engine pointers into `HostApi`.
+5. **Fork boundary blocks direct engine access.** The child inherits engine pointers, but calling them after `fork()` is unsafe (`Log.zig:13-16`). Any engine operation for plugins must be mediated by the parent over IPC, not by passing raw engine pointers into `PluginContext`.
 6. **Synchronous event exchange is a scalability limit.** `sendManagerEvent()` blocks the engine callback until the child replies (`Entrypoint.zig:832-849`). A slow plugin blocks the server. This is tolerable for level events, not for `GameFrame` or client commands.
 7. **IPC payloads are absent/limited.** `Ipc.Event` carries no parameters (`Ipc.zig:276-300`), and frames are capped at 4096 bytes (`Ipc.zig:22`). Client command arguments or larger results will need payload support and a higher/chunked limit.
 8. **`cachePlugin()` leaks on append failure.** If `plugins.append()` fails after `DynLib.open()`, the library is not closed (`PluginManager.zig:337-342`).
@@ -127,18 +131,22 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 1. **Event delivery to native plugins — required.**
    Either:
    - add one optional export such as `on_event(event, payload) -> int`, or
-   - let plugins register callbacks through `HostApi` (e.g. `host.events.subscribe(callback, context)`).
+   - let plugins register callbacks through `PluginContext` (e.g. `host.events.subscribe(callback, context)`).
 
    The callback-table approach is cleaner: it avoids dlsym name proliferation and lets the ABI version the callback signature.
 
-2. **Plugin identity and configuration — required.**
-   `HostApi` should expose at least `plugin_id`, plugin root directory, name/version/author, and access to the parsed manifest. The example plugin currently hardcodes `plugin_id = "hello"` and derives `tf/addons/zorcerer` itself (`example-plugins/hello/hello_plugin.zig:44-73`), which will break as soon as the directory or install layout changes.
+2. **Plugin identity and configuration — implemented.**
+   ABI version 2 passes `PluginInfo` (id, name, version, author, library path)
+   inside `PluginContext`. Root directories are not part of the context yet;
+   the example plugin still derives them locally.
 
 3. **Host-mediated engine operations — required for real plugins.**
    Add function pointers for operations such as `server_command`, cvar get/set, `game://` file access, and controlled interface queries. These must go through the parent Entrypoint over IPC and be allowlisted there; the child must never dereference inherited engine vtables.
 
-4. **ABI version/size negotiation — recommended.**
-   `abi_version` lets the plugin reject the host (`PluginContext.zig:23-26`), but there is no `struct_size` or function-table version. Once `HostApi` grows, a plugin compiled against a newer header could read past an older host’s struct. Add an explicit `size` field or a versioned pointer to a function table, and document append-only layout rules.
+4. **ABI version/size negotiation — implemented.**
+   `PluginContext` now starts with `abi_version` and `struct_size`. New fields
+   are append-only; a plugin must reject a context whose `struct_size` is
+   smaller than the version it was compiled against.
 
 5. **Lifecycle/event coverage.**
    If plugins need Source callbacks, add them in this order:
@@ -152,11 +160,11 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 ### What does *not* need to change
 
 - The Source VSP vtable does **not** need more real slots merely to load and unload. The existing padding is safe for `ISERVERPLUGINCALLBACKS003`.
-- Plugins do **not** need to export a large API surface. A single `load`/`unload` pair plus a versioned `HostApi` function table is sufficient and preserves the current contract.
+- Plugins do **not** need to export a large API surface. A single `load`/`unload` pair plus the versioned `PluginContext` contract is sufficient and preserves the current contract.
 
 ### Suggested priority
 
-**P0:** native event delivery, plugin identity/config, host-mediated engine calls, `HostApi` size/version negotiation.
+**P0:** native event delivery, host-mediated engine calls. Plugin identity/config and ABI size/version negotiation are implemented in ABI version 2.
 
 **P1:** real `GameFrame`/client VSP callbacks, IPC payloads, per-plugin permissions/allowlists, dependency ordering.
 

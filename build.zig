@@ -206,27 +206,41 @@ pub fn build(b: *std.Build) !void {
     plugin_dependency.addImport("plugin-configuration", plugin_configuration);
 
     // ABI contract between the plugin manager and plugin modules
-    // (src/PluginContext.zig). The manager imports it through src/root.zig
-    // (`abi`); plugin compilations import it as this module, so every side
-    // compiles the same declarations. Example plugins live outside src/ in
-    // example-plugins/ and cannot reach it by file path (imports may not
-    // escape a module's root directory), hence the module indirection.
+    // (src/core/PluginContext.zig). The manager imports it through
+    // src/root.zig (`abi`); plugin compilations import it as this module, so
+    // every side compiles the same declarations. Example plugins live
+    // outside src/ in example-plugins/ and cannot reach it by file path
+    // (imports may not escape a module's root directory), hence the module
+    // indirection.
     const plugin_context = b.addModule("plugin-context", .{
         .root_source_file = b.path("src/core/PluginContext.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
     });
+
+    // Dynamic-library loader for native plugins (src/core/PluginLibrary.zig).
+    // Kept separate from the manager so the structured dlopen()/dlsym()
+    // behavior can be tested with small fixture libraries.
+    const plugin_library = b.addModule("plugin-library", .{
+        .root_source_file = b.path("src/core/PluginLibrary.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_library.addImport("plugin-context", plugin_context);
 
     // Plugin-facing filesystem API (src/io/file_system.zig). Example plugins
     // live outside src/ and cannot import it by file path for the same
     // reason as plugin-context, so it is exposed as a module. Resolving
-    // URI schemes needs the same plugin-configuration module the manager
-    // uses, hence the import below.
+    // plugin:// URIs uses the shared ABI context, hence the import below.
     const zorcerer_filesystem = b.addModule("zorcerer-filesystem", .{
         .root_source_file = b.path("src/io/file_system.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
-    zorcerer_filesystem.addImport("plugin-configuration", plugin_configuration);
+    zorcerer_filesystem.addImport("plugin-context", plugin_context);
 
     const zorcerer = b.addLibrary(.{
         .name = "zorcerer",
@@ -243,6 +257,8 @@ pub fn build(b: *std.Build) !void {
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.root_module.addImport("plugin-configuration", plugin_configuration);
+    zorcerer.root_module.addImport("plugin-context", plugin_context);
+    zorcerer.root_module.addImport("plugin-library", plugin_library);
     zorcerer.root_module.addImport("zjr", zjr);
     zorcerer.root_module.addImport("luajit", luajit);
     zorcerer.root_module.addImport("zlua", zlua);
@@ -267,6 +283,64 @@ pub fn build(b: *std.Build) !void {
     hello_plugin.root_module.addImport("plugin-context", plugin_context);
     hello_plugin.root_module.addImport("zorcerer-filesystem", zorcerer_filesystem);
     hello_plugin.out_filename = "hello_plugin.so";
+
+    // Dynamic libraries used by src/core/PluginLibrary.zig's tests. They are
+    // never installed: the test executable receives only their emitted
+    // paths through the build_options module below.
+    const valid_fixture = b.addLibrary(.{
+        .name = "plugin-library-valid-fixture",
+        .linkage = .dynamic,
+        .root_module = b.addModule("plugin-library-valid-fixture", .{
+            .root_source_file = b.path("src/tests/fixtures/valid_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    valid_fixture.root_module.addImport("plugin-context", plugin_context);
+    valid_fixture.out_filename = "plugin-library-valid-fixture.so";
+
+    const missing_symbol_fixture = b.addLibrary(.{
+        .name = "plugin-library-missing-symbol-fixture",
+        .linkage = .dynamic,
+        .root_module = b.addModule("plugin-library-missing-symbol-fixture", .{
+            .root_source_file = b.path("src/tests/fixtures/missing_symbol_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    missing_symbol_fixture.root_module.addImport("plugin-context", plugin_context);
+    missing_symbol_fixture.out_filename = "plugin-library-missing-symbol-fixture.so";
+
+    // PluginLibrary is tested through its own module instance so the test
+    // build options do not leak into the production module.
+    const plugin_library_test_module = b.addModule("plugin-library-tests", .{
+        .root_source_file = b.path("src/core/PluginLibrary.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_library_test_module.addImport("plugin-context", plugin_context);
+
+    const plugin_library_test_options = b.addOptions();
+    plugin_library_test_options.addOptionPath("valid_library", valid_fixture.getEmittedBin());
+    plugin_library_test_options.addOptionPath(
+        "missing_symbol_library",
+        missing_symbol_fixture.getEmittedBin(),
+    );
+    plugin_library_test_options.addOptionPath(
+        "invalid_library",
+        b.path("src/tests/fixtures/invalid_library.so"),
+    );
+    plugin_library_test_module.addOptions("build_options", plugin_library_test_options);
+
+    const plugin_library_tests = b.addTest(.{
+        .name = "plugin-library-tests",
+        .root_module = plugin_library_test_module,
+    });
+    plugin_library_tests.step.dependOn(&valid_fixture.step);
+    plugin_library_tests.step.dependOn(&missing_symbol_fixture.step);
 
     const zorcerer_tests = b.addTest(.{
         .name = "zorcerer-tests",
@@ -307,6 +381,7 @@ pub fn build(b: *std.Build) !void {
     compile_modules_step.dependOn(&toml_tests.step);
     compile_modules_step.dependOn(&plugin_configuration_tests.step);
     compile_modules_step.dependOn(&plugin_dependency_tests.step);
+    compile_modules_step.dependOn(&plugin_library_tests.step);
     compile_modules_step.dependOn(&zlua_tests.step);
     compile_modules_step.dependOn(&hello_plugin.step);
 
@@ -325,6 +400,9 @@ pub fn build(b: *std.Build) !void {
     const run_plugin_dependency_tests = b.addRunArtifact(plugin_dependency_tests);
     run_plugin_dependency_tests.step.dependOn(compile_modules_step);
 
+    const run_plugin_library_tests = b.addRunArtifact(plugin_library_tests);
+    run_plugin_library_tests.step.dependOn(compile_modules_step);
+
     const run_zlua_tests = b.addRunArtifact(zlua_tests);
     run_zlua_tests.step.dependOn(compile_modules_step);
 
@@ -333,7 +411,7 @@ pub fn build(b: *std.Build) !void {
 
     const tests_step = b.step("tests", "Run tests for all project modules");
     // TODO: Find out why this causes tests failure
-    // tests_step.dependOn(&run_zorcerer_tests.step);
+    tests_step.dependOn(&run_zorcerer_tests.step);
     tests_step.dependOn(&run_hooks_tests.step);
 
     // I don't know if is this intended, but two of these tests fail
@@ -341,6 +419,7 @@ pub fn build(b: *std.Build) !void {
 
     tests_step.dependOn(&run_plugin_configuration_tests.step);
     tests_step.dependOn(&run_plugin_dependency_tests.step);
+    tests_step.dependOn(&run_plugin_library_tests.step);
     tests_step.dependOn(&run_zlua_tests.step);
 
     const should_skip_analyze = b.option(

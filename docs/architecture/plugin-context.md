@@ -29,10 +29,26 @@ Scenarios:
 4. Dependency failed to load
 
 3. Dynlib loading
-On error: Stop loading. Send to the Plugin Manager error of corresponding scenario. 
+The manager opens only the library named by the manifest's `path`; other
+`.so` files in the plugin directory are ignored. It resolves the exported
+`load` and `unload` symbols and builds one `PluginContext` per plugin.
+
+`PluginContext` is ABI version 2. Its first fields are `abi_version` and
+`struct_size`; a plugin must validate both before reading the rest. The
+context carries an optional `logger` and an embedded `PluginInfo` (`id`,
+`name`, `version`, `author`, `library_path`). Every string is a `Text`
+(pointer + length) borrowed from the manager's validated manifest, so it
+stays valid until after `unload()` and must not be freed by the plugin.
+
+On error: Stop loading the plugin and its transitive dependents, emit a
+`library_rejected` manager event with the structured reason, and continue
+with unrelated plugins.
 Scenarios:
-    1. Invalid configuration or symbols
-    2. Dynalic library not found
+    1. Dynamic library not found (`library_not_found`)
+    2. Invalid configuration: the file is not a usable dynamic library, or
+       the plugin rejects the context / returns nonzero from `load()`
+       (`invalid_configuration`)
+    3. Invalid or missing `load`/`unload` symbols (`missing_symbol`)
     
 4. Instance creation
 Sending to the Plugin Manager successful instance creation event

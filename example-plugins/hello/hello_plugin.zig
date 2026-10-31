@@ -7,30 +7,28 @@
 //!     tf/addons/zorcerer/plugins/hello/hello_plugin.so
 //!
 //! The plugin manager dlopen()s the .so, looks up the exported `load` and
-//! `unload` symbols (ABI contract in src/PluginContext.zig) and calls them
-//! with a *const HostApi.
+//! `unload` symbols (ABI contract in src/core/PluginContext.zig) and calls
+//! them with a *PluginContext.
 //!
 //! On load(), the plugin creates/overwrites `plugin://hello.txt` with a
 //! report that lists the non-directory entries of `game://materials`, one
 //! name per line. On unload(), it deletes that same file. Both operations
-//! go through the host filesystem API in src/io/FileSystem.zig, which
+//! go through the host filesystem API in src/io/file_system.zig, which
 //! routes `plugin://` URIs to std.Io and `game://` URIs to the Source
 //! Engine filesystem.
 //!
-//! The plugin has to derive its own roots because the v1 HostApi carries
-//! no path information: the manager treats its working directory as the
+//! The plugin still derives its own roots because PluginContext carries no
+//! root directories yet: the manager treats its working directory as the
 //! game directory and loads plugins from
 //! `tf/addons/zorcerer/plugins/<id>/`, so the Zorcerer root is
-//! `<cwd>/tf/addons/zorcerer` and the game root is `<cwd>/tf`.
+//! `<cwd>/tf/addons/zorcerer` and the game root is `<cwd>/tf`. The context
+//! supplies the plugin id and manifest identity used for filesystem
+//! resolution and log messages.
 //!
-//! Enumerating `game://` needs an engine filesystem binding, which the v1
-//! HostApi does not carry yet. Until the host supplies one, load() still
+//! Enumerating `game://` needs an engine filesystem binding, which the
+//! context does not carry yet. Until the host supplies one, load() still
 //! creates the report but records that the material listing is
 //! unavailable instead of pretending it succeeded.
-//!
-//! Both entry points print progress via std.debug.print (stderr) - not the
-//! host logger; the `consolePrint` helper below is the logger-based path
-//! and is not called yet.
 
 const std = @import("std");
 const abi = @import("plugin-context");
@@ -56,21 +54,6 @@ const report_uri = "plugin://hello.txt";
 
 /// Directory whose non-directory entries the report lists.
 const materials_uri = "game://materials";
-
-/// Builds the context `filesystem.parsePath()` needs. `id` names the plugin
-/// directory, so `plugin://` resolves to `plugins/hello` under the Zorcerer
-/// root; `path` is this plugin's library relative to that directory.
-fn pluginContext() filesystem.PluginContext {
-    return .{
-        .config = .{
-            .id = "hello",
-            .name = "Hello Example",
-            .version = "0.1.0",
-            .author = "Zorcerer",
-            .path = "./hello_plugin.so",
-        },
-    };
-}
 
 /// Derives this process' game and Zorcerer roots from the working
 /// directory and registers them with the filesystem module.
@@ -111,26 +94,28 @@ fn resolveRoots(io: std.Io) !void {
 /// Creates/overwrites `plugin://hello.txt` and writes the non-directory
 /// entry names of `game://materials` into it, one per line.
 ///
+/// `ctx` is the manager-provided context for this plugin; `plugin.id`
+/// names the directory `plugin://` resolves under.
+///
 /// Errors: URI resolution failures (`filesystem.parsePath`), file opening
 /// and writing failures, and directory enumeration failures. When the
-/// engine filesystem is not bound (its v1 HostApi has no binding yet), the
-/// function does not fail: it writes an explanatory line into the report.
+/// engine filesystem is not bound, the function does not fail: it writes an
+/// explanatory line into the report.
 ///
 /// Side effects: creates or truncates `hello.txt` in the plugin directory.
 /// If anything fails after the file was created, the file is removed again
 /// so a failed load() leaves no stray report (the manager never calls
 /// unload() for a plugin whose load() failed).
-fn writeReport(io: std.Io) !void {
-    var ctx = pluginContext();
-    const report = try filesystem.parsePath(&ctx, report_uri);
+fn writeReport(io: std.Io, ctx: *abi.PluginContext) !void {
+    const report = try filesystem.parsePath(ctx, report_uri);
 
     var output = try filesystem.File.open(io, null, report, .write);
     errdefer filesystem.File.remove(io, report) catch {};
     defer output.close();
 
-    const materials = try filesystem.parsePath(&ctx, materials_uri);
+    const materials = try filesystem.parsePath(ctx, materials_uri);
     var directory = filesystem.Directory.open(io, null, materials) catch |err| switch (err) {
-        // There is no engine filesystem binding in the v1 HostApi. Record
+        // There is no engine filesystem binding in the context yet. Record
         // the limitation instead of failing a load() over host plumbing.
         error.EngineNotBound => {
             try output.writeAll("game://materials: engine filesystem binding not available\n");
@@ -153,17 +138,24 @@ fn writeReport(io: std.Io) !void {
 
 /// Sends one message through the logger the plugin manager configured.
 /// Does nothing when the host could not provide one.
-fn consolePrint(host: *const abi.HostApi, message: [:0]const u8) void {
-    if (host.logger) |logger| {
+fn consolePrint(ctx: *abi.PluginContext, message: [:0]const u8) void {
+    if (ctx.logger) |logger| {
         logger.print(logger.context, message.ptr);
     }
 }
 
-export fn load(host: *const abi.HostApi) callconv(.c) c_int {
-    if (host.abi_version != abi.abi_version) {
+export fn load(ctx: *abi.PluginContext) callconv(.c) c_int {
+    if (ctx.abi_version != abi.abi_version or
+        ctx.struct_size < @sizeOf(abi.PluginContext))
+    {
         std.debug.print(
-            "hello_plugin: HostApi ABI mismatch, host {d} != plugin {d}\n",
-            .{ host.abi_version, abi.abi_version },
+            "hello_plugin: PluginContext ABI mismatch, host {d}/{d} != plugin {d}/{d}\n",
+            .{
+                ctx.abi_version,
+                ctx.struct_size,
+                abi.abi_version,
+                @sizeOf(abi.PluginContext),
+            },
         );
         return 1;
     }
@@ -173,17 +165,27 @@ export fn load(host: *const abi.HostApi) callconv(.c) c_int {
         std.debug.print("hello_plugin: could not resolve filesystem roots ({s})\n", .{@errorName(err)});
         return 1;
     };
-    writeReport(io) catch |err| {
+    writeReport(io, ctx) catch |err| {
         std.debug.print("hello_plugin: could not write {s} ({s})\n", .{ report_uri, @errorName(err) });
         return 1;
     };
 
-    std.debug.print("Hello, Plugin Manager!\n", .{});
+    var message_buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrintZ(
+        &message_buffer,
+        "hello_plugin: {s} v{s} loaded\n",
+        .{ ctx.plugin.id.slice(), ctx.plugin.version.slice() },
+    ) catch "hello_plugin: loaded\n";
+    consolePrint(ctx, message);
     return 0;
 }
 
-export fn unload(host: *const abi.HostApi) callconv(.c) c_int {
-    _ = host;
+export fn unload(ctx: *abi.PluginContext) callconv(.c) c_int {
+    if (ctx.abi_version != abi.abi_version or
+        ctx.struct_size < @sizeOf(abi.PluginContext))
+    {
+        return 1;
+    }
 
     const io = threaded_io.io();
     // load() already registered the roots; resolving again keeps unload()
@@ -193,8 +195,7 @@ export fn unload(host: *const abi.HostApi) callconv(.c) c_int {
         return 1;
     };
 
-    var ctx = pluginContext();
-    const report = filesystem.parsePath(&ctx, report_uri) catch |err| {
+    const report = filesystem.parsePath(ctx, report_uri) catch |err| {
         std.debug.print("hello_plugin: could not resolve {s} ({s})\n", .{ report_uri, @errorName(err) });
         return 1;
     };
@@ -203,6 +204,6 @@ export fn unload(host: *const abi.HostApi) callconv(.c) c_int {
         return 1;
     };
 
-    std.debug.print("Bye, Plugin Manager!\n", .{});
+    consolePrint(ctx, "hello_plugin: unloaded\n");
     return 0;
 }

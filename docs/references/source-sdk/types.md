@@ -1003,17 +1003,19 @@ above is therefore a new public surface, not a change to an established one.
 Keep the first addition small and documented; do not bundle econ, UI, and
 filesystem wrappers into the same change.
 
-### 9.2 `HostApi` is at ABI version 1 and exposes only a logger
+### 9.2 `PluginContext` is at ABI version 2 and exposes identity plus a logger
 
-**[checkout]** `src/PluginContext.zig:26-45` defines `abi_version = 1` and a
-`HostApi` with exactly two fields: `abi_version` and `logger`. A plugin compiled
-against version 1 must reject a host with a different version before using the
-struct (`:23-26`).
+**[checkout]** `src/core/PluginContext.zig` defines `abi_version = 2` and a
+`PluginContext` whose leading fields are `abi_version` and `struct_size`,
+followed by an optional `logger` and embedded `PluginInfo` (`id`, `name`,
+`version`, `author`, `library_path`). A plugin compiled against a different
+version, or against a larger struct than the host provides, must reject the
+context before using the remaining fields.
 
-Adding an entity resolver would change the struct shape. Even an append-only
-change needs a version bump so a new plugin can tell whether the field is
-present; a new plugin reading a field past the end of an old host's struct would
-be reading out of bounds. Recommended additions, when authorized:
+Adding an entity resolver would still change the struct shape. Even an
+append-only change needs a version bump so a new plugin can tell whether the
+field is present; a new plugin reading a field past the end of an old host's
+struct would be reading out of bounds. Recommended additions, when authorized:
 
 ```zig
 pub const ResolveEntityFn = *const fn (
@@ -1188,9 +1190,9 @@ Zig can reproduce the class safely.
    until the live mode is verified; then narrow it if necessary.
 5. **Unknown enum values.** Recommendation: preserve and pass through; validate
    only at the point where a known-revision operation requires a known value.
-6. **When to bump `HostApi`.** Recommendation: bump when the first resolver is
-   added, and make new plugins check `abi_version` before touching appended
-   fields. Do not append silently.
+6. **When to bump `PluginContext`.** Recommendation: bump when the first
+   resolver is added, and make new plugins check `abi_version` and
+   `struct_size` before touching appended fields. Do not append silently.
 7. **Econ scope.** Recommendation: defer. The C++ typedefs are easy; the live
    schema and item semantics are not.
 8. **Analyzer codegen.** Recommendation: emit `edict_t` as an opaque pointer and
@@ -1215,8 +1217,8 @@ Zig can reproduce the class safely.
 - The recommended `zostd` surface is a small set of `extern struct` newtypes:
   `EntityHandle` (`u32` bits), slot indices (`u16`), opaque pointers, and
   integer-valued TF2 newtypes.
-- `HostApi` currently exposes only a logger at ABI version 1. Any entity
-  resolver is a new ABI surface and needs a version bump.
+- `PluginContext` currently exposes identity and a logger at ABI version 2.
+  Any entity resolver is a new ABI surface and needs a version bump.
 - The parent reference's `PlayerInfoManager001`-only table is incomplete:
   this checkout defines `PlayerInfoManager002` and exposes `001` as a
   compatibility alias.

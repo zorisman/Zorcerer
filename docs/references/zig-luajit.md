@@ -432,7 +432,7 @@ A normal Zorcerer plugin:
 4. Registers plugin-specific Zig functions.
 5. Calls `lua.deinit()` in `unload()`.
 
-The plugin already has the `HostApi.logger` and can import the `zorcerer-filesystem` module for `plugin://`/`game://` access (`src/PluginContext.zig:40-45`, `build.zig:168-179`). No manifest or loader change is needed beyond making the `luajit` module available to plugin builds.
+The plugin already has `PluginContext.logger` and can import the `zorcerer-filesystem` module for `plugin://`/`game://` access (`src/core/PluginContext.zig`, `build.zig`). No manifest or loader change is needed beyond making the `luajit` module available to plugin builds.
 
 #### Why it is valid against the docs/references
 

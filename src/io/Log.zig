@@ -17,7 +17,7 @@
 //! IPC-backed sink to plugins through abi.Logger.
 
 const std = @import("std");
-const abi = @import("../core/PluginContext.zig");
+const abi = @import("plugin-context");
 const Ipc = @import("../core/Ipc.zig");
 
 /// The captured Source SDK logging sink: the engine context paired with
@@ -75,8 +75,8 @@ pub fn logLine(comptime fmt: []const u8, args: anytype) void {
 /// Prints one plugin message through the active sink.
 ///
 /// Signature-compatible with abi.Logger.PrintFn so PluginManager can hand it
-/// to plugins as `HostApi.logger.print`. The context is unused; the sink is
-/// process-global. After setupIpc() the message is sent to the parent over
+/// to plugins as `PluginContext.logger.print`. The context is unused; the sink
+/// is process-global. After setupIpc() the message is sent to the parent over
 /// IPC; otherwise it goes to the engine sink from setup(). Messages are
 /// dropped while neither sink is configured.
 pub fn pluginPrint(context: *anyopaque, message: [*:0]const u8) callconv(.c) void {
