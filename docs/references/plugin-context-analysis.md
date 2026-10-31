@@ -3,9 +3,10 @@
 > Status update: the contract has since moved to ABI version 2. It replaces
 > `HostApi` with `PluginContext` (`abi_version`, `struct_size`, `logger`,
 > embedded `PluginInfo` with `Text` fields), meeting the identity and
-> size-negotiation recommendations below. The review is kept as historical
-> context for the remaining P0 items (native events and host-mediated engine
-> access).
+> size-negotiation recommendations below. An optional `onEvent(ctx, event)`
+> export now delivers the five implemented engine events to native plugins,
+> so only host-mediated engine access remains a P0 item. The review is kept
+> as historical context.
 
 The reviewed v1 file was `src/core/PluginContext.zig` (51 lines). It was a
 very small ABI contract:
@@ -84,7 +85,13 @@ This is also called out in `docs/references/plugin-abi.md:134-135`.
 
 #### 2. Event delivery
 
-Native plugins currently receive no events after `load()`. `PluginManager.dispatchEvent()` only iterates `lua_scripts` (`PluginManager.zig:532-536`), while the source VSP callbacks send `pause`, `levelInit`, `serverActivate`, etc. only to Lua.
+> Status update: implemented as an optional
+> `onEvent(ctx, event: *const Event) -> int` export. The manager delivers
+> `pause`, `unpause`, `levelInit`, `serverActivate`, and `levelShutdown` after
+> Lua, in dependency-first load order; `levelInit` and `serverActivate` carry
+> JSON payloads. The text below is the original recommendation.
+
+Native plugins previously received no events after `load()`. `PluginManager.dispatchEvent()` only iterated `lua_scripts`, while the source VSP callbacks send `pause`, `levelInit`, `serverActivate`, etc. only to Lua.
 
 Native plugins need either:
 

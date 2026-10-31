@@ -612,7 +612,7 @@ pub const Manager = struct {
         }
 
         self.notifyManagerEvent(.runtime_entered);
-        self.dispatchEvent("on_runtime_entered");
+        self.dispatchToLua("on_runtime_entered", null);
     }
 
     /// Opens one plugin's manifest library, builds its context, and adds the
@@ -966,17 +966,64 @@ pub const Manager = struct {
         script.runtime.dispatchEvent("on_load", null);
     }
 
-    /// Delivers one manager event to every loaded Lua script.
+    /// Delivers one engine event to every loaded Lua script and every
+    /// initialized native plugin.
     ///
-    /// `event` is the `Ipc.Event` method name, for example `"pause"`. Runtime
-    /// dispatch isolates and logs callback failures, so one script cannot stop
-    /// delivery to the rest.
-    pub fn dispatchEvent(self: *@This(), event: []const u8) void {
+    /// `event` is the `Ipc.Event` method name, for example `"pause"`.
+    /// `payload` is optional JSON text; Lua receives it as the callback's
+    /// second argument and native plugins receive it in `abi.Event`.
+    ///
+    /// Lua dispatch isolates and logs callback failures, so one script cannot
+    /// stop delivery to the rest. Native dispatch runs in load order and stops
+    /// early only when a plugin returns something other than
+    /// `abi.plugin_continue`; that matches Source's `PLUGIN_STOP` convention
+    /// within the plugin fan-out and cannot cancel the engine action.
+    pub fn dispatchEvent(self: *@This(), event: []const u8, payload: ?[]const u8) void {
+        self.dispatchToLua(event, payload);
+        self.dispatchToPlugins(event, payload);
+    }
+
+    /// Delivers one event to every loaded Lua script.
+    fn dispatchToLua(self: *@This(), event: []const u8, payload: ?[]const u8) void {
         for (self.lua_scripts.items) |*script| {
-            script.runtime.dispatchEvent(event, null);
+            script.runtime.dispatchEvent(event, payload);
         }
     }
+
+    /// Delivers one event to every initialized native plugin that resolved an
+    /// `onEvent` export.
+    fn dispatchToPlugins(self: *@This(), event: []const u8, payload: ?[]const u8) void {
+        dispatchEventToPlugins(self.plugins.items, event, payload);
+    }
 };
+
+/// Delivers one event to the initialized plugins in `plugins`, in slice order.
+///
+/// The event and its texts are stack values that stay valid for the whole
+/// fan-out; plugins must not retain them. Delivery stops at the first plugin
+/// whose return value differs from `abi.plugin_continue`, matching Source's
+/// `PLUGIN_STOP` convention within the plugin fan-out.
+fn dispatchEventToPlugins(plugins: []Plugin, event: []const u8, payload: ?[]const u8) void {
+    const native_event = abi.Event{
+        .struct_size = @sizeOf(abi.Event),
+        .name = abi.Text.fromSlice(event),
+        .payload = abi.Text.fromSlice(payload orelse ""),
+    };
+
+    for (plugins) |*plugin| {
+        if (plugin.state != .initialized) continue;
+        const on_event = plugin.library.on_event orelse continue;
+
+        const status = on_event(plugin.context, &native_event);
+        if (status == abi.plugin_continue) continue;
+
+        Log.logLine(
+            "[zorcerer] {s}: onEvent({s}) returned {d}; stopping delivery\n",
+            .{ plugin.context.plugin.id.slice(), event, status },
+        );
+        return;
+    }
+}
 
 /// Manager whose Lua scripts receive IPC events.
 ///
@@ -1005,10 +1052,11 @@ fn luaLog(context: ?*anyopaque, message: []const u8) void {
 ///
 /// Each received frame must carry a JSON-RPC request whose method is one of
 /// `Ipc.Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
-/// "id":1}`. Every valid event is delivered to the loaded Lua scripts before
-/// any response is sent. Every request carrying an ID is answered with exactly
-/// one JSON-RPC result or error response carrying that ID, so the Entrypoint's
-/// synchronous event exchange never waits for a reply that will not come.
+/// "id":1}`. Every valid event is delivered to the loaded Lua scripts and
+/// initialized native plugins before any response is sent. Every request
+/// carrying an ID is answered with exactly one JSON-RPC result or error
+/// response carrying that ID, so the Entrypoint's synchronous event exchange
+/// never waits for a reply that will not come.
 /// Notifications (requests without an ID) are served without a response,
 /// as JSON-RPC requires. A message that cannot be decoded is answered with a
 /// JSON-RPC error and the message "Event is invalid".
@@ -1053,7 +1101,7 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
         defer parsed.deinit();
 
         if (event_manager) |manager| {
-            manager.dispatchEvent(@tagName(parsed.value.event));
+            manager.dispatchEvent(@tagName(parsed.value.event), parsed.value.payload);
         }
 
         const request_id = parsed.id();
@@ -1160,6 +1208,7 @@ fn testPlugin(context: *abi.PluginContext, load: abi.LoadFn) Plugin {
             .handle = undefined,
             .load = load,
             .unload = testUnload,
+            .on_event = null,
         },
         .context = context,
     };
@@ -1225,4 +1274,115 @@ test "runtime_entered reaches the manager listener" {
 
     manager.notifyManagerEvent(.runtime_entered);
     try std.testing.expect(collector.saw_runtime_entered);
+}
+
+/// Records the last event handed to a fake plugin callback.
+///
+/// The borrows are copied immediately because the manager only guarantees
+/// them for the duration of the callback.
+const TestEventCapture = struct {
+    /// Number of callbacks that ran.
+    calls: usize = 0,
+    /// Copy of the last event name.
+    name: [32]u8 = undefined,
+    /// Number of valid bytes in `name`.
+    name_len: usize = 0,
+    /// Copy of the last payload.
+    payload: [64]u8 = undefined,
+    /// Number of valid bytes in `payload`.
+    payload_len: usize = 0,
+};
+
+/// Storage for the fake plugin callbacks below; reset by each test that uses
+/// them.
+var test_event_capture: TestEventCapture = .{};
+
+/// Copies one event into `test_event_capture`, truncating oversized fields.
+fn recordTestEvent(event: *const abi.Event) void {
+    test_event_capture.calls += 1;
+
+    const name = event.name.slice();
+    test_event_capture.name_len = @min(name.len, test_event_capture.name.len);
+    @memcpy(
+        test_event_capture.name[0..test_event_capture.name_len],
+        name[0..test_event_capture.name_len],
+    );
+
+    const payload = event.payload.slice();
+    test_event_capture.payload_len = @min(payload.len, test_event_capture.payload.len);
+    @memcpy(
+        test_event_capture.payload[0..test_event_capture.payload_len],
+        payload[0..test_event_capture.payload_len],
+    );
+}
+
+/// Fake plugin `onEvent` that keeps the fan-out going.
+fn testOnEventContinue(_: *abi.PluginContext, event: *const abi.Event) callconv(.c) c_int {
+    recordTestEvent(event);
+    return abi.plugin_continue;
+}
+
+/// Fake plugin `onEvent` that stops later plugins from receiving the event.
+fn testOnEventStop(_: *abi.PluginContext, event: *const abi.Event) callconv(.c) c_int {
+    recordTestEvent(event);
+    return abi.plugin_stop;
+}
+
+test "dispatchEventToPlugins forwards the event name and payload" {
+    test_event_capture = .{};
+
+    var context = testPluginContext();
+    var plugin = testPlugin(&context, testLoadSuccess);
+    plugin.state = .initialized;
+    plugin.library.on_event = testOnEventContinue;
+
+    var plugins = [_]Plugin{plugin};
+    dispatchEventToPlugins(&plugins, "levelInit", "{\"map\":\"de_dust2\"}");
+
+    try std.testing.expectEqual(@as(usize, 1), test_event_capture.calls);
+    try std.testing.expectEqualStrings(
+        "levelInit",
+        test_event_capture.name[0..test_event_capture.name_len],
+    );
+    try std.testing.expectEqualStrings(
+        "{\"map\":\"de_dust2\"}",
+        test_event_capture.payload[0..test_event_capture.payload_len],
+    );
+}
+
+test "dispatchEventToPlugins skips plugins that did not initialize" {
+    test_event_capture = .{};
+
+    var context = testPluginContext();
+    var plugin = testPlugin(&context, testLoadSuccess);
+    plugin.state = .created;
+    plugin.library.on_event = testOnEventContinue;
+
+    var plugins = [_]Plugin{plugin};
+    dispatchEventToPlugins(&plugins, "pause", null);
+
+    try std.testing.expectEqual(@as(usize, 0), test_event_capture.calls);
+}
+
+test "dispatchEventToPlugins stops after plugin_stop" {
+    test_event_capture = .{};
+
+    var first_context = testPluginContext();
+    var first = testPlugin(&first_context, testLoadSuccess);
+    first.state = .initialized;
+    first.library.on_event = testOnEventStop;
+
+    var second_context = testPluginContext();
+    var second = testPlugin(&second_context, testLoadSuccess);
+    second.state = .initialized;
+    second.library.on_event = testOnEventContinue;
+
+    var plugins = [_]Plugin{ first, second };
+    dispatchEventToPlugins(&plugins, "pause", null);
+
+    try std.testing.expectEqual(@as(usize, 1), test_event_capture.calls);
+    try std.testing.expectEqualStrings(
+        "pause",
+        test_event_capture.name[0..test_event_capture.name_len],
+    );
 }

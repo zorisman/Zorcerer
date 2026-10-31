@@ -196,7 +196,7 @@ test "event JSON matches the schema" {
 
     var buffer: [128]u8 = undefined;
     for (cases) |case| {
-        const text = try Ipc.encodeEvent(&buffer, case.event);
+        const text = try Ipc.encodeEvent(&buffer, case.event, null);
 
         var expected_buffer: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(
@@ -211,6 +211,26 @@ test "event JSON matches the schema" {
         try std.testing.expectEqual(case.event, parsed.value.event);
         try std.testing.expect(parsed.id().eql(Ipc.event_request_id));
     }
+}
+
+test "event payload round-trips as JSON text" {
+    var buffer: [256]u8 = undefined;
+    const text = try Ipc.encodeEvent(&buffer, .levelInit, "{\"map\":\"de_dust2\"}");
+
+    const parsed = try Ipc.parseEvent(std.testing.allocator, text);
+    defer parsed.deinit();
+    try std.testing.expectEqual(Ipc.Event.levelInit, parsed.value.event);
+    try std.testing.expectEqualStrings("{\"map\":\"de_dust2\"}", parsed.value.payload.?);
+}
+
+test "event schema rejects a non-string payload" {
+    try std.testing.expectError(
+        error.InvalidParams,
+        Ipc.parseEvent(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"levelInit\",\"params\":{\"payload\":1},\"id\":1}",
+        ),
+    );
 }
 
 test "event schema rejects an unknown callback" {
@@ -236,7 +256,7 @@ test "manager answers every Entrypoint event with a JSON-RPC result" {
     };
 
     for (cases) |case| {
-        try Ipc.sendEvent(child.socket, case.event);
+        try Ipc.sendEvent(child.socket, case.event, null);
 
         const frame = try Ipc.readFrame(child.socket);
         try std.testing.expect(frame.received);
@@ -265,7 +285,7 @@ test "manager ignores event notifications" {
     // reply; only the following request is answered.
     try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}");
     try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}");
-    try Ipc.sendEvent(child.socket, .unpause);
+    try Ipc.sendEvent(child.socket, .unpause, null);
 
     const frame = try Ipc.readFrame(child.socket);
     try std.testing.expect(frame.received);

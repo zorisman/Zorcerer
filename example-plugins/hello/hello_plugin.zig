@@ -8,7 +8,8 @@
 //!
 //! The plugin manager dlopen()s the .so, looks up the exported `load` and
 //! `unload` symbols (ABI contract in src/core/PluginContext.zig) and calls
-//! them with a *PluginContext.
+//! them with a *PluginContext. It also resolves the optional `onEvent`
+//! export, which this plugin implements to log runtime events.
 //!
 //! On load(), the plugin creates/overwrites `plugin://hello.txt` with a
 //! report that lists the non-directory entries of `game://materials`, one
@@ -206,4 +207,24 @@ export fn unload(ctx: *abi.PluginContext) callconv(.c) c_int {
 
     consolePrint(ctx, "hello_plugin: unloaded\n");
     return 0;
+}
+
+/// Optional runtime-event hook: logs the event name and keeps delivery going.
+///
+/// `event` and its texts are only valid during this call, so nothing is
+/// retained. A context or event struct from an incompatible ABI is ignored
+/// rather than dereferenced.
+export fn onEvent(ctx: *abi.PluginContext, event: *const abi.Event) callconv(.c) c_int {
+    if (ctx.abi_version != abi.abi_version or event.struct_size < @sizeOf(abi.Event)) {
+        return abi.plugin_continue;
+    }
+
+    var message_buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrintZ(
+        &message_buffer,
+        "hello_plugin: event {s}\n",
+        .{event.name.slice()},
+    ) catch return abi.plugin_continue;
+    consolePrint(ctx, message);
+    return abi.plugin_continue;
 }

@@ -145,7 +145,28 @@ var manager_child: ?fork.ForkedChild = null;
 /// parent is effectively single-threaded when `forkChild` is called, which
 /// holds for the engine's VSP `Load` call.
 fn pluginManagerChild(fd: std.os.linux.fd_t) void {
-    _ = fd;
+    // The child must not call the engine's inherited LogPrint after the fork;
+    // route manager and plugin messages to the parent over IPC instead.
+    plugin_manager.setIpcLogger(fd);
+
+    plugin_manager.loadPlugins() catch |err| {
+        // A global failure (unreadable plugin root, out of memory, ...) is
+        // reported as a failed readiness text so the parent refuses startup.
+        var message_buffer: [128]u8 = undefined;
+        const message = std.fmt.bufPrint(
+            &message_buffer,
+            "plugin load failed: {s}",
+            .{@errorName(err)},
+        ) catch "plugin load failed";
+        Ipc.sendReady(fd, message) catch return;
+        Manager.listenForEvents(fd);
+        plugin_manager.unloadAll();
+        return;
+    };
+
+    Ipc.sendReady(fd, fork.manager_ready_message) catch return;
+    Manager.listenForEvents(fd);
+    plugin_manager.unloadAll();
 }
 
 fn load(
@@ -273,15 +294,18 @@ fn unload(this: *anyopaque) callconv(.c) void {
 /// sent by the child meanwhile are forwarded instead of being mistaken for the
 /// response.
 ///
+/// `payload` is optional JSON text with event parameters; the manager forwards
+/// it unchanged to Lua scripts and native plugins.
+///
 /// The engine invokes VSP callbacks from one thread at a time; this function
 /// is not reentrant and must not be called concurrently.
 ///
 /// Errors are logged rather than propagated: the engine callbacks have no way
 /// to report failure, and `unload` owns the manager's lifetime.
-fn sendManagerEvent(event: Ipc.Event) void {
+fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
     const child = if (manager_child) |*running| running else return;
 
-    Ipc.sendEvent(child.socket, event) catch |err| {
+    Ipc.sendEvent(child.socket, event, payload) catch |err| {
         Log.logLine(
             "[Zorcerer] sending the {s} event to the plugin manager failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
@@ -300,13 +324,13 @@ fn sendManagerEvent(event: Ipc.Event) void {
 /// VSP `Pause` callback: notifies the manager that the game was paused.
 fn pause(this: *anyopaque) callconv(.c) void {
     _ = this;
-    sendManagerEvent(.pause);
+    sendManagerEvent(.pause, null);
 }
 
 /// VSP `UnPause` callback: notifies the manager that the game was unpaused.
 fn unpause(this: *anyopaque) callconv(.c) void {
     _ = this;
-    sendManagerEvent(.unpause);
+    sendManagerEvent(.unpause, null);
 }
 
 /// VSP `GetPluginDescription` callback: returns the text the engine shows in
@@ -318,11 +342,16 @@ fn getPluginDescription(this: *anyopaque) callconv(.c) [*:0]const u8 {
 
 /// VSP `LevelInit` callback: logs the map and notifies the manager.
 /// `map_name` is the engine-owned, zero-terminated map name; it is only read
-/// during this call.
+/// during this call. The manager receives it in the event payload as JSON.
 fn levelInit(this: *anyopaque, map_name: [*:0]const u8) callconv(.c) void {
     _ = this;
-    Log.logLine("[Zorcerer] LevelInit: {s}\n", .{std.mem.span(map_name)});
-    sendManagerEvent(.levelInit);
+    const name = std.mem.span(map_name);
+    Log.logLine("[Zorcerer] LevelInit: {s}\n", .{name});
+
+    const allocator = std.heap.page_allocator;
+    const payload = std.json.Stringify.valueAlloc(allocator, .{ .map = name }, .{}) catch null;
+    defer if (payload) |text| allocator.free(text);
+    sendManagerEvent(.levelInit, payload);
 }
 
 /// VSP `ServerActivate` callback: logs the edict and client limits and
@@ -337,14 +366,22 @@ fn serverActivate(
     _ = this;
     _ = edict_list;
     Log.logLine("[Zorcerer] ServerActivate: {d} edicts, {d} max clients\n", .{ edict_count, client_max });
-    sendManagerEvent(.serverActivate);
+
+    const allocator = std.heap.page_allocator;
+    const payload = std.json.Stringify.valueAlloc(
+        allocator,
+        .{ .edict_count = edict_count, .client_max = client_max },
+        .{},
+    ) catch null;
+    defer if (payload) |text| allocator.free(text);
+    sendManagerEvent(.serverActivate, payload);
 }
 
 /// VSP `LevelShutdown` callback: logs the shutdown and notifies the manager.
 fn levelShutdown(this: *anyopaque) callconv(.c) void {
     _ = this;
     Log.logLine("[Zorcerer] LevelShutdown\n", .{});
-    sendManagerEvent(.levelShutdown);
+    sendManagerEvent(.levelShutdown, null);
 }
 
 pub export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {

@@ -11,9 +11,14 @@
 //!     load(ctx: *PluginContext) callconv(.c) c_int
 //!     unload(ctx: *PluginContext) callconv(.c) c_int
 //!
-//! - The plugin manager looks both symbols up with dlsym() and calls them
-//!   through the matching function pointers; a plugin missing one of them
-//!   is skipped.
+//! A plugin may additionally export an optional runtime-event hook:
+//!
+//!     onEvent(ctx: *PluginContext, event: *const Event) callconv(.c) c_int
+//!
+//! - The plugin manager looks both required symbols up with dlsym() and
+//!   calls them through the matching function pointers; a plugin missing one
+//!   of them is skipped. A missing `onEvent` is not an error and only means
+//!   the plugin receives no runtime events.
 //! - A plugin must check `ctx.abi_version` and `ctx.struct_size` before
 //!   reading any other field. The host sets both to the contract it was
 //!   compiled with; a plugin compiled against a newer contract must refuse
@@ -29,7 +34,8 @@
 //!   freed or modified by the plugin.
 //! - The context itself, its logger pointer and all identity fields remain
 //!   valid until after the plugin's unload() returns.
-//! - The manager hands the same context to load() and unload().
+//! - The manager hands the same context to load(), unload() and onEvent().
+//! - An `Event` and the texts it carries only live for one onEvent() call.
 
 /// Version of this contract. The host writes it into every PluginContext;
 /// a plugin compiled against a different version must return nonzero from
@@ -120,6 +126,36 @@ pub const LoadFn = *const fn (ctx: *PluginContext) callconv(.c) c_int;
 /// Plugin's `unload` export; called only when load() returned 0.
 pub const UnloadFn = *const fn (ctx: *PluginContext) callconv(.c) c_int;
 
-/// Optional plugin `onEvent` export. The manager currently does not look it
-/// up; a plugin that omits it still loads normally.
-pub const OnEventFn = *const fn (ctx: *PluginContext) callconv(.c) c_int;
+/// Return value of `OnEventFn` that lets the manager deliver the same event
+/// to the remaining initialized plugins.
+pub const plugin_continue: c_int = 0;
+
+/// Return value of `OnEventFn` that stops the manager from delivering the
+/// same event to plugins later in load order. It cannot cancel the engine
+/// action, which has already happened when a runtime event is delivered.
+pub const plugin_stop: c_int = 1;
+
+/// One runtime event handed to a plugin's `onEvent` export.
+///
+/// All fields are borrowed from the plugin manager and are only valid for
+/// the duration of the `onEvent` call; a plugin that needs them later must
+/// copy them. `struct_size` follows the same append-only rule as
+/// `PluginContext`, so a plugin can reject an event it does not understand.
+pub const Event = extern struct {
+    /// Size of this struct in bytes as provided by the host.
+    struct_size: usize,
+    /// Event name, for example `pause`, `levelInit`, or `serverActivate`.
+    /// The spelling matches the names Lua scripts receive.
+    name: Text,
+    /// Zero or more JSON-serialized parameters, or an empty text when the
+    /// event carries none. The empty text must not be dereferenced.
+    payload: Text,
+};
+
+/// Optional plugin `onEvent` export; called for every runtime event after
+/// `load()` returned 0.
+///
+/// A plugin that does not export it simply receives no events. The return
+/// value should be `plugin_continue`; any other value stops delivery to the
+/// remaining plugins (see `plugin_stop`).
+pub const OnEventFn = *const fn (ctx: *PluginContext, event: *const Event) callconv(.c) c_int;

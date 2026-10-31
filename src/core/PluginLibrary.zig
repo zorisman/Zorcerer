@@ -34,9 +34,11 @@ pub const RejectionReason = enum {
 
 /// A successfully opened plugin library.
 ///
-/// Invariants: `handle` is an open system library handle and both function
-/// pointers were resolved from it. The pointers remain valid until `close()`
-/// and must only be called with a compatible `*abi.PluginContext`.
+/// Invariants: `handle` is an open system library handle and both required
+/// function pointers were resolved from it. `on_event` is null when the
+/// plugin does not subscribe to runtime events. The pointers remain valid
+/// until `close()` and must only be called with a compatible
+/// `*abi.PluginContext`.
 ///
 /// Ownership: the value owns the underlying dlopen() handle. Every successful
 /// `open()` must be paired with exactly one `close()`.
@@ -47,6 +49,8 @@ pub const Library = struct {
     load: abi.LoadFn,
     /// Resolved `unload` export.
     unload: abi.UnloadFn,
+    /// Optional resolved `onEvent` export; null when the plugin omits it.
+    on_event: ?abi.OnEventFn,
 
     /// Closes the underlying library handle.
     ///
@@ -75,7 +79,8 @@ pub const OpenResult = union(enum) {
     rejected: Rejection,
 };
 
-/// Opens one plugin library and resolves its `load`/`unload` exports.
+/// Opens one plugin library and resolves its `load`/`unload` exports plus the
+/// optional `onEvent` export.
 ///
 /// `path` is the exact library path named by the plugin manifest; this
 /// function never scans a directory. The returned library owns the dlopen()
@@ -103,6 +108,7 @@ pub fn open(path: []const u8) OpenResult {
         .handle = handle,
         .load = undefined,
         .unload = undefined,
+        .on_event = null,
     };
 
     library.load = library.handle.lookup(abi.LoadFn, "load") orelse {
@@ -114,6 +120,10 @@ pub fn open(path: []const u8) OpenResult {
         library.close();
         return .{ .rejected = .{ .reason = .missing_symbol } };
     };
+
+    // Runtime-event delivery is opt-in: a plugin without `onEvent` still
+    // loads normally and simply receives no events.
+    library.on_event = library.handle.lookup(abi.OnEventFn, "onEvent");
 
     return .{ .loaded = library };
 }
@@ -155,10 +165,26 @@ test "open rejects a file that is not a usable dynamic library" {
 test "open loads a library exporting load and unload" {
     var result = open(build_options.valid_library);
     try std.testing.expect(result == .loaded);
+    try std.testing.expect(result.loaded.on_event == null);
 
     var ctx = testContext();
     try std.testing.expectEqual(@as(c_int, 0), result.loaded.load(&ctx));
     try std.testing.expectEqual(@as(c_int, 0), result.loaded.unload(&ctx));
+    result.loaded.close();
+}
+
+test "open resolves the optional onEvent export" {
+    var result = open(build_options.event_library);
+    try std.testing.expect(result == .loaded);
+    const on_event = result.loaded.on_event orelse return error.MissingOnEvent;
+
+    var ctx = testContext();
+    var event = abi.Event{
+        .struct_size = @sizeOf(abi.Event),
+        .name = abi.Text.fromSlice("pause"),
+        .payload = abi.Text.fromSlice(""),
+    };
+    try std.testing.expectEqual(abi.plugin_continue, on_event(&ctx, &event));
     result.loaded.close();
 }
 

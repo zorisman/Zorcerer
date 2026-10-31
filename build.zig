@@ -313,6 +313,19 @@ pub fn build(b: *std.Build) !void {
     missing_symbol_fixture.root_module.addImport("plugin-context", plugin_context);
     missing_symbol_fixture.out_filename = "plugin-library-missing-symbol-fixture.so";
 
+    const event_fixture = b.addLibrary(.{
+        .name = "plugin-library-event-fixture",
+        .linkage = .dynamic,
+        .root_module = b.addModule("plugin-library-event-fixture", .{
+            .root_source_file = b.path("src/tests/fixtures/event_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    event_fixture.root_module.addImport("plugin-context", plugin_context);
+    event_fixture.out_filename = "plugin-library-event-fixture.so";
+
     // PluginLibrary is tested through its own module instance so the test
     // build options do not leak into the production module.
     const plugin_library_test_module = b.addModule("plugin-library-tests", .{
@@ -329,6 +342,7 @@ pub fn build(b: *std.Build) !void {
         "missing_symbol_library",
         missing_symbol_fixture.getEmittedBin(),
     );
+    plugin_library_test_options.addOptionPath("event_library", event_fixture.getEmittedBin());
     plugin_library_test_options.addOptionPath(
         "invalid_library",
         b.path("src/tests/fixtures/invalid_library.so"),
@@ -341,6 +355,7 @@ pub fn build(b: *std.Build) !void {
     });
     plugin_library_tests.step.dependOn(&valid_fixture.step);
     plugin_library_tests.step.dependOn(&missing_symbol_fixture.step);
+    plugin_library_tests.step.dependOn(&event_fixture.step);
 
     const zorcerer_tests = b.addTest(.{
         .name = "zorcerer-tests",

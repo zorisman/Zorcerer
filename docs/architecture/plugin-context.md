@@ -80,6 +80,24 @@ Scenarios:
 
 6. Runtime
     1. Event hooking
+    Native plugins that export `onEvent(ctx, event)` receive every runtime
+    event after initialization. The manager looks the export up while opening
+    the library; a plugin without it loads normally and receives no events.
+    Only "On" hooks exist for now: the five VSP callbacks `pause`, `unpause`,
+    `levelInit`, `serverActivate`, and `levelShutdown` are forwarded over IPC
+    after the engine action, so a return value cannot cancel it.
+
+    `event.name` is the same spelling Lua scripts receive. `event.payload` is
+    JSON text or empty: `{"map":"<name>"}` for `levelInit` and
+    `{"edict_count":N,"client_max":N}` for `serverActivate`; the remaining
+    events carry no payload. The `Event` struct, its name, and its payload are
+    borrowed and only valid during the call.
+
+    Delivery runs after the Lua fan-out, in dependency-first load order, and
+    only reaches plugins in the `initialized` state. `plugin_continue` (0)
+    delivers the event to the next plugin; any other value stops delivery to
+    later plugins, matching Source's `PLUGIN_STOP` convention within the
+    plugin fan-out.
     2. Game queries
     3. File system
     4. Networking

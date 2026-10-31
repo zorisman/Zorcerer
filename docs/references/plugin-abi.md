@@ -1,10 +1,10 @@
 # ## Bottom line
 
-**The native plugin ABI is currently `load()` + `unload()` + a logger + plugin identity (ABI version 2) — enough to open a `.so` and identify it, not yet enough to deliver runtime events.**
+**The native plugin ABI is currently `load()` + `unload()` + an optional `onEvent()` hook + a logger + plugin identity (ABI version 2) — enough to open a `.so`, identify it, and deliver the five implemented runtime events.**
 
-- More ABI **surface** is needed: events, plugin identity/config, host-mediated engine access, and file/service access.
-- More exported **symbols** are not necessarily needed. Keeping `load`/`unload` as the only plugin exports and growing the versioned `PluginContext` contract is the cleaner direction.
-- The Source-side VSP vtable is layout-correct for `ISERVERPLUGINCALLBACKS003`, but most callbacks are stubs. That is safe for loading/unloading, but the engine events plugins would care about never reach native plugins at all.
+- More ABI **surface** is needed: host-mediated engine access, file/service access, and additional event sites.
+- More exported **symbols** are not necessarily needed. Keeping `load`/`unload` as the only required exports, adding optional `onEvent`, and growing the versioned `PluginContext` contract is the cleaner direction.
+- The Source-side VSP vtable is layout-correct for `ISERVERPLUGINCALLBACKS003`, but most callbacks are stubs. Five engine callbacks (`pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown`) now reach native plugins over IPC.
 
 Note: `PluginManager.zig` has no functions literally named `load()`/`unload()`; the manager-side equivalents are `loadPlugins()` / `unloadAll()`, while `load()`/`unload()` are the plugin-exported entry points in `PluginContext.zig`.
 
@@ -24,9 +24,10 @@ The Source engine loading a Valve Server Plugin works like this:
    - wires the logger (`Entrypoint.zig:759`),
    - forks the manager child (`Entrypoint.zig:766-769`),
    - waits for its `ready` notification (`Entrypoint.zig:776-783`).
-5. The child loads native plugins and Lua scripts, then reports readiness.
-6. The engine calls the remaining VSP callbacks. Currently only `pause`, `unpause`, `levelInit`, `serverActivate`, and `levelShutdown` are forwarded (`Entrypoint.zig:832-893`); `gameFrame` is a no-op (`Entrypoint.zig:884-887`); client callbacks are `genericStub` (`Entrypoint.zig:902-921`).
-7. On unload, the engine calls vtable slot 1, `Unload()` (`Entrypoint.zig:795-815`), which closes the IPC socket, causing the child’s `listenForEvents()` to see EOF, unload its plugins, and exit.
+5. The child loads Lua scripts and native plugins, reports readiness, and then
+   serves engine events until the parent closes the channel.
+6. The engine calls the remaining VSP callbacks. Currently only `pause`, `unpause`, `levelInit`, `serverActivate`, and `levelShutdown` are forwarded (`Entrypoint.zig`); `gameFrame` is a no-op; client callbacks are `genericStub`. `levelInit` and `serverActivate` include JSON payloads.
+7. On unload, the engine calls vtable slot 1, `Unload()`, which closes the IPC socket, causing the child’s `listenForEvents()` to see EOF, unload its plugins, and exit.
 
 ### Vtable check
 
@@ -59,33 +60,38 @@ So, for **loading**: no additional VSP slots are required. For **useful event de
 2. Iterates directories under `tf/addons/zorcerer/plugins` and loads each `main.lua`.
 3. Reads and validates every `manifest.toml` through `readConfig()`.
 4. Resolves the native dependency graph and reports static rejections.
-5. Walks the dependency-first order; for each accepted configuration it opens
-   only the library named by `manifest.path`, looks up `load`/`unload`, and
-   calls `load(ctx)` with a per-plugin `PluginContext`.
-6. Rejects a failed library and every transitive dependent; unrelated plugins
-   continue loading.
+5. Creates each accepted plugin in dependency-first order: opens only the
+   library named by `manifest.path`, looks up `load`/`unload` and the optional
+   `onEvent`, and builds a per-plugin `PluginContext`.
+6. Initializes the created plugins in the same order by calling `load(ctx)`.
+7. Rejects a failed library or initialization and every transitive dependent;
+   unrelated plugins continue loading.
+8. Emits `runtime_entered` after the initialization pass.
 
 `PluginLibrary.open()` (`src/core/PluginLibrary.zig`) owns the dlopen handle
 and reports structured rejections: `library_not_found`,
-`invalid_configuration`, or `missing_symbol`. The manager turns them into a
-`library_rejected` event.
+`invalid_configuration`, or `missing_symbol`. A missing `onEvent` is not a
+rejection. The manager turns rejections into a `library_rejected` event.
 
 `unloadAll()` walks native plugins in reverse order, calls `unload(ctx)` only
-for active plugins, always closes the library, frees the context, and frees the
-path, then notifies and tears down Lua scripts.
+for initialized plugins, always closes the library, frees the context, and frees
+the path, then notifies and tears down Lua scripts.
 
 The ABI itself is in `src/core/PluginContext.zig` (version 2):
 
 ```zig
 PluginContext { abi_version, struct_size, logger, plugin: PluginInfo }
 PluginInfo { id, name, version, author, library_path }  // Text = ptr + len
+Event { struct_size, name: Text, payload: Text }        // borrowed for one call
 load(ctx: *PluginContext) -> int
 unload(ctx: *PluginContext) -> int
+onEvent(ctx: *PluginContext, event: *const Event) -> int   // optional
 ```
 
 Context strings borrow the manager's validated manifest and stay valid until
 after `unload()`. Plugins must check `abi_version` and `struct_size` before
-reading the remaining fields.
+reading the remaining fields. `payload` is JSON text or empty; `onEvent`
+returns `0` (`PLUGIN_CONTINUE`) to keep event delivery going.
 
 ---
 
@@ -95,15 +101,19 @@ reading the remaining fields.
 |---|---|---|
 | Load/unload lifecycle | yes | `on_load` / `on_unload` |
 | Logging | yes | `zostd.log` |
-| Pause/UnPause | **no** | yes |
-| LevelInit/ServerActivate/LevelShutdown | **no** | yes |
+| Pause/UnPause | yes (`onEvent`) | yes |
+| LevelInit/ServerActivate/LevelShutdown | yes (`onEvent`) | yes |
 | GameFrame | **no** | **no** |
 | Client callbacks | **no** | **no** |
 | Plugin id / manifest data | id, name, version, author, library path | id and root only |
 | Engine commands / cvars / game FS | **no** | `server_command` exists but is not wired by the manager |
-| IPC/event payloads | **no** | only event name, payload always `nil` |
+| IPC/event payloads | JSON text for `levelInit`/`serverActivate` | same payload string |
 
-This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts` (`PluginManager.zig:532-536`). Native plugins are loaded and unloaded, but **never receive any event after `load()`**. The Source `pause`, `levelInit`, etc. go through IPC only to Lua.
+`Manager.dispatchEvent()` delivers each engine event to Lua scripts first and
+then to every initialized native plugin that exported `onEvent`, in
+dependency-first load order. Native plugins without the export are skipped.
+`onEvent` may stop delivery to later plugins but cannot cancel the engine
+action, because these events are post-action notifications.
 
 ---
 
@@ -115,7 +125,7 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 4. **`game_server_factory` is ignored** (`Entrypoint.zig:702-703`). It is the normal route to server-side interfaces such as `ServerGameDLL`, `ServerGameClients`, and `ServerGameEnts`.
 5. **Fork boundary blocks direct engine access.** The child inherits engine pointers, but calling them after `fork()` is unsafe (`Log.zig:13-16`). Any engine operation for plugins must be mediated by the parent over IPC, not by passing raw engine pointers into `PluginContext`.
 6. **Synchronous event exchange is a scalability limit.** `sendManagerEvent()` blocks the engine callback until the child replies (`Entrypoint.zig:832-849`). A slow plugin blocks the server. This is tolerable for level events, not for `GameFrame` or client commands.
-7. **IPC payloads are absent/limited.** `Ipc.Event` carries no parameters (`Ipc.zig:276-300`), and frames are capped at 4096 bytes (`Ipc.zig:22`). Client command arguments or larger results will need payload support and a higher/chunked limit.
+7. **IPC payloads are limited.** `Ipc.Event` now carries optional JSON text for `levelInit` and `serverActivate`, and frames are capped at 4096 bytes (`Ipc.zig:22`). Client command arguments or larger results will need a higher/chunked limit.
 8. **`cachePlugin()` leaks on append failure.** If `plugins.append()` fails after `DynLib.open()`, the library is not closed (`PluginManager.zig:337-342`).
 
 ---
@@ -128,12 +138,12 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 
 ### Recommended ABI shape
 
-1. **Event delivery to native plugins — required.**
-   Either:
-   - add one optional export such as `on_event(event, payload) -> int`, or
-   - let plugins register callbacks through `PluginContext` (e.g. `host.events.subscribe(callback, context)`).
-
-   The callback-table approach is cleaner: it avoids dlsym name proliferation and lets the ABI version the callback signature.
+1. **Event delivery to native plugins — implemented.**
+   Plugins may export an optional
+   `onEvent(ctx, event: *const Event) -> int`. The manager resolves it with
+   dlsym and delivers the five implemented engine events after
+   initialization. A richer callback-table registration API can replace the
+   export later without changing `PluginContext`.
 
 2. **Plugin identity and configuration — implemented.**
    ABI version 2 passes `PluginInfo` (id, name, version, author, library path)
@@ -150,7 +160,7 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 
 5. **Lifecycle/event coverage.**
    If plugins need Source callbacks, add them in this order:
-   - `levelInit`, `serverActivate`, `levelShutdown`, `pause`, `unpause` to native plugins (currently Lua-only),
+   - `levelInit`, `serverActivate`, `levelShutdown`, `pause`, `unpause` to native plugins — implemented as post-action "On" events,
    - `gameFrame` only if genuinely needed, because synchronous per-tick IPC is expensive,
    - client callbacks (`ClientActive`, `ClientDisconnect`, `ClientPutInServer`, `ClientSettingsChanged`, `ClientConnect`, `ClientCommand`, `NetworkIDValidated`, `OnQueryCvarValueFinished`, `OnEdictAllocated/Freed`) by replacing the relevant `genericStub` slots.
 
@@ -164,9 +174,9 @@ This is the key finding: `Manager.dispatchEvent()` only loops over `lua_scripts`
 
 ### Suggested priority
 
-**P0:** native event delivery, host-mediated engine calls. Plugin identity/config and ABI size/version negotiation are implemented in ABI version 2.
+**P0:** host-mediated engine calls. Native event delivery, plugin identity/config, and ABI size/version negotiation are implemented in ABI version 2.
 
-**P1:** real `GameFrame`/client VSP callbacks, IPC payloads, per-plugin permissions/allowlists, dependency ordering.
+**P1:** real `GameFrame`/client VSP callbacks, richer IPC payloads, per-plugin permissions/allowlists, dependency ordering.
 
 **P2:** hot reload, async event dispatch, structured error reporting, richer service discovery.
 

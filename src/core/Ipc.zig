@@ -291,9 +291,13 @@ pub const Event = enum {
 /// In JSON-RPC the event callback is the method name, so the wire message is:
 ///
 ///     {"jsonrpc": "2.0", "method": "pause", "id": 1}
+///     {"jsonrpc": "2.0", "method": "levelInit", "params": {"payload": "{\"map\":\"de_dust2\"}"}, "id": 1}
 pub const EventMessage = struct {
     /// Callback that fired.
     event: Event,
+    /// Optional JSON text with event-specific parameters. It is transmitted
+    /// as a JSON string and borrows the parsed request.
+    payload: ?[]const u8 = null,
 };
 
 /// An event request parsed from a JSON-RPC request.
@@ -318,12 +322,14 @@ pub const ParsedEvent = struct {
 
 /// Parses one JSON-RPC event request.
 ///
-/// The JSON-RPC method name selects the event. The returned value owns the
-/// parsed JSON until `deinit()`.
+/// The JSON-RPC method name selects the event. An optional object `params`
+/// may carry a string member `payload`, which is returned unchanged as JSON
+/// text. The returned value owns the parsed JSON until `deinit()`.
 ///
 /// Errors: `error.NotRpcRequest` when `text` is a response or batch,
 /// `error.InvalidRpcRequest` for an invalid JSON-RPC envelope,
-/// `error.UnknownMethod` when the method is not one of `Event`'s callbacks.
+/// `error.UnknownMethod` when the method is not one of `Event`'s callbacks,
+/// and `error.InvalidParams` when `payload` is not a string.
 pub fn parseEvent(allocator: std.mem.Allocator, text: []const u8) !ParsedEvent {
     var rpc = zjr.parseRpcRequest(allocator, text);
     errdefer rpc.deinit();
@@ -333,38 +339,73 @@ pub fn parseEvent(allocator: std.mem.Allocator, text: []const u8) !ParsedEvent {
     if (request.hasError()) return error.InvalidRpcRequest;
 
     const event = eventFromMethod(request.method) orelse return error.UnknownMethod;
+
+    var payload: ?[]const u8 = null;
+    if (request.objectParams()) |params| {
+        if (params.get("payload")) |value| {
+            payload = switch (value) {
+                .string => |bytes| bytes,
+                else => return error.InvalidParams,
+            };
+        }
+    }
+
     return .{
         .rpc = rpc,
-        .value = .{ .event = event },
+        .value = .{ .event = event, .payload = payload },
     };
 }
 
 /// Serializes `event` as a JSON-RPC request into `buffer`.
 ///
 /// Uses `event_request_id` so the listener can answer with a matching ID.
-/// The returned slice borrows `buffer`.
+/// `payload` is optional JSON text that is transmitted as a string inside an
+/// object `params`. The returned slice borrows `buffer`.
 ///
-/// Errors: `error.WriteFailed` when the event does not fit `buffer`.
-pub fn encodeEvent(buffer: []u8, event: Event) ![]const u8 {
+/// Errors: `error.OutOfMemory` while encoding the parameters,
+/// `error.WriteFailed` when the event does not fit `buffer`, and writer
+/// errors from parameter encoding.
+pub fn encodeEvent(buffer: []u8, event: Event, payload: ?[]const u8) ![]const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
-    try zjr.composer.writeRequestJson(
-        @tagName(event),
-        null,
-        zjr.RpcId.of(event_request_id),
-        &writer,
-    );
+
+    if (payload) |text| {
+        const allocator = std.heap.page_allocator;
+        const params_json = try std.json.Stringify.valueAlloc(
+            allocator,
+            .{ .payload = text },
+            .{},
+        );
+        defer allocator.free(params_json);
+
+        try zjr.composer.writeRequestJson(
+            @tagName(event),
+            params_json,
+            zjr.RpcId.of(event_request_id),
+            &writer,
+        );
+    } else {
+        try zjr.composer.writeRequestJson(
+            @tagName(event),
+            null,
+            zjr.RpcId.of(event_request_id),
+            &writer,
+        );
+    }
+
     return writer.buffered();
 }
 
 /// Serializes `event` as a JSON-RPC request and sends it as one frame.
 ///
 /// Uses `event_request_id` so the listener can answer with a matching ID.
+/// `payload` is optional JSON text; see `encodeEvent`.
 /// Errors: `error.WriteFailed` when the event does not fit the stack buffer or
-/// the write fails, and `error.PayloadTooLarge` from `writeFrame`.
-pub fn sendEvent(fd: std.os.linux.fd_t, event: Event) !void {
-    var buffer: [128]u8 = undefined;
-    const payload = try encodeEvent(&buffer, event);
-    try writeFrame(fd, payload);
+/// the write fails, `error.OutOfMemory` while encoding the parameters, and
+/// `error.PayloadTooLarge` from `writeFrame`.
+pub fn sendEvent(fd: std.os.linux.fd_t, event: Event, payload: ?[]const u8) !void {
+    var buffer: [max_payload_len]u8 = undefined;
+    const payload_json = try encodeEvent(&buffer, event, payload);
+    try writeFrame(fd, payload_json);
 }
 
 /// Formats the result text the manager answers `event` with: `"Event is X"`.
