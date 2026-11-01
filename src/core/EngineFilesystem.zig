@@ -16,9 +16,10 @@
 
 const std = @import("std");
 const Ipc = @import("Ipc.zig");
-const Indexes = @import("../codegen_generated/engine_indexes.zig");
+const root = @import("zroot");
+const Indexes = root.codegen.indexes;
 const abi = @import("plugin-context");
-const file_system = @import("../io/file_system.zig");
+const file_system = root.io.filesystem;
 
 /// One engine file handle owned by this process.
 const FileHandle = struct {

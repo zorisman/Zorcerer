@@ -1,7 +1,7 @@
 const std = @import("std");
 const zjr = @import("zjr");
 const Ipc = @import("Ipc.zig");
-const Log = @import("../root.zig").io.Log;
+const Log = @import("zroot").io.Log;
 const fork = @import("ForkProcess.zig");
 
 /// Executes one JSON-RPC response received from the plugin manager.

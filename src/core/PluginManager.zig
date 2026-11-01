@@ -1,12 +1,13 @@
 const std = @import("std");
 const Ipc = @import("Ipc.zig");
-const root = @import("../root.zig");
+const root = @import("zroot");
 const abi = root.abi;
 const Log = root.io.Log;
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 const PluginDependency = @import("PluginDependency.zig");
 const PluginLibrary = @import("plugin-library");
 const FileService = @import("FileService.zig");
+const LuaHost = @import("LuaHost.zig");
 const zlua = @import("zlua");
 
 /// Plugin directory relative to the process working directory.
@@ -71,43 +72,20 @@ const CreatedPlugin = struct {
     plugin_index: usize,
 };
 
-/// Host callback context of one Lua script.
+/// One loaded Lua script and the core resources it uses.
 ///
-/// The `zlua` runtime hands this pointer to every `zostd` callback. It is
-/// heap-allocated so its address stays stable when the manager's script list
-/// grows, and it owns nothing: `manager` and `files` are owned by the manager
-/// and outlive the script's runtime.
-const LuaContext = struct {
-    /// Manager that owns the script's Lua state.
-    manager: *Manager,
-    /// Filesystem context shared with the native plugin in the same
-    /// directory.
+/// `zlua.Script` owns the Lua state, script strings, and Lua lifecycle. This
+/// entry only pairs it with the filesystem context and host context that the
+/// manager must release after the script's `on_unload` dispatch. The entry is
+/// retained until `unloadAll()`.
+const LuaScriptEntry = struct {
+    /// Loaded script and its independent Lua state.
+    script: zlua.Script,
+    /// Filesystem context of this script's directory. Released after the
+    /// script's `deinit()`.
     files: *FileService.PluginFiles,
-};
-
-/// One Lua script loaded directly by the manager.
-///
-/// A script is discovered as `main.lua` inside a plugin directory. It runs in
-/// its own `zlua` state, registers callbacks through `zostd.on`, and is called
-/// directly by the manager on the existing IPC events. This is the prototype
-/// path for ZLua; it does not use the native `.so` plugin ABI.
-pub const LuaScript = struct {
-    /// Plugin id shown to the script through `zostd.plugin_id()`.
-    /// Owned by the manager.
-    plugin_id: []const u8,
-    /// Absolute path of this script's plugin directory, also passed to the
-    /// Lua runtime so `zostd` can resolve plugin-relative paths when no host
-    /// file callbacks are configured. Normal file access goes through `files`
-    /// instead. Owned by the manager.
-    root: []const u8,
-    /// Script path used in error messages. Owned by the manager.
-    path: []const u8,
-    /// Filesystem context of this script's directory.
-    files: *FileService.PluginFiles,
-    /// Host callback context; `runtime` borrows it.
-    host: *LuaContext,
-    /// Independent Lua state for this script.
-    runtime: zlua.runtime.Runtime,
+    /// Host callback context borrowed by the script runtime.
+    host: *LuaHost.Context,
 };
 
 /// One lifecycle event emitted by the manager while loading plugins.
@@ -204,7 +182,7 @@ pub const ManagerListener = struct {
 /// call or deinit().
 ///
 /// Independently of manifests, loadPlugins() discovers each directory's
-/// `main.lua` (see LuaScript) and its plugin libraries (see plugins_directory
+/// `main.lua` (see zlua.Script) and its plugin libraries (see plugins_directory
 /// and Plugin), resolves the native plugins' dependency graph, creates each
 /// accepted instance in dependency-first order, then initializes them by
 /// calling their load(). After the initialization pass it enters the runtime
@@ -264,7 +242,7 @@ pub const Manager = struct {
 
     /// Lua scripts loaded directly by the manager: filled by loadPlugins(),
     /// emptied and released by unloadAll().
-    lua_scripts: std.ArrayList(LuaScript) = .empty,
+    lua_scripts: std.ArrayList(LuaScriptEntry) = .empty,
 
     pub fn init() @This() {
         return .{};
@@ -916,185 +894,81 @@ pub const Manager = struct {
         var remaining_scripts = self.lua_scripts.items.len;
         while (remaining_scripts > 0) {
             remaining_scripts -= 1;
-            const script = &self.lua_scripts.items[remaining_scripts];
+            const entry = &self.lua_scripts.items[remaining_scripts];
 
-            script.runtime.dispatchEvent("on_unload", null);
-            script.runtime.deinit();
-            if (self.file_service) |service| service.destroyPluginFiles(script.files);
-            self.allocator.destroy(script.host);
-            self.allocator.free(script.plugin_id);
-            self.allocator.free(script.root);
-            self.allocator.free(script.path);
+            // `deinit()` dispatches `on_unload` before closing the state, so
+            // the script can still use its host callbacks and files.
+            entry.script.deinit();
+            if (self.file_service) |service| service.destroyPluginFiles(entry.files);
+            self.allocator.destroy(entry.host);
         }
 
         self.lua_scripts.clearRetainingCapacity();
     }
 
-    /// Loads `<plugins_directory>/<dir_name>/main.lua` into its own runtime.
+    /// Loads `<plugins_directory>/<dir_name>/main.lua` through `zlua.Script`.
     ///
-    /// A missing script leaves the manager unchanged. Read, compile, and
-    /// runtime failures are logged and the partially initialized state is
-    /// released, matching how invalid native plugins are skipped. On success,
-    /// the script receives the `on_load` event and is retained until
-    /// `unloadAll()`.
+    /// A missing script leaves the manager unchanged. `zlua.Script` owns
+    /// discovery, runtime setup, `on_load`, and diagnostics; this function
+    /// only creates the core resources the script's host callbacks need and
+    /// retains them for `unloadAll()`.
     fn loadLuaScript(self: *@This(), dir_name: []const u8) void {
-        const io = self.threaded_io.io();
-
-        const script_path = std.Io.Dir.path.join(
-            self.allocator,
-            &.{ plugins_directory, dir_name, "main.lua" },
-        ) catch |err| {
-            Log.logLine(
-                "[zlua] {s}/{s}/main.lua: path join failed ({s}), script skipped\n",
-                .{ plugins_directory, dir_name, @errorName(err) },
-            );
-            return;
-        };
-        var keep_path = false;
-        defer if (!keep_path) self.allocator.free(script_path);
-
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            io,
-            script_path,
-            self.allocator,
-            .unlimited,
-        ) catch |err| {
-            if (err != error.FileNotFound) {
-                Log.logLine(
-                    "[zlua] {s}: read failed ({s}), script skipped\n",
-                    .{ script_path, @errorName(err) },
-                );
-            }
-            return;
-        };
-        defer self.allocator.free(source);
-
-        const plugin_id = self.allocator.dupe(u8, dir_name) catch |err| {
-            Log.logLine(
-                "[zlua] {s}: could not duplicate plugin id ({s}), script skipped\n",
-                .{ script_path, @errorName(err) },
-            );
-            return;
-        };
-        var keep_plugin_id = false;
-        defer if (!keep_plugin_id) self.allocator.free(plugin_id);
-
-        const plugin_root = std.Io.Dir.path.join(
-            self.allocator,
-            &.{ plugins_directory, dir_name },
-        ) catch |err| {
-            Log.logLine(
-                "[zlua] {s}: could not build plugin root ({s}), script skipped\n",
-                .{ script_path, @errorName(err) },
-            );
-            return;
-        };
-        var keep_root = false;
-        defer if (!keep_root) self.allocator.free(plugin_root);
-
         const service = self.file_service orelse {
             Log.logLine(
-                "[zlua] {s}: filesystem service is not initialized, script skipped\n",
-                .{script_path},
+                "[zlua] {s}/{s}/main.lua: filesystem service is not initialized, script skipped\n",
+                .{ plugins_directory, dir_name },
             );
             return;
         };
+
         const files = service.createPluginFiles(dir_name) catch |err| {
             Log.logLine(
-                "[zlua] {s}: could not create filesystem context ({s}), script skipped\n",
-                .{ script_path, @errorName(err) },
+                "[zlua] {s}/{s}/main.lua: could not create filesystem context ({s}), script skipped\n",
+                .{ plugins_directory, dir_name, @errorName(err) },
             );
             return;
         };
         var files_alive = true;
         defer if (files_alive) service.destroyPluginFiles(files);
 
-        const host = self.allocator.create(LuaContext) catch |err| {
+        const host_context = self.allocator.create(LuaHost.Context) catch |err| {
             Log.logLine(
-                "[zlua] {s}: could not create host context ({s}), script skipped\n",
-                .{ script_path, @errorName(err) },
+                "[zlua] {s}/{s}/main.lua: could not create host context ({s}), script skipped\n",
+                .{ plugins_directory, dir_name, @errorName(err) },
             );
             return;
         };
         var host_alive = true;
-        defer if (host_alive) self.allocator.destroy(host);
-        host.* = .{ .manager = self, .files = files };
+        defer if (host_alive) self.allocator.destroy(host_context);
+        host_context.* = .{ .manager = self, .files = files };
 
-        var runtime = zlua.runtime.Runtime.init(self.allocator) catch |err| {
-            Log.logLine(
-                "[zlua] {s}: could not create Lua state ({s}), script skipped\n",
-                .{ script_path, @errorName(err) },
-            );
-            return;
-        };
-        var runtime_alive = true;
-        defer if (runtime_alive) runtime.deinit();
-
-        // The runtime borrows these slices, so they must outlive it. They are
-        // moved into the manager's LuaScript entry on success.
-        runtime.setPluginId(plugin_id);
-        runtime.setPluginRoot(plugin_root);
-        runtime.setHost(.{
-            .context = host,
-            .log = luaLog,
-            .read_file = luaReadFile,
-            .write_file = luaWriteFile,
-            .server_info = luaGameServerInfo,
-            .player_info = luaGamePlayerInfo,
-            .entity_exists = luaGameEntityExists,
-            .server_cvar = luaGameServerCvar,
-            .client_cvar = luaGameClientCvar,
-        });
-        runtime.openSafeLibs();
-        runtime.installZostd();
-
-        var chunk_name_buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
-        const chunk_name = std.fmt.bufPrintZ(
-            &chunk_name_buffer,
-            "@{s}",
-            .{script_path},
-        ) catch {
-            Log.logLine(
-                "[zlua] {s}: path is too long for a Lua chunk name, script skipped\n",
-                .{script_path},
-            );
-            return;
-        };
-
-        runtime.run(source, chunk_name) catch |err| {
-            const message = runtime.lua.toString(-1) catch "<non-string error>";
-            Log.logLine(
-                "[zlua] {s}: {s}: {s}\n",
-                .{ script_path, @errorName(err), std.mem.span(message) },
-            );
-            return;
-        };
+        var script = zlua.Script.load(
+            self.allocator,
+            self.threaded_io.io(),
+            .{
+                .plugins_directory = plugins_directory,
+                .directory_name = dir_name,
+                .host = LuaHost.host(host_context),
+            },
+        ) catch return;
+        var script_alive = true;
+        defer if (script_alive) script.deinit();
 
         self.lua_scripts.append(self.allocator, .{
-            .plugin_id = plugin_id,
-            .root = plugin_root,
-            .path = script_path,
+            .script = script,
             .files = files,
-            .host = host,
-            .runtime = runtime,
+            .host = host_context,
         }) catch |err| {
             Log.logLine(
                 "[zlua] {s}: could not retain script ({s}), script skipped\n",
-                .{ script_path, @errorName(err) },
+                .{ script.path(), @errorName(err) },
             );
             return;
         };
 
-        keep_path = true;
-        keep_plugin_id = true;
-        keep_root = true;
-        runtime_alive = false;
+        script_alive = false;
         files_alive = false;
         host_alive = false;
-
-        const script = &self.lua_scripts.items[self.lua_scripts.items.len - 1];
-        Log.logLine("[zlua] loaded {s} as {s}\n", .{ script_path, plugin_id });
-        script.runtime.dispatchEvent("on_load", null);
     }
 
     /// Delivers one engine event to every loaded Lua script and every
@@ -1116,8 +990,8 @@ pub const Manager = struct {
 
     /// Delivers one event to every loaded Lua script.
     fn dispatchToLua(self: *@This(), event: []const u8, payload: ?[]const u8) void {
-        for (self.lua_scripts.items) |*script| {
-            script.runtime.dispatchEvent(event, payload);
+        for (self.lua_scripts.items) |*entry| {
+            entry.script.dispatchEvent(event, payload);
         }
     }
 
@@ -1151,7 +1025,9 @@ pub const Manager = struct {
     }
 
     /// Executes the `server_info` query into `out`.
-    fn queryServerInfo(self: *@This(), out: *abi.ServerInfo) c_int {
+    ///
+    /// Public so the Lua host adapter can answer `zostd.game.server_info()`.
+    pub fn queryServerInfo(self: *@This(), out: *abi.ServerInfo) c_int {
         const text = self.fetchQuery(.{ .query = .server_info }) catch |err|
             return queryStatus(err);
         defer self.allocator.free(text);
@@ -1185,7 +1061,7 @@ pub const Manager = struct {
     }
 
     /// Executes the `player_info` query for `index` into `out`.
-    fn queryPlayerInfo(self: *@This(), index: c_int, out: *abi.PlayerInfo) c_int {
+    pub fn queryPlayerInfo(self: *@This(), index: c_int, out: *abi.PlayerInfo) c_int {
         const text = self.fetchQuery(.{ .query = .player_info, .index = index }) catch |err|
             return queryStatus(err);
         defer self.allocator.free(text);
@@ -1226,7 +1102,7 @@ pub const Manager = struct {
     }
 
     /// Executes the `entity_exists` query for `index` into `out`.
-    fn queryEntityInfo(self: *@This(), index: c_int, out: *abi.EntityInfo) c_int {
+    pub fn queryEntityInfo(self: *@This(), index: c_int, out: *abi.EntityInfo) c_int {
         const text = self.fetchQuery(.{ .query = .entity_exists, .index = index }) catch |err|
             return queryStatus(err);
         defer self.allocator.free(text);
@@ -1246,7 +1122,7 @@ pub const Manager = struct {
     }
 
     /// Executes the `server_cvar` query for `name` into `out`.
-    fn queryServerCvar(self: *@This(), name: []const u8, out: *abi.CvarValue) c_int {
+    pub fn queryServerCvar(self: *@This(), name: []const u8, out: *abi.CvarValue) c_int {
         const text = self.fetchQuery(.{ .query = .server_cvar, .name = name }) catch |err|
             return queryStatus(err);
         defer self.allocator.free(text);
@@ -1263,7 +1139,7 @@ pub const Manager = struct {
     }
 
     /// Executes the `client_cvar` query for client `index` into `out`.
-    fn queryClientCvar(
+    pub fn queryClientCvar(
         self: *@This(),
         index: c_int,
         name: []const u8,
@@ -1399,185 +1275,6 @@ fn dispatchEventToPlugins(plugins: []Plugin, event: []const u8, payload: ?[]cons
 /// The manager is single-threaded and lives in the forked child for the whole
 /// lifetime of the listener.
 var event_manager: ?*Manager = null;
-
-/// Returns the Lua callback context behind an ABI `context` pointer.
-fn luaHostContext(raw: ?*anyopaque) ?*LuaContext {
-    const context = raw orelse return null;
-    return @ptrCast(@alignCast(context));
-}
-
-/// Forwards one `zostd.log()` message from a Lua script to the manager's log.
-///
-/// `context` is the script's host context; the log sink itself is
-/// process-global (see src/io/Log.zig), so the context is not used.
-fn luaLog(context: ?*anyopaque, message: []const u8) void {
-    _ = context;
-    Log.logLine("[zlua] {s}\n", .{message});
-}
-
-/// Qualifies a `zostd.read_file()`/`write_file()` path for `PluginFiles`.
-///
-/// A path without a `plugin://` or `game://` prefix addresses a file relative
-/// to the script's plugin directory, matching the historical Lua behavior.
-/// The returned slice is allocated with `allocator` and owned by the caller.
-///
-/// Errors: `error.OutOfMemory`.
-fn luaFilePath(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) error{OutOfMemory}![]u8 {
-    if (std.mem.startsWith(u8, path, "plugin://") or
-        std.mem.startsWith(u8, path, "game://"))
-    {
-        return allocator.dupe(u8, path);
-    }
-    return std.fmt.allocPrint(allocator, "plugin://{s}", .{path});
-}
-
-/// Implements `zostd.read_file(path)` for a Lua script.
-///
-/// The bytes are allocated with `allocator` and owned by the caller. Both URI
-/// schemes work; `game://` content is read-only.
-///
-/// Errors: the `PluginFiles` errors for the selected path and
-/// `error.OutOfMemory`.
-fn luaReadFile(
-    context: ?*anyopaque,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) anyerror![]u8 {
-    const host = luaHostContext(context) orelse return error.Unavailable;
-    const qualified = try luaFilePath(allocator, path);
-    defer allocator.free(qualified);
-    return host.files.readAll(allocator, qualified);
-}
-
-/// Implements `zostd.write_file(path, data)` for a Lua script.
-///
-/// A path without a URI scheme is relative to the script's plugin directory.
-/// `game://` content is read-only and yields `error.PermissionDenied`.
-///
-/// Errors: the `PluginFiles` errors for the selected path and
-/// `error.OutOfMemory`.
-fn luaWriteFile(
-    context: ?*anyopaque,
-    path: []const u8,
-    data: []const u8,
-) anyerror!void {
-    const host = luaHostContext(context) orelse return error.Unavailable;
-    const allocator = host.manager.allocator;
-    const qualified = try luaFilePath(allocator, path);
-    defer allocator.free(qualified);
-    return host.files.writeAll(qualified, data);
-}
-
-/// Forwards `zostd.game.server_info()` from a Lua script to the query client.
-fn luaGameServerInfo(context: ?*anyopaque, out: *zlua.zostd.GameServerInfo) c_int {
-    const self = (luaHostContext(context) orelse return abi.query_unavailable).manager;
-    var info = std.mem.zeroes(abi.ServerInfo);
-    info.struct_size = @sizeOf(abi.ServerInfo);
-
-    const status = self.queryServerInfo(&info);
-    if (status != abi.query_ok and status != abi.query_truncated) return status;
-
-    out.dedicated = info.dedicated != 0;
-    out.paused = info.paused != 0;
-    out.entity_count = info.entity_count;
-    out.server_version = info.server_version;
-    out.server_time = info.server_time;
-    out.game_dir_len = info.game_dir_len;
-    @memcpy(&out.game_dir, &info.game_dir);
-    out.map_name_len = info.map_name_len;
-    @memcpy(&out.map_name, &info.map_name);
-    return status;
-}
-
-/// Forwards `zostd.game.player_info()` from a Lua script to the query client.
-fn luaGamePlayerInfo(
-    context: ?*anyopaque,
-    index: c_int,
-    out: *zlua.zostd.GamePlayerInfo,
-) c_int {
-    const self = (luaHostContext(context) orelse return abi.query_unavailable).manager;
-    var info = std.mem.zeroes(abi.PlayerInfo);
-    info.struct_size = @sizeOf(abi.PlayerInfo);
-
-    const status = self.queryPlayerInfo(index, &info);
-    if (status != abi.query_ok and status != abi.query_truncated) return status;
-
-    out.* = std.mem.zeroes(zlua.zostd.GamePlayerInfo);
-    out.present = info.present != 0;
-    out.index = info.index;
-    out.user_id = info.user_id;
-    out.friends_id = info.friends_id;
-    out.fake_player = info.fake_player != 0;
-    out.is_hltv = info.is_hltv != 0;
-    out.name_len = info.name_len;
-    @memcpy(&out.name, &info.name);
-    out.guid_len = info.guid_len;
-    @memcpy(&out.guid, &info.guid);
-    out.friends_name_len = info.friends_name_len;
-    @memcpy(&out.friends_name, &info.friends_name);
-    return status;
-}
-
-/// Forwards `zostd.game.entity_exists()` from a Lua script to the query client.
-fn luaGameEntityExists(context: ?*anyopaque, index: c_int, out: *bool) c_int {
-    const self = (luaHostContext(context) orelse return abi.query_unavailable).manager;
-    var info = std.mem.zeroes(abi.EntityInfo);
-    info.struct_size = @sizeOf(abi.EntityInfo);
-
-    const status = self.queryEntityInfo(index, &info);
-    if (status != abi.query_ok) return status;
-    out.* = info.exists != 0;
-    return status;
-}
-
-/// Forwards `zostd.game.server_cvar()` from a Lua script to the query client.
-fn luaGameServerCvar(
-    context: ?*anyopaque,
-    name: []const u8,
-    out: *zlua.zostd.GameCvarValue,
-) c_int {
-    const self = (luaHostContext(context) orelse return abi.query_unavailable).manager;
-    var value = std.mem.zeroes(abi.CvarValue);
-    value.struct_size = @sizeOf(abi.CvarValue);
-
-    const status = self.queryServerCvar(name, &value);
-    if (status != abi.query_ok and status != abi.query_truncated) return status;
-    return copyCvarValue(value, status, out);
-}
-
-/// Forwards `zostd.game.client_cvar()` from a Lua script to the query client.
-fn luaGameClientCvar(
-    context: ?*anyopaque,
-    index: c_int,
-    name: []const u8,
-    out: *zlua.zostd.GameCvarValue,
-) c_int {
-    const self = (luaHostContext(context) orelse return abi.query_unavailable).manager;
-    var value = std.mem.zeroes(abi.CvarValue);
-    value.struct_size = @sizeOf(abi.CvarValue);
-
-    const status = self.queryClientCvar(index, name, &value);
-    if (status != abi.query_ok and status != abi.query_truncated) return status;
-    return copyCvarValue(value, status, out);
-}
-
-/// Copies an ABI cvar result into its Lua-bridge counterpart.
-fn copyCvarValue(
-    value: abi.CvarValue,
-    status: c_int,
-    out: *zlua.zostd.GameCvarValue,
-) c_int {
-    out.* = std.mem.zeroes(zlua.zostd.GameCvarValue);
-    out.found = value.found != 0;
-    out.int_value = value.int_value;
-    out.float_value = value.float_value;
-    out.text_len = value.text_len;
-    @memcpy(&out.text, &value.text);
-    return status;
-}
 
 /// Serves the Entrypoint's callback events on the manager's end of the IPC
 /// channel until the Entrypoint requests shutdown or closes it.

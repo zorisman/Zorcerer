@@ -19,12 +19,26 @@ pub const io = struct {
     /// Minimal Source SDK console logger for the plugin manager's own
     /// messages (src/io/Log.zig).
     pub const Log = @import("io/Log.zig");
-    /// Wrappers for std.Io and Source filesystems
-    pub const fs = @import("io/file_system.zig");
+    /// Wrappers for std.Io and Source filesystems.
+    pub const filesystem = @import("io/file_system.zig");
 };
 
 pub const codegen = struct {
     pub const indexes = @import("codegen_generated/engine_indexes.zig");
+};
+
+/// Core modules re-exported so files in this module can use `zroot` instead of
+/// parent-relative import paths.
+pub const core = struct {
+    pub const EngineFilesystem = @import("core/EngineFilesystem.zig");
+    pub const Entrypoint = @import("core/Entrypoint.zig");
+    pub const FileService = @import("core/FileService.zig");
+    pub const ForkProcess = @import("core/ForkProcess.zig");
+    pub const GameQueries = @import("core/GameQueries.zig");
+    pub const JsonRpc = @import("core/JsonRpc.zig");
+    pub const LuaHost = @import("core/LuaHost.zig");
+    pub const PluginManager = @import("core/PluginManager.zig");
+    pub const Vsp = @import("core/Vsp.zig");
 };
 
 const tests = struct {

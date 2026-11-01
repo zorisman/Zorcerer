@@ -85,7 +85,7 @@ pub const VTable = struct {
 };
 
 const std = @import("std");
-const root = @import("../root.zig");
+const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 
 /// Version strings this plugin answers to, newest first. All of them get

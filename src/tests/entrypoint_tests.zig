@@ -1,12 +1,13 @@
 const std = @import("std");
 const zjr = @import("zjr");
-const Entrypoint = @import("../core/Entrypoint.zig");
-const Vsp = @import("../core/Vsp.zig");
-const fork = @import("../core/ForkProcess.zig");
-const Ipc = @import("../core/Ipc.zig");
-const JsonRpc = @import("../core/JsonRpc.zig");
-const Manager = @import("../core/PluginManager.zig");
-const Log = @import("../io/Log.zig");
+const root = @import("zroot");
+const Entrypoint = root.core.Entrypoint;
+const Vsp = root.core.Vsp;
+const fork = root.core.ForkProcess;
+const Ipc = root.Ipc;
+const JsonRpc = root.core.JsonRpc;
+const Manager = root.core.PluginManager;
+const Log = root.io.Log;
 
 /// Mirrors Entrypoint.PluginObject so tests can inspect the published vtable.
 const PluginObject = extern struct {

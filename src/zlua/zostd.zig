@@ -47,11 +47,13 @@ pub const Host = struct {
     /// slice is borrowed and must stay valid for the duration of the call.
     plugin_id: ?*const fn (?*anyopaque) []const u8 = null,
 
-    /// Reads `path` and returns its bytes. The path is the raw string the
-    /// script passed, for example `plugin://config.txt`.
+    /// Reads `path` and returns its bytes. The path is normalized before this
+    /// callback runs: a value without a URI scheme is rewritten to
+    /// `plugin://<path>`, so callbacks receive only `plugin://` or `game://`.
     read_file: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror![]u8 = null,
 
-    /// Writes `data` to `path`.
+    /// Writes `data` to `path`. Like `read_file`, the path is normalized to a
+    /// `plugin://` URI when the script did not provide a scheme.
     write_file: ?*const fn (?*anyopaque, []const u8, []const u8) anyerror!void = null,
 
     /// Requests that the host execute one engine server command.
@@ -575,10 +577,13 @@ fn readFile(lua: *Lua) callconv(.c) i32 {
         return fail(lua, "zostd.read_file expects a path string");
     const binding = currentBinding(lua);
 
-    const bytes = if (binding.host.read_file) |host_read_file|
-        host_read_file(binding.host.context, binding.allocator, path) catch |err|
-            return failError(lua, "zostd.read_file", err)
-    else
+    const bytes = if (binding.host.read_file) |host_read_file| host_block: {
+        const qualified = qualifyPath(binding.allocator, path) catch |err|
+            return failError(lua, "zostd.read_file", err);
+        defer binding.allocator.free(qualified);
+        break :host_block host_read_file(binding.host.context, binding.allocator, qualified) catch |err|
+            return failError(lua, "zostd.read_file", err);
+    } else
         readFileFromPluginRoot(binding, path) catch |err|
             return failError(lua, "zostd.read_file", err);
 
@@ -596,7 +601,10 @@ fn writeFile(lua: *Lua) callconv(.c) i32 {
     const binding = currentBinding(lua);
 
     if (binding.host.write_file) |host_write_file| {
-        host_write_file(binding.host.context, path, data) catch |err|
+        const qualified = qualifyPath(binding.allocator, path) catch |err|
+            return failError(lua, "zostd.write_file", err);
+        defer binding.allocator.free(qualified);
+        host_write_file(binding.host.context, qualified, data) catch |err|
             return failError(lua, "zostd.write_file", err);
     } else {
         writeFileToPluginRoot(binding, path, data) catch |err|
@@ -605,6 +613,23 @@ fn writeFile(lua: *Lua) callconv(.c) i32 {
 
     lua.pushBoolean(true);
     return 1;
+}
+
+/// Returns `path` as a URI understood by host file callbacks.
+///
+/// A path that already starts with `plugin://` or `game://` is duplicated
+/// unchanged. Every other path is relative to the script's plugin directory
+/// and becomes `plugin://<path>`. The returned slice is allocated with
+/// `allocator` and owned by the caller.
+///
+/// Errors: `error.OutOfMemory`.
+fn qualifyPath(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]u8 {
+    if (std.mem.startsWith(u8, path, "plugin://") or
+        std.mem.startsWith(u8, path, "game://"))
+    {
+        return allocator.dupe(u8, path);
+    }
+    return std.fmt.allocPrint(allocator, "plugin://{s}", .{path});
 }
 
 /// Lua C function implementing `zostd.server_command(command)`.
@@ -959,3 +984,22 @@ fn resolvePath(
     if (uses_scheme) return error.RootNotConfigured;
     return allocator.dupe(u8, path);
 }
+
+// --- Tests -------------------------------------------------------------------
+
+test "qualifyPath prefixes bare paths and preserves URI schemes" {
+    const allocator = std.testing.allocator;
+
+    const bare = try qualifyPath(allocator, "config.txt");
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings("plugin://config.txt", bare);
+
+    const plugin = try qualifyPath(allocator, "plugin://config.txt");
+    defer allocator.free(plugin);
+    try std.testing.expectEqualStrings("plugin://config.txt", plugin);
+
+    const game = try qualifyPath(allocator, "game://materials/readme.txt");
+    defer allocator.free(game);
+    try std.testing.expectEqualStrings("game://materials/readme.txt", game);
+}
+

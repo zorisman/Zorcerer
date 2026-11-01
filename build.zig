@@ -242,6 +242,19 @@ pub fn build(b: *std.Build) !void {
         }),
     });
 
+    // Root-relative import facade. `@import("root")` names the compilation
+    // root, which is Zig's test runner in test builds, so source files import
+    // this module instead. The cycle with `zorcerer` is intentional: the
+    // facade re-exports the same module instance and owns no state.
+    const zroot = b.addModule("zroot", .{
+        .root_source_file = b.path("src/zroot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    zroot.addImport("zorcerer", zorcerer.root_module);
+    zorcerer.root_module.addImport("zroot", zroot);
+
     zorcerer.root_module.addImport("hooks", hooks);
     zorcerer.root_module.addImport("toml", toml);
     zorcerer.root_module.addImport("plugin-configuration", plugin_configuration);

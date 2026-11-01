@@ -12,6 +12,10 @@ const zostd_bridge = @import("zostd.zig");
 /// Re-exported for callers that only import the `zlua` module.
 pub const runtime = @import("Runtime.zig");
 
+/// One loaded Lua script: discovery, runtime setup, lifecycle events, and
+/// teardown.
+pub const Script = @import("Script.zig").Script;
+
 /// Re-exported so callers can inspect the installed Lua-facing type bridge.
 pub const zostd = zostd_bridge;
 

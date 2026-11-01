@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const abi = @import("plugin-context");
-const file_system = @import("../io/file_system.zig");
+const file_system = @import("zroot").io.filesystem;
 const Ipc = @import("Ipc.zig");
 
 /// Largest file `readAll()` loads into memory for the Lua bridge.

@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const Ipc = @import("Ipc.zig");
-const Indexes = @import("../codegen_generated/engine_indexes.zig");
+const Indexes = @import("zroot").codegen.indexes;
 
 /// Longest text value returned by a query. Matches `MAX_PATH`, the bound the
 /// engine documents for `GetGameDir`.
