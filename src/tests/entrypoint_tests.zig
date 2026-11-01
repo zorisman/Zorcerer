@@ -7,6 +7,9 @@ const fork = root.core.ForkProcess;
 const Ipc = root.Ipc;
 const JsonRpc = root.core.JsonRpc;
 const Manager = root.core.PluginManager;
+const FileService = root.core.FileService;
+const LuaHost = root.core.LuaHost;
+const zlua = @import("zlua");
 const Log = root.io.Log;
 
 /// Mirrors Entrypoint.PluginObject so tests can inspect the published vtable.
@@ -508,4 +511,148 @@ fn testQueryResponder(fd: std.os.linux.fd_t) void {
 
     if (parsed.value.query != .entity_exists or parsed.value.index != 4) return;
     Ipc.sendResultResponse(fd, parsed.id(), "\"{\\\"exists\\\":true}\"") catch {};
+}
+
+test "Lua script queries the game through LuaHost" {
+    var child = try fork.forkChild(testLuaGameQueryResponder);
+    defer child.finish() catch {};
+
+    var manager = Manager.Manager.init();
+    manager.ipc_fd = child.socket;
+    defer manager.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var plugin_dir = try tmp.dir.createDirPathOpen(std.testing.io, "demo", .{});
+    plugin_dir.close(std.testing.io);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "demo/main.lua",
+        .data =
+        \\local info = assert(zostd.game.server_info())
+        \\assert(info.dedicated == true)
+        \\assert(info.paused == false)
+        \\assert(info.entity_count == 12)
+        \\assert(info.server_version == 9000)
+        \\assert(math.abs(info.server_time - 1.5) < 0.001)
+        \\assert(info.game_dir == "tf")
+        \\assert(info.map_name == "cp_process")
+        \\
+        \\local player = assert(zostd.game.player_info(1))
+        \\assert(player.index == 1)
+        \\assert(player.user_id == 5)
+        \\assert(player.friends_id == 77)
+        \\assert(player.name == "Alice")
+        \\assert(player.guid == "STEAM")
+        \\assert(player.friends_name == "Bob")
+        \\assert(player.fake_player == true)
+        \\assert(player.is_hltv == false)
+        \\assert(zostd.game.player_info(2) == nil)
+        \\
+        \\assert(zostd.game.entity_exists(1) == true)
+        \\assert(zostd.game.entity_exists(2) == false)
+        \\
+        \\local cvar = assert(zostd.game.server_cvar("sv_cheats"))
+        \\assert(cvar.int_value == 1)
+        \\assert(math.abs(cvar.float_value - 1.0) < 0.001)
+        \\assert(cvar.text == "1")
+        \\assert(zostd.game.server_cvar("missing") == nil)
+        \\
+        \\local client = assert(zostd.game.client_cvar(1, "cl_name"))
+        \\assert(client.text == "client")
+        \\assert(zostd.game.client_cvar(2, "cl_name") == nil)
+        ,
+    });
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const plugins_root = path_buffer[0..root_len];
+
+    var service = try FileService.Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        child.socket,
+        plugins_root,
+    );
+    defer service.deinit();
+
+    const files = try service.createPluginFiles("demo");
+    defer service.destroyPluginFiles(files);
+
+    var host_context = LuaHost.Context{ .manager = &manager, .files = files };
+    var script = try zlua.Script.load(std.testing.allocator, std.testing.io, .{
+        .plugins_directory = plugins_root,
+        .directory_name = "demo",
+        .host = LuaHost.host(&host_context),
+    });
+    defer script.deinit();
+}
+
+/// Answers every game-query request with a fixed document matching the query
+/// and its parameters, until the parent closes the socket.
+///
+/// Results are serialized as JSON strings because `Ipc.receiveQueryResult`
+/// expects the result of a query response to be a string containing the result
+/// document.
+fn testLuaGameQueryResponder(fd: std.os.linux.fd_t) void {
+    const allocator = std.heap.page_allocator;
+
+    const server_info_result =
+        \\{"dedicated":true,"paused":false,"entity_count":12,"server_version":9000,"server_time":1.5,"game_dir":"tf","map_name":"cp_process"}
+    ;
+    const player_present_result =
+        \\{"present":true,"index":1,"user_id":5,"friends_id":77,"name":"Alice","guid":"STEAM","friends_name":"Bob","fake_player":true,"is_hltv":false}
+    ;
+    const player_absent_result =
+        \\{"present":false,"index":2,"user_id":0,"friends_id":0,"name":"","guid":"","friends_name":"","fake_player":false,"is_hltv":false}
+    ;
+    const entity_present_result =
+        \\{"exists":true}
+    ;
+    const entity_absent_result =
+        \\{"exists":false}
+    ;
+    const cvar_present_result =
+        \\{"found":true,"int_value":1,"float_value":1.0,"text":"1"}
+    ;
+    const cvar_absent_result =
+        \\{"found":false,"int_value":0,"float_value":0.0,"text":""}
+    ;
+    const client_cvar_present_result =
+        \\{"found":true,"int_value":0,"float_value":0.0,"text":"client"}
+    ;
+
+    while (true) {
+        const frame = Ipc.readFrame(fd) catch return;
+        if (!frame.framed or !frame.received) return;
+
+        const parsed = Ipc.parseQuery(allocator, frame.text()) catch return;
+        defer parsed.deinit();
+
+        const result_text: []const u8 = switch (parsed.value.query) {
+            .server_info => server_info_result,
+            .player_info => if (parsed.value.index == 1)
+                player_present_result
+            else
+                player_absent_result,
+            .entity_exists => if (parsed.value.index == 1)
+                entity_present_result
+            else
+                entity_absent_result,
+            .server_cvar => if (std.mem.eql(u8, parsed.value.name, "sv_cheats"))
+                cvar_present_result
+            else
+                cvar_absent_result,
+            .client_cvar => if (parsed.value.index == 1 and
+                std.mem.eql(u8, parsed.value.name, "cl_name"))
+                client_cvar_present_result
+            else
+                cvar_absent_result,
+        };
+
+        const quoted = std.json.Stringify.valueAlloc(allocator, result_text, .{}) catch return;
+        defer allocator.free(quoted);
+        Ipc.sendResultResponse(fd, parsed.id(), quoted) catch return;
+    }
 }
