@@ -307,6 +307,28 @@ engine's normal command-buffer point.
 
 The Source SDK reference notes that numeric vtable indices are a binary-verification concern (`docs/references/source-sdk-2013.md:326-328`), while the interface version is `VEngineServer023` (`source-sdk-2013.md:169`). The existing Entrypoint version gate (`src/Entrypoint.zig:919-925`) is what keeps the generated index honest; a new scenario should reuse that mechanism rather than hand-picking a slot.
 
+### 3.6a Client commands and client console messages
+
+`IServerPluginCallbacks::ClientCommand` (VSP slot 15) is implemented in the
+Entrypoint. When a player types a command in their console:
+
+1. The Entrypoint records the issuing edict and reads the full command line
+   from the engine's `CCommand`.
+2. It sends the `clientCommand` event with the command text as the payload.
+3. `PluginManager` brackets the event fan-out with
+   `beginClientCommand()`/`endClientCommand()`.
+4. Lua can call `zostd.client_print(message)` while that event is active.
+5. `LuaHost.clientPrint()` calls `Manager.executeClientPrint()`, which sends
+   `engine.clientPrint` (request ID `103`).
+6. `EngineClients.Binding.handle()` revalidates the message and calls
+   `IVEngineServer::ClientPrintf(active_edict, message)`.
+7. If a message was printed, `ClientCommand` returns `PLUGIN_STOP` so the game
+   DLL does not also report the command as unknown.
+
+The target is never sent over IPC: only the edict recorded for the active
+`ClientCommand` callback can be printed to. `client_print` is therefore
+unavailable outside that callback, and delayed replies are not supported.
+
 ### 3.7 Filesystem policy
 
 `docs/references/source-sdk/filesystem.md:262-299` defines the split:
@@ -323,7 +345,7 @@ For Lua:
 
 ### 3.8 Event dispatch is synchronous
 
-`Ipc.Event` currently contains only `pause`, `unpause`, `levelInit`, `serverActivate`, and `levelShutdown` (`src/Ipc.zig:289-300`). There is no `gameFrame` event.
+`Ipc.Event` currently contains `pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown`, and `clientCommand` (`src/core/Ipc.zig`). There is no `gameFrame` event.
 
 `sendManagerEvent` sends an event and waits for the matching response (`src/Entrypoint.zig:1028-1051`). It is explicitly non-reentrant and single-threaded. A slow Lua handler therefore blocks the engine callback until it returns.
 
@@ -489,6 +511,7 @@ A first Lua-facing `zostd` surface should be small and capability-based:
 | `zostd.read_file(path)` | Reads a `plugin://` file | `std.Io` + policy |
 | `zostd.write_file(path, data)` | Writes a `plugin://` file | `std.Io` + policy |
 | `zostd.server_command(command)` | Requests an engine command | Entrypoint RPC |
+| `zostd.client_print(message)` | Prints to the client whose command is active | Entrypoint RPC |
 | `zostd.on(event, callback)` | Registers a lifecycle callback | Registry ref |
 
 Design rules:
@@ -496,6 +519,7 @@ Design rules:
 - No raw pointers or opaque engine handles cross into Lua. Use strings, numbers, booleans, tables, and explicit handles.
 - Every function validates argument types and path policy; return `(nil, error_string)` or raise a Lua error consistently.
 - `server_command` is a request to the Entrypoint; it is not a direct engine call.
+- `client_print` is a request to the Entrypoint and is only valid during a `clientCommand` callback.
 - `game://` is not part of the first version. If added, it must be an Entrypoint RPC with chunking.
 - Version the API and reject incompatible scripts at load time.
 
@@ -597,7 +621,8 @@ Lua bytecode is not a safe sandbox input; a malformed chunk can crash or corrupt
 
 **Current-source note (2026-11-01):** Phases 0 and 2 are implemented: LuaJIT
 links into `zorcerer.so`, and the manager loads per-plugin Lua scripts with a
-`zostd` API, including `zostd.server_command()` over `engine.serverCommand` IPC.
+`zostd` API, including `zostd.server_command()` over `engine.serverCommand` IPC
+and `zostd.client_print()` over `engine.clientPrint` during a `clientCommand`.
 Phase 1 (console Lua) is not implemented. The phase text below is the original
 plan and is retained for context.
 
@@ -672,9 +697,11 @@ Implement Scenario B:
 - Zorcerer's current `build.zig` registration is incomplete: the module exists, but the `c` import and dependency graph do not. The missing pieces are hidden only because nothing under `src/` imports `luajit` yet.
 - The only architecture-consistent place for Lua is the forked manager child. The Entrypoint must remain the engine-facing security boundary.
 - The first shipped scenario is script plugins with per-plugin Lua states and a
-  curated `zostd` API, which now includes `zostd.server_command()`. A `zlua`
-  console command remains unimplemented; it would need a new console entry
-  point, because no `ServerCommand` hook exists in the current source.
+  curated `zostd` API, which now includes `zostd.server_command()` and
+  `zostd.client_print()`. A server-console `zlua` command remains unimplemented;
+  it would need a new console entry point, because no `ServerCommand` hook
+  exists in the current source. Client console commands are handled separately
+  through `IServerPluginCallbacks::ClientCommand`.
 - The documented ZLua target is script plugins with per-plugin Lua states and a curated `zostd` API. That is valid, but it needs manifest, loader, lifecycle, and security work.
 - A native `.so` plugin embedding Lua is the smallest build proof-of-concept and is supported by the FAQ's "write a plugin" stance, but it is not the built-in ZLua.
 - Do not expose `ffi`, `io`, `os`, `package`, or `debug` to untrusted scripts; do not call engine interfaces from the manager child; do not derive the Lua API from vtable dumps.

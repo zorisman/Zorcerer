@@ -71,6 +71,31 @@ fn installExamplePlugin(
     }
 }
 
+/// Installs one Lua-only example plugin as
+/// `zig-out/lib/plugins/<install_dir>/main.lua`.
+///
+/// Lua examples have no compiled artifact and need no manifest: the manager
+/// discovers `plugins/<dir>/main.lua` directly. Like `installExamplePlugin`,
+/// this helper depends on `tests_step` so the default install never packages an
+/// example unless the project's tests passed.
+fn installExampleLuaPlugin(
+    b: *std.Build,
+    tests_step: *std.Build.Step,
+    source_dir: []const u8,
+    install_dir: []const u8,
+) void {
+    const plugin_dir = b.pathJoin(&.{ "lib", "plugins", install_dir });
+    const source_path = b.pathJoin(&.{ "example-plugins", source_dir, "main.lua" });
+
+    const install_script = b.addInstallFileWithDir(
+        b.path(source_path),
+        .{ .custom = plugin_dir },
+        "main.lua",
+    );
+    install_script.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_script.step);
+}
+
 /// Returns whether the installed analyzer executable exists and is at least
 /// as new as every input that defines its behavior.
 ///
@@ -502,4 +527,6 @@ pub fn build(b: *std.Build) !void {
         .library_name = "hello.so",
         .artifact = hello_plugin,
     });
+
+    installExampleLuaPlugin(b, tests_step, "lua-hello", "lua-hello");
 }

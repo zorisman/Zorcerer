@@ -1,10 +1,10 @@
 # ## Bottom line
 
-**The native plugin ABI is currently `load()` + `unload()` + an optional `onEvent()` hook + a logger + plugin identity + an optional read-only game-query table (ABI version 2) — enough to open a `.so`, identify it, deliver the five implemented runtime events, and read server/player/entity/cvar state through the parent process.**
+**The native plugin ABI is currently `load()` + `unload()` + an optional `onEvent()` hook + a logger + plugin identity + an optional read-only game-query table (ABI version 2) — enough to open a `.so`, identify it, deliver the six implemented runtime events, and read server/player/entity/cvar state through the parent process.**
 
 - More ABI **surface** is needed: host-mediated engine access, file/service access, and additional event sites.
 - More exported **symbols** are not necessarily needed. Keeping `load`/`unload` as the only required exports, adding optional `onEvent`, and growing the versioned `PluginContext` contract is the cleaner direction.
-- The Source-side VSP vtable is layout-correct for `ISERVERPLUGINCALLBACKS003`, but most callbacks are stubs. Five engine callbacks (`pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown`) now reach native plugins over IPC.
+- The Source-side VSP vtable is layout-correct for `ISERVERPLUGINCALLBACKS003`, but most callbacks are stubs. Six engine callbacks (`pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown`, `clientCommand`) now reach plugins over IPC.
 
 Note: `PluginManager.zig` has no functions literally named `load()`/`unload()`; the manager-side equivalents are `loadPlugins()` / `unloadAll()`, while `load()`/`unload()` are the plugin-exported entry points in `PluginContext.zig`.
 
@@ -141,11 +141,11 @@ during event delivery (the parent is waiting for the event response).
 | Pause/UnPause | yes (`onEvent`) | yes |
 | LevelInit/ServerActivate/LevelShutdown | yes (`onEvent`) | yes |
 | GameFrame | **no** | **no** |
-| Client callbacks | **no** | **no** |
+| Client callbacks | **partial**: `ClientCommand` reaches Lua as `clientCommand`, with `zostd.client_print`; native plugins receive the event but have no print API | **partial** |
 | Plugin id / manifest data | id, name, version, author, library path | id and root only |
 | Read-only game queries | `ctx.game`: server info, player info, entity existence, server/client cvar reads | `zostd.game.*` |
-| Engine commands / write access / game FS | **no native command call**; Lua uses `zostd.server_command` over `engine.serverCommand` IPC | `server_command` is wired for Lua; native `GameApi` still has no command entry |
-| IPC/event payloads | JSON text for `levelInit`/`serverActivate` | same payload string |
+| Engine commands / write access / game FS | **no native command call**; Lua uses `zostd.server_command` over `engine.serverCommand` IPC and `zostd.client_print` over `engine.clientPrint` | `server_command` and `client_print` are wired for Lua; native `GameApi` still has no command or client-print entry |
+| IPC/event payloads | JSON text for `levelInit`/`serverActivate`; raw command text for `clientCommand` | same payload string |
 
 `Manager.dispatchEvent()` delivers each engine event to Lua scripts first and
 then to every initialized native plugin that exported `onEvent`, in
@@ -205,7 +205,7 @@ action, because these events are post-action notifications.
    If plugins need Source callbacks, add them in this order:
    - `levelInit`, `serverActivate`, `levelShutdown`, `pause`, `unpause` to native plugins — implemented as post-action "On" events,
    - `gameFrame` only if genuinely needed, because synchronous per-tick IPC is expensive,
-   - client callbacks (`ClientActive`, `ClientDisconnect`, `ClientPutInServer`, `ClientSettingsChanged`, `ClientConnect`, `ClientCommand`, `NetworkIDValidated`, `OnQueryCvarValueFinished`, `OnEdictAllocated/Freed`) by replacing the relevant `genericStub` slots.
+   - client callbacks (`ClientActive`, `ClientDisconnect`, `ClientPutInServer`, `ClientSettingsChanged`, `ClientConnect`, `ClientCommand`, `NetworkIDValidated`, `OnQueryCvarValueFinished`, `OnEdictAllocated/Freed`) by replacing the relevant `genericStub` slots. `ClientCommand` is now implemented for Lua (`clientCommand` event plus `zostd.client_print`); the remaining client callbacks are still stubs.
 
 6. **Inter-plugin dependencies/services.**
    `docs/Architecture.md:19-24` plans a dependency graph, but `loadPlugins()` uses filesystem order and `unloadAll()` simply reverses discovery order. If plugin dependencies are planned, the host ABI also needs a way to resolve/request another plugin’s services and the loader needs topological ordering.

@@ -5,6 +5,8 @@
 //! `PluginManager` owns the script entry and passes this host table to
 //! `zlua.Script.load()`. File paths reaching these callbacks are already
 //! normalized by zlua, so they always carry a `plugin://` or `game://` scheme.
+//! Engine writes and client messages are forwarded through the manager's IPC
+//! channel; no engine pointer reaches a callback.
 //!
 //! The context is heap-allocated by the manager so it stays stable while the
 //! script list grows. It borrows `manager` and `files`; both must outlive the
@@ -41,6 +43,7 @@ pub fn host(context: *Context) zlua.zostd.Host {
         .read_file = readFile,
         .write_file = writeFile,
         .server_command = serverCommand,
+        .client_print = clientPrint,
         .server_info = gameServerInfo,
         .player_info = gamePlayerInfo,
         .entity_exists = gameEntityExists,
@@ -76,6 +79,19 @@ fn pluginId(context: ?*anyopaque) []const u8 {
 fn serverCommand(context: ?*anyopaque, command: []const u8) anyerror!void {
     const host_context = contextOf(context) orelse return error.Unavailable;
     return host_context.manager.executeServerCommand(host_context.plugin_id, command);
+}
+
+/// Implements `zostd.client_print()` by printing to the client whose command is
+/// currently being handled.
+///
+/// Only valid during a `clientCommand` event; outside one the manager returns
+/// `error.NoActiveClientCommand`. The call returns after the Entrypoint has
+/// handed the message to `ClientPrintf`, not after the client displays it.
+/// Errors: the `Manager.executeClientPrint` errors, or `error.Unavailable` when
+/// the context is missing.
+fn clientPrint(context: ?*anyopaque, message: []const u8) anyerror!void {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    return host_context.manager.executeClientPrint(host_context.plugin_id, message);
 }
 
 /// Implements `zostd.read_file()` through the script's filesystem context.

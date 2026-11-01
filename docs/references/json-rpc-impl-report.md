@@ -109,10 +109,11 @@ Facts enforced by `src/Ipc.zig`:
 |---|---|---|---|---|
 | child → parent | `ready` | notification | none | `{"message":"Hello from fork"}` |
 | child → parent | `stderr` | notification | none | `{"message":"..."}` |
-| parent → child | `pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown` | request | `1` | result string `"Event is X"` |
+| parent → child | `pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown`, `clientCommand` | request | `1` | result string `"Event is X"` |
 | child → parent | `query.serverInfo`, `query.playerInfo`, `query.entityExists`, `query.serverCvar`, `query.clientCvar` | request | `100` | typed JSON result document |
 | child → parent | `file.*` | request | `101` | typed JSON file result |
 | child → parent | `engine.serverCommand` | request | `102` | JSON string `{"accepted":true}` |
+| child → parent | `engine.clientPrint` | request | `103` | JSON string `{"printed":true}` |
 | parent → child | `shutdown` | request | `200` | result string `"OK"` |
 
 Example engine command round trip:
@@ -131,6 +132,7 @@ The IDs are separate on purpose:
 - `query_request_id = 100`.
 - `file_request_id = 101`.
 - `server_command_request_id = 102`.
+- `client_print_request_id = 103`.
 - `shutdown_request_id = 200`.
 - Log/readiness traffic is sent as JSON-RPC notifications (`RpcId.ofNone()`),
   so it never consumes a request ID.
@@ -219,8 +221,9 @@ interleaved with synchronous replies.
 
 `jsonListener` (`src/Entrypoint.zig`) and `exchangeServerCommand` implement
 this on the parent side; `PluginManager.listenForEvents` implements the mirror
-image on the child side. `event_request_id` and `server_command_request_id`
-are distinct so a response can never satisfy the wrong exchange.
+image on the child side. `event_request_id`, `server_command_request_id`, and
+`client_print_request_id` are distinct so a response can never satisfy the
+wrong exchange.
 
 **Guard:** `test "manager ignores event notifications"` and the forked
 `serverCommand` round-trip test.
