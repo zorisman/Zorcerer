@@ -18,6 +18,7 @@ const abi = root.abi;
 const Log = root.io.Log;
 const Manager = @import("PluginManager.zig").Manager;
 const FileService = @import("FileService.zig");
+const NetworkService = @import("NetworkService.zig");
 const zlua = @import("zlua");
 
 /// Per-script host context passed back to every `zostd` callback.
@@ -26,6 +27,9 @@ pub const Context = struct {
     manager: *Manager,
     /// Filesystem context of the script's plugin directory.
     files: *FileService.PluginFiles,
+    /// Network context of the script's plugin directory. Borrowed; the
+    /// manager destroys it after the script's runtime closes.
+    network: *NetworkService.PluginNetwork,
     /// Id of the script's plugin directory. Advisory attribution for command
     /// audit logs; an empty slice means the caller did not supply one.
     plugin_id: []const u8 = "",
@@ -49,6 +53,11 @@ pub fn host(context: *Context) zlua.zostd.Host {
         .entity_exists = gameEntityExists,
         .server_cvar = gameServerCvar,
         .client_cvar = gameClientCvar,
+        .connect = networkConnect,
+        .close_connection = networkClose,
+        .read_network = networkRead,
+        .write_network = networkWrite,
+        .poll_network = networkPoll,
     };
 }
 
@@ -122,6 +131,50 @@ fn writeFile(
 ) anyerror!void {
     const host_context = contextOf(context) orelse return error.Unavailable;
     return host_context.files.writeAll(path, data);
+}
+
+/// Implements `zostd.net.connect()` through the script's network context.
+///
+/// The context applies the manifest's deny-by-default allowlist and returns an
+/// error when the destination is not permitted.
+///
+/// Errors: the `PluginNetwork` connect errors, or `error.Unavailable` when the
+/// context is missing.
+fn networkConnect(context: ?*anyopaque, host_name: []const u8, port: u16) anyerror!u64 {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    var handle: u64 = 0;
+    try host_context.network.connect(host_name, port, .tcp, &handle);
+    return handle;
+}
+
+/// Implements `zostd.net.close()` through the script's network context.
+fn networkClose(context: ?*anyopaque, handle: u64) anyerror!void {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    return host_context.network.close(handle);
+}
+
+/// Implements `zostd.net.read()` through the script's network context.
+fn networkRead(context: ?*anyopaque, handle: u64, destination: []u8) anyerror!usize {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    return host_context.network.read(handle, destination);
+}
+
+/// Implements `zostd.net.write()` through the script's network context.
+fn networkWrite(context: ?*anyopaque, handle: u64, source: []const u8) anyerror!usize {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    return host_context.network.write(handle, source);
+}
+
+/// Implements `zostd.net.poll()` through the script's network context.
+fn networkPoll(
+    context: ?*anyopaque,
+    handle: u64,
+    events: u8,
+    timeout_ms: u32,
+    out_events: *u8,
+) anyerror!void {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    return host_context.network.poll(handle, events, timeout_ms, out_events);
 }
 
 /// Forwards `zostd.game.server_info()` to the manager's query client.

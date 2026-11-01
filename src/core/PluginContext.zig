@@ -127,6 +127,10 @@ pub const PluginContext = extern struct {
     /// `game`, this field was appended after version 2 without changing
     /// `abi_version`; old plugins ignore it via `struct_size`.
     files: ?*const FileApi,
+    /// Outbound network access, or null when the host does not provide it.
+    /// Like `game` and `files`, this field was appended after version 2
+    /// without changing `abi_version`.
+    network: ?*const NetworkApi,
 };
 
 /// Plugin's `load` export.
@@ -463,4 +467,129 @@ pub const FileApi = extern struct {
     ) callconv(.c) c_int,
     /// Ends a directory enumeration started by `find_open`.
     find_close: *const fn (context: ?*anyopaque, handle: u64) callconv(.c) c_int,
+};
+
+// --- Networking -------------------------------------------------------------
+
+/// Status returned by a `NetworkApi` operation: the operation succeeded.
+pub const network_ok: c_int = 0;
+/// Status returned when the host has no network service.
+pub const network_unavailable: c_int = 1;
+/// Status returned when the destination is not permitted by the plugin's
+/// manifest policy, or resolves into private address space without
+/// `allow_private`.
+pub const network_permission_denied: c_int = 2;
+/// Status returned for a malformed argument, such as an unsupported protocol
+/// or an empty host.
+pub const network_invalid_argument: c_int = 3;
+/// Status returned when the host name could not be resolved.
+pub const network_resolution_failed: c_int = 4;
+/// Status returned when the resolved address could not be connected.
+pub const network_connect_failed: c_int = 5;
+/// Status returned when the resolve, connect, read, write, or poll deadline
+/// elapsed.
+pub const network_timeout: c_int = 6;
+/// Status returned when a non-blocking operation has no progress to report.
+/// The synchronous `read`/`write` helpers normally wait for the deadline
+/// instead of returning this status.
+pub const network_would_block: c_int = 7;
+/// Status returned when the peer closed the connection.
+pub const network_closed: c_int = 8;
+/// Status returned when the plugin reached `max_connections`.
+pub const network_resource_limit: c_int = 9;
+/// Status returned for an I/O failure on an open connection.
+pub const network_io_error: c_int = 10;
+/// Status returned when `handle` does not name an open connection owned by
+/// the calling plugin.
+pub const network_invalid_handle: c_int = 11;
+
+/// Transport protocols accepted by `NetworkApi.connect`.
+pub const NetworkProtocol = enum(c_int) {
+    /// Reliable, ordered byte stream (TCP).
+    tcp = 0,
+};
+
+/// Event bit in `NetworkApi.poll` arguments and results: readable.
+pub const network_poll_in: u8 = 1;
+/// Event bit in `NetworkApi.poll` arguments and results: writable.
+pub const network_poll_out: u8 = 2;
+/// Event bit in `NetworkApi.poll` results: error condition.
+pub const network_poll_error: u8 = 4;
+/// Event bit in `NetworkApi.poll` results: peer closed or hung up.
+pub const network_poll_hup: u8 = 8;
+
+/// Outbound-only network access called from plugin code.
+///
+/// The plugin manager performs every operation in the forked child; no engine
+/// pointer or engine-side socket is involved. Only outbound TCP connections
+/// are supported. TLS, HTTP, WebSocket, and inbound listeners are not part of
+/// this contract.
+///
+/// A plugin's manifest `[network]` table is deny-by-default: `connect` fails
+/// with `network_permission_denied` unless one `allow` rule matches the
+/// requested host and port. Host-name resolution runs on a dedicated resolver
+/// thread; the calling thread waits for its answer but never performs DNS
+/// itself. Connections use non-blocking sockets and bounded `poll`, so a call
+/// blocks for at most the policy's connect or I/O timeout.
+///
+/// Handles are opaque, non-zero integers valid only in the plugin context that
+/// opened them and only until `close` is called or the plugin's `unload()`
+/// returns. The host closes every remaining handle when the plugin unloads.
+///
+/// Lifetime: `context` is owned by the host and is this plugin's network
+/// context. `struct_size` follows the same append-only rule as
+/// `PluginContext`.
+pub const NetworkApi = extern struct {
+    /// Size of this struct in bytes as provided by the host.
+    struct_size: usize,
+    /// Opaque host context; pass back unchanged.
+    context: ?*anyopaque,
+    /// Opens a connection to `host`:`port` and stores its handle in
+    /// `out_handle`.
+    connect: *const fn (
+        context: ?*anyopaque,
+        host: Text,
+        port: u16,
+        protocol: NetworkProtocol,
+        out_handle: *u64,
+    ) callconv(.c) c_int,
+    /// Closes a connection opened by `connect`.
+    close: *const fn (context: ?*anyopaque, handle: u64) callconv(.c) c_int,
+    /// Reads at most `destination_len` bytes from `handle`.
+    ///
+    /// Returns the number of bytes read, 0 at end of stream, or a negated
+    /// `network_*` status. It waits until data arrives or the policy's I/O
+    /// timeout elapses.
+    read: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        destination: [*]u8,
+        destination_len: usize,
+    ) callconv(.c) isize,
+    /// Writes at most `source_len` bytes to `handle`.
+    ///
+    /// Returns the number of bytes written or a negated `network_*` status.
+    /// It waits until at least some progress is possible or the policy's I/O
+    /// timeout elapses.
+    write: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        source: [*]const u8,
+        source_len: usize,
+    ) callconv(.c) isize,
+    /// Waits until `handle` reports at least one of the `events` bits, or
+    /// `timeout_ms` elapses.
+    ///
+    /// `events` is a combination of `network_poll_in` and `network_poll_out`.
+    /// The result is stored in `out_events` as a combination of the poll bits,
+    /// including `network_poll_error` and `network_poll_hup`. A zero result
+    /// means the timeout elapsed. The host caps `timeout_ms` by the policy's
+    /// `poll_timeout_ms`.
+    poll: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        events: u8,
+        timeout_ms: u32,
+        out_events: *u8,
+    ) callconv(.c) c_int,
 };

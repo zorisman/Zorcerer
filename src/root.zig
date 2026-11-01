@@ -39,6 +39,7 @@ pub const core = struct {
     pub const GameQueries = @import("core/GameQueries.zig");
     pub const JsonRpc = @import("core/JsonRpc.zig");
     pub const LuaHost = @import("core/LuaHost.zig");
+    pub const NetworkService = @import("core/NetworkService.zig");
     pub const PluginManager = @import("core/PluginManager.zig");
     pub const Vsp = @import("core/Vsp.zig");
 };
@@ -84,4 +85,8 @@ test "src/core/EngineFilesystem.zig" {
 
 test "src/core/EngineClients.zig" {
     std.testing.refAllDecls(@import("core/EngineClients.zig"));
+}
+
+test "src/core/NetworkService.zig" {
+    std.testing.refAllDecls(@import("core/NetworkService.zig"));
 }

@@ -7,6 +7,7 @@ const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 const PluginDependency = @import("PluginDependency.zig");
 const PluginLibrary = @import("plugin-library");
 const FileService = @import("FileService.zig");
+const NetworkService = @import("NetworkService.zig");
 const LuaHost = @import("LuaHost.zig");
 const zlua = @import("zlua");
 
@@ -24,6 +25,12 @@ const plugins_directory = "tf/addons/zorcerer/plugins";
 
 /// Name of the manifest file inside every plugin directory.
 const manifest_name = "manifest.toml";
+
+/// Policy used for a Lua script whose directory has no valid manifest.
+///
+/// Scripts are discovered independently of manifests, so a directory without
+/// one still runs; its network access is deny-by-default.
+const default_network_policy: PluginConfiguration.NetworkPolicy = .{};
 
 /// One plugin .so held in the manager's cache.
 pub const Plugin = struct {
@@ -56,6 +63,11 @@ pub const Plugin = struct {
     /// `context.files`. Owned by the manager and destroyed after `unload()`
     /// returns. Null only for records built outside `loadPlugins()`.
     files: ?*FileService.PluginFiles = null,
+    /// Network context of this plugin, also referenced by
+    /// `context.network`. Owned by the manager and destroyed after
+    /// `unload()` returns. Null only for records built outside
+    /// `loadPlugins()`.
+    network: ?*NetworkService.PluginNetwork = null,
     /// Current lifecycle state; see `State`.
     state: State = .created,
 };
@@ -84,6 +96,9 @@ const LuaScriptEntry = struct {
     /// Filesystem context of this script's directory. Released after the
     /// script's `deinit()`.
     files: *FileService.PluginFiles,
+    /// Network context of this script's directory. Released after the
+    /// script's `deinit()`.
+    network: *NetworkService.PluginNetwork,
     /// Host callback context borrowed by the script runtime.
     host: *LuaHost.Context,
     /// Owned copy of the script's directory name, used as its plugin id.
@@ -227,6 +242,11 @@ pub const Manager = struct {
     /// service pointer when the manager value moves.
     file_service: ?*FileService.Service = null,
 
+    /// Per-plugin outbound network service, created by `loadPlugins()` and
+    /// destroyed by `deinit()`. Heap-allocated so every `PluginNetwork` it
+    /// hands out keeps a stable service pointer when the manager value moves.
+    network_service: ?*NetworkService.Service = null,
+
     /// ABI table handed to plugins through `PluginContext.game` when
     /// `ipc_fd` is set. `context` is filled with this manager's address in
     /// `buildContext()`.
@@ -265,6 +285,10 @@ pub const Manager = struct {
             service.deinit();
             self.allocator.destroy(service);
             self.file_service = null;
+        }
+        if (self.network_service) |service| {
+            service.deinit();
+            self.network_service = null;
         }
         self.plugins.deinit(self.allocator);
         self.lua_scripts.deinit(self.allocator);
@@ -473,13 +497,15 @@ pub const Manager = struct {
     /// Builds the ABI context handed to one plugin entry point.
     ///
     /// The returned value borrows `configuration` (for its identity strings),
-    /// `self.logger`, and `files`. All must outlive the plugin's loaded
-    /// lifetime; the caller stores the context on the heap so its address
-    /// stays stable.
+    /// `self.logger`, `files`, and `network`. All must outlive the plugin's
+    /// loaded lifetime; the caller stores the context on the heap so its
+    /// address stays stable. `configuration.path` must be non-null, which
+    /// holds because only native configurations reach `createPlugin()`.
     fn buildContext(
         self: *@This(),
         configuration: *const PluginConfiguration,
         files: *FileService.PluginFiles,
+        network: *NetworkService.PluginNetwork,
     ) abi.PluginContext {
         self.game_api.context = self;
         return .{
@@ -491,10 +517,11 @@ pub const Manager = struct {
                 .name = abi.Text.fromSlice(configuration.name),
                 .version = abi.Text.fromSlice(configuration.version),
                 .author = abi.Text.fromSlice(configuration.author),
-                .library_path = abi.Text.fromSlice(configuration.path),
+                .library_path = abi.Text.fromSlice(configuration.path orelse ""),
             },
             .game = if (self.ipc_fd != null) &self.game_api else null,
             .files = &files.api,
+            .network = &network.api,
         };
     }
 
@@ -554,25 +581,46 @@ pub const Manager = struct {
             };
             self.file_service = service;
         }
+        if (self.network_service == null) {
+            self.network_service = try NetworkService.Service.init(self.allocator);
+        }
 
         var plugin_root = try std.Io.Dir.cwd().openDir(io, plugins_directory, .{ .iterate = true });
         defer plugin_root.close(io);
-
-        // Lua scripts are independent of the native plugin ABI and do not
-        // need a manifest. A directory may contain both a script and
-        // managed .so plugins.
-        var dirs = plugin_root.iterate();
-        while (try dirs.next(io)) |dir| {
-            if (dir.kind != .directory) continue;
-            self.loadLuaScript(dir.name);
-        }
 
         // Only directories with a valid manifest participate in native
         // plugin loading. readConfig() logs and skips every rejected
         // manifest, so failures here are per-plugin, not fatal.
         const configurations = try self.readConfig();
 
-        var resolution = try PluginDependency.resolve(self.allocator, configurations);
+        // Lua scripts are independent of the native plugin ABI and do not
+        // need a manifest. A directory may contain both a script and
+        // managed .so plugins; when it has a valid manifest, that manifest's
+        // `[network]` policy applies to its script as well.
+        var script_policies = std.StringHashMap(*const PluginConfiguration.NetworkPolicy)
+            .init(self.allocator);
+        defer script_policies.deinit();
+        for (configurations) |*configuration| {
+            try script_policies.put(configuration.id, &configuration.network);
+        }
+
+        var dirs = plugin_root.iterate();
+        while (try dirs.next(io)) |dir| {
+            if (dir.kind != .directory) continue;
+            const policy = script_policies.get(dir.name) orelse &default_network_policy;
+            self.loadLuaScript(dir.name, policy);
+        }
+
+        // Script-only manifests are valid configurations but do not take part
+        // in native dependency resolution or dlopen().
+        var native_configs: std.ArrayList(PluginConfiguration) = .empty;
+        defer native_configs.deinit(self.allocator);
+        for (configurations) |configuration| {
+            if (!configuration.isNative()) continue;
+            try native_configs.append(self.allocator, configuration);
+        }
+
+        var resolution = try PluginDependency.resolve(self.allocator, native_configs.items);
         defer resolution.deinit(self.allocator);
 
         // Ids that must not satisfy dependents: statically rejected plugins,
@@ -584,7 +632,7 @@ pub const Manager = struct {
         // Static graph failures are known before any dynamic library is
         // opened, so report them first, in manifest order.
         for (resolution.rejected) |rejection| {
-            const configuration = configurations[rejection.plugin_index];
+            const configuration = native_configs.items[rejection.plugin_index];
             self.notifyManagerEvent(.{ .dependency_rejected = .{
                 .plugin_id = configuration.id,
                 .rejection = rejection,
@@ -600,7 +648,7 @@ pub const Manager = struct {
         defer created.deinit(self.allocator);
 
         for (resolution.order) |configuration_index| {
-            const configuration = configurations[configuration_index];
+            const configuration = native_configs.items[configuration_index];
 
             if (configuration.dependencies.len != 0) {
                 self.notifyManagerEvent(.{ .awaiting_dependencies = .{
@@ -644,7 +692,7 @@ pub const Manager = struct {
         // dependency-first order. A failure here is reported after creation
         // and makes the plugin unavailable to its dependents.
         for (created.items) |entry| {
-            const configuration = configurations[entry.configuration_index];
+            const configuration = native_configs.items[entry.configuration_index];
             const plugin = &self.plugins.items[entry.plugin_index];
 
             var failed_dependency: ?[]const u8 = null;
@@ -694,7 +742,7 @@ pub const Manager = struct {
     fn createPlugin(self: *@This(), configuration: *const PluginConfiguration) !?usize {
         const path = try std.Io.Dir.path.join(
             self.allocator,
-            &.{ plugins_directory, configuration.id, configuration.path },
+            &.{ plugins_directory, configuration.id, configuration.path.? },
         );
         var path_owned = false;
         defer if (!path_owned) self.allocator.free(path);
@@ -720,10 +768,16 @@ pub const Manager = struct {
                 var files_owned = true;
                 defer if (files_owned) service.destroyPluginFiles(files);
 
+                const network_service = self.network_service orelse
+                    return error.NetworkUnavailable;
+                const network = try network_service.createPluginNetwork(&configuration.network);
+                var network_owned = true;
+                defer if (network_owned) network_service.destroyPluginNetwork(network);
+
                 const context = try self.allocator.create(abi.PluginContext);
                 var context_owned = true;
                 defer if (context_owned) self.allocator.destroy(context);
-                context.* = self.buildContext(configuration, files);
+                context.* = self.buildContext(configuration, files, network);
 
                 const plugin_index = self.plugins.items.len;
                 try self.plugins.append(self.allocator, .{
@@ -731,11 +785,13 @@ pub const Manager = struct {
                     .library = library,
                     .context = context,
                     .files = files,
+                    .network = network,
                 });
                 path_owned = true;
                 library_owned = false;
                 context_owned = false;
                 files_owned = false;
+                network_owned = false;
 
                 self.notifyManagerEvent(.{ .instance_created = .{
                     .plugin_id = context.plugin.id.slice(),
@@ -894,6 +950,10 @@ pub const Manager = struct {
                 plugin.files = null;
             }
             self.allocator.destroy(plugin.context);
+            if (plugin.network) |network| {
+                if (self.network_service) |service| service.destroyPluginNetwork(network);
+                plugin.network = null;
+            }
             self.allocator.free(plugin.path);
         }
 
@@ -908,6 +968,7 @@ pub const Manager = struct {
             // the script can still use its host callbacks and files.
             entry.script.deinit();
             if (self.file_service) |service| service.destroyPluginFiles(entry.files);
+            if (self.network_service) |service| service.destroyPluginNetwork(entry.network);
             self.allocator.destroy(entry.host);
             self.allocator.free(entry.plugin_id);
         }
@@ -921,10 +982,21 @@ pub const Manager = struct {
     /// discovery, runtime setup, `on_load`, and diagnostics; this function
     /// only creates the core resources the script's host callbacks need and
     /// retains them for `unloadAll()`.
-    fn loadLuaScript(self: *@This(), dir_name: []const u8) void {
+    fn loadLuaScript(
+        self: *@This(),
+        dir_name: []const u8,
+        policy: *const PluginConfiguration.NetworkPolicy,
+    ) void {
         const service = self.file_service orelse {
             Log.logLine(
                 "[zlua] {s}/{s}/main.lua: filesystem service is not initialized, script skipped\n",
+                .{ plugins_directory, dir_name },
+            );
+            return;
+        };
+        const network_service = self.network_service orelse {
+            Log.logLine(
+                "[zlua] {s}/{s}/main.lua: network service is not initialized, script skipped\n",
                 .{ plugins_directory, dir_name },
             );
             return;
@@ -939,6 +1011,16 @@ pub const Manager = struct {
         };
         var files_alive = true;
         defer if (files_alive) service.destroyPluginFiles(files);
+
+        const network = network_service.createPluginNetwork(policy) catch |err| {
+            Log.logLine(
+                "[zlua] {s}/{s}/main.lua: could not create network context ({s}), script skipped\n",
+                .{ plugins_directory, dir_name, @errorName(err) },
+            );
+            return;
+        };
+        var network_alive = true;
+        defer if (network_alive) network_service.destroyPluginNetwork(network);
 
         const host_context = self.allocator.create(LuaHost.Context) catch |err| {
             Log.logLine(
@@ -965,6 +1047,7 @@ pub const Manager = struct {
         host_context.* = .{
             .manager = self,
             .files = files,
+            .network = network,
             .plugin_id = plugin_id,
         };
 
@@ -983,6 +1066,7 @@ pub const Manager = struct {
         self.lua_scripts.append(self.allocator, .{
             .script = script,
             .files = files,
+            .network = network,
             .host = host_context,
             .plugin_id = plugin_id,
         }) catch |err| {
@@ -995,6 +1079,7 @@ pub const Manager = struct {
 
         script_alive = false;
         files_alive = false;
+        network_alive = false;
         host_alive = false;
         plugin_id_alive = false;
     }
@@ -1599,6 +1684,7 @@ fn testPluginContext() abi.PluginContext {
         },
         .game = null,
         .files = null,
+        .network = null,
     };
 }
 

@@ -57,9 +57,12 @@ So, for **loading**: no additional VSP slots are required. For **useful event de
 `Manager.loadPlugins()` does:
 
 1. Refuses if a native plugin or Lua script is already loaded.
-2. Iterates directories under `tf/addons/zorcerer/plugins` and loads each `main.lua`.
-3. Reads and validates every `manifest.toml` through `readConfig()`.
-4. Resolves the native dependency graph and reports static rejections.
+2. Reads and validates every `manifest.toml` through `readConfig()`.
+3. Iterates directories under `tf/addons/zorcerer/plugins` and loads each
+   `main.lua` with its directory's `[network]` policy; a directory without a
+   manifest uses a deny-all policy.
+4. Resolves the native dependency graph over the configurations that name a
+   `path` and reports static rejections; script-only manifests are skipped.
 5. Creates each accepted plugin in dependency-first order: opens only the
    library named by `manifest.path`, looks up `load`/`unload` and the optional
    `onEvent`, and builds a per-plugin `PluginContext`.
@@ -80,7 +83,10 @@ the path, then notifies and tears down Lua scripts.
 The ABI itself is in `src/core/PluginContext.zig` (version 2):
 
 ```zig
-PluginContext { abi_version, struct_size, logger, plugin: PluginInfo, game: ?*const GameApi }
+PluginContext {
+    abi_version, struct_size, logger, plugin: PluginInfo,
+    game: ?*const GameApi, files: ?*const FileApi, network: ?*const NetworkApi,
+}
 PluginInfo { id, name, version, author, library_path }  // Text = ptr + len
 Event { struct_size, name: Text, payload: Text }        // borrowed for one call
 GameApi {
@@ -90,6 +96,14 @@ GameApi {
     entity_info(ctx, index, *EntityInfo) -> status,
     server_cvar(ctx, name: Text, *CvarValue) -> status,
     client_cvar(ctx, index, name: Text, *CvarValue) -> status,
+}
+NetworkApi {
+    struct_size, context,
+    connect(ctx, host: Text, port: u16, protocol, *u64) -> status,
+    close(ctx, handle: u64) -> status,
+    read(ctx, handle: u64, ptr, len) -> isize,
+    write(ctx, handle: u64, ptr, len) -> isize,
+    poll(ctx, handle: u64, events: u8, timeout_ms: u32, *u8) -> status,
 }
 load(ctx: *PluginContext) -> int
 unload(ctx: *PluginContext) -> int
@@ -130,6 +144,53 @@ the existing synchronous event exchange; a stalled engine process stalls the
 caller. Queries work during `load()` (the parent is waiting for readiness) and
 during event delivery (the parent is waiting for the event response).
 
+### Network policy, status, and handles
+
+`network` is appended after `files` without changing `abi_version`. It exposes
+outbound TCP only: TLS, HTTP, WebSocket, and inbound listeners are not part of
+this ABI. The manager exposes it whenever the plugin-manager child runs; no
+engine interface is involved.
+
+The manifest `[network]` table is deny-by-default. `allow` lists `host`,
+`host:port`, `[ipv6]`, or `[ipv6]:port` entries; a `*.` prefix matches the
+suffix and its subdomains but not the bare suffix. `allow_private` (default
+false) permits loopback, RFC 1918, link-local, ULA, multicast, and unspecified
+destinations, and is checked against the resolved address. `max_connections`
+(default 4), `max_frame_bytes` (default 64 KiB), `connect_timeout_ms` (default
+3000), `io_timeout_ms` (default 3000), and `poll_timeout_ms` (default 10) bound
+resource use; manifest values above the `max_network_*` caps are rejected.
+
+Every `NetworkApi` function except `read`/`write` returns a `c_int` status:
+
+| Status | Value | Meaning |
+|---|---|---|
+| `network_ok` | 0 | Operation succeeded. |
+| `network_unavailable` | 1 | No network service for this context. |
+| `network_permission_denied` | 2 | Destination not allowed, or it resolved into private space without `allow_private`. |
+| `network_invalid_argument` | 3 | Malformed host, unsupported protocol, or empty event mask. |
+| `network_resolution_failed` | 4 | Host name did not resolve. |
+| `network_connect_failed` | 5 | The resolved address could not be connected. |
+| `network_timeout` | 6 | The resolve, connect, read, write, or poll deadline elapsed. |
+| `network_would_block` | 7 | Reserved for non-blocking callers; the synchronous helpers wait instead. |
+| `network_closed` | 8 | The peer closed the connection. |
+| `network_resource_limit` | 9 | `max_connections` reached or a descriptor could not be allocated. |
+| `network_io_error` | 10 | I/O failed on an open connection. |
+| `network_invalid_handle` | 11 | The handle is not open in this plugin's context. |
+
+`read` returns the byte count, `0` at end of stream, or a negated status;
+`write` returns the accepted byte count or a negated status. Both may transfer
+fewer bytes than requested, so whole-message callers must loop. `poll` combines
+`network_poll_in` (1) and `network_poll_out` (2) and reports
+`network_poll_error` (4) and `network_poll_hup` (8); a zero result means the
+timeout elapsed.
+
+Connections are non-blocking and wait through bounded `poll` slices (10 ms)
+until the policy deadline. Host-name resolution happens on the service's
+dedicated resolver thread, not on the manager's event thread. Handles are
+opaque, non-zero integers valid only in the owning plugin's context and only
+until `close` or until the plugin's `unload()` returns. The host closes every
+remaining handle after `unload()`.
+
 ---
 
 ## 3. What reaches plugins today
@@ -144,6 +205,8 @@ during event delivery (the parent is waiting for the event response).
 | Client callbacks | **partial**: `ClientCommand` reaches Lua as `clientCommand`, with `zostd.client_print`; native plugins receive the event but have no print API | **partial** |
 | Plugin id / manifest data | id, name, version, author, library path | id and root only |
 | Read-only game queries | `ctx.game`: server info, player info, entity existence, server/client cvar reads | `zostd.game.*` |
+| File access | `ctx.files`: `plugin://` read/write, parent-mediated read-only `game://` | `zostd.read_file` / `zostd.write_file` |
+| Outbound networking | `ctx.network`: policy-checked TCP connect/close/read/write/poll | `zostd.net.*` |
 | Engine commands / write access / game FS | **no native command call**; Lua uses `zostd.server_command` over `engine.serverCommand` IPC and `zostd.client_print` over `engine.clientPrint` | `server_command` and `client_print` are wired for Lua; native `GameApi` still has no command or client-print entry |
 | IPC/event payloads | JSON text for `levelInit`/`serverActivate`; raw command text for `clientCommand` | same payload string |
 
@@ -196,6 +259,11 @@ action, because these events are post-action notifications.
    cvar *writes*, and `game://` file access are still absent and would follow
    the same allowlisted parent-side path.
 
+   Outbound TCP networking is available separately through
+   `PluginContext.network`. It is deny-by-default per manifest and runs
+   entirely inside the forked plugin-manager child; no engine socket is
+   involved.
+
 4. **ABI version/size negotiation — implemented.**
    `PluginContext` now starts with `abi_version` and `struct_size`. New fields
    are append-only; a plugin must reject a context whose `struct_size` is
@@ -217,7 +285,7 @@ action, because these events are post-action notifications.
 
 ### Suggested priority
 
-**P0:** host-mediated engine calls. Native event delivery, plugin identity/config, read-only game queries, and ABI size/version negotiation are implemented in ABI version 2.
+**P0:** host-mediated engine calls. Native event delivery, plugin identity/config, read-only game queries, per-plugin filesystem access, outbound networking, and ABI size/version negotiation are implemented in ABI version 2.
 
 **P1:** real `GameFrame`/client VSP callbacks, richer IPC payloads, per-plugin permissions/allowlists, dependency ordering.
 

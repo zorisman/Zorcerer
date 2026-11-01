@@ -30,6 +30,18 @@ pub const api_version: Lua.Integer = 1;
 /// Largest file the built-in `plugin://` backend reads in one call.
 pub const max_file_size: usize = 8 * 1024 * 1024;
 
+/// Largest number of bytes `zostd.net.read()` returns in one call.
+pub const max_network_read: usize = 64 * 1024;
+
+/// `zostd.net.poll()` event bit: the connection is readable.
+pub const net_poll_in: u8 = 1;
+/// `zostd.net.poll()` event bit: the connection is writable.
+pub const net_poll_out: u8 = 2;
+/// `zostd.net.poll()` result bit: the connection reported an error.
+pub const net_poll_error: u8 = 4;
+/// `zostd.net.poll()` result bit: the peer closed the connection.
+pub const net_poll_hup: u8 = 8;
+
 /// Host callbacks backing the Lua-visible `zostd` functions.
 ///
 /// All callbacks are optional. `context` is passed back unchanged. The file
@@ -78,6 +90,26 @@ pub const Host = struct {
 
     /// Fills `out` with client `index`'s cvar named `name`.
     client_cvar: ?*const fn (?*anyopaque, c_int, []const u8, *GameCvarValue) c_int = null,
+
+    /// Opens an outbound TCP connection to `host`:`port` and returns its
+    /// opaque, non-zero handle. The host applies the script's manifest network
+    /// policy and returns an error when the destination is not allowed.
+    connect: ?*const fn (?*anyopaque, []const u8, u16) anyerror!u64 = null,
+
+    /// Closes a connection previously returned by `connect`.
+    close_connection: ?*const fn (?*anyopaque, u64) anyerror!void = null,
+
+    /// Reads at most `destination.len` bytes from `handle`. Returns the number
+    /// of bytes read, or 0 at end of stream.
+    read_network: ?*const fn (?*anyopaque, u64, []u8) anyerror!usize = null,
+
+    /// Writes at most `source.len` bytes to `handle` and returns the number of
+    /// bytes accepted.
+    write_network: ?*const fn (?*anyopaque, u64, []const u8) anyerror!usize = null,
+
+    /// Waits until `handle` reports one of the `events` bits and stores the
+    /// result in `out_events`. A zero result means the timeout elapsed.
+    poll_network: ?*const fn (?*anyopaque, u64, u8, u32, *u8) anyerror!void = null,
 };
 
 /// Status returned by a game-query host callback when it succeeded. Other
@@ -211,6 +243,10 @@ pub fn install(lua: *Lua, binding: *Binding) void {
     installGame(lua, binding);
     lua.setTable(-3);
 
+    lua.pushLString("net");
+    installNet(lua, binding);
+    lua.setTable(-3);
+
     lua.setGlobal("zostd");
     installCallbackRegistry(lua);
 }
@@ -227,6 +263,32 @@ fn installGame(lua: *Lua, binding: *Binding) void {
     setFunction(lua, "entity_exists", binding, gameEntityExists);
     setFunction(lua, "server_cvar", binding, gameServerCvar);
     setFunction(lua, "client_cvar", binding, gameClientCvar);
+}
+
+/// Installs the `zostd.net` table with outbound TCP operations.
+///
+/// Every entry forwards to a `Host` callback; when the host did not install
+/// one, the function returns `(nil, message)` instead of raising a Lua error.
+/// Handles are opaque numbers owned by the host and are valid only until
+/// `close` is called or the script unloads.
+fn installNet(lua: *Lua, binding: *Binding) void {
+    lua.createTable(0, 9);
+    setFunction(lua, "connect", binding, netConnect);
+    setFunction(lua, "close", binding, netClose);
+    setFunction(lua, "read", binding, netRead);
+    setFunction(lua, "write", binding, netWrite);
+    setFunction(lua, "poll", binding, netPoll);
+    setIntegerField(lua, "poll_in", net_poll_in);
+    setIntegerField(lua, "poll_out", net_poll_out);
+    setIntegerField(lua, "poll_error", net_poll_error);
+    setIntegerField(lua, "poll_hup", net_poll_hup);
+}
+
+/// Installs one integer constant into the table at the top of the stack.
+fn setIntegerField(lua: *Lua, name: [:0]const u8, value: anytype) void {
+    lua.pushLString(name);
+    lua.pushInteger(@intCast(value));
+    lua.setTable(-3);
 }
 
 /// Installs the `zostd.types` table.
@@ -669,6 +731,143 @@ fn clientPrint(lua: *Lua) callconv(.c) i32 {
         return failError(lua, "zostd.client_print", err);
 
     lua.pushBoolean(true);
+    return 1;
+}
+
+/// Lua C function implementing `zostd.net.connect(host, port)`.
+///
+/// Returns an opaque numeric handle on success or `(nil, message)` when the
+/// host is not configured, the arguments are invalid, or the policy rejects
+/// the destination.
+fn netConnect(lua: *Lua) callconv(.c) i32 {
+    const host = lua.toLString(1) catch
+        return fail(lua, "zostd.net.connect expects a host string");
+    if (!lua.isNumber(2)) {
+        return fail(lua, "zostd.net.connect expects a port number");
+    }
+    const port = std.math.cast(u16, lua.toInteger(2)) orelse
+        return fail(lua, "zostd.net.connect port is out of range");
+
+    const binding = currentBinding(lua);
+    const host_connect = binding.host.connect orelse
+        return fail(lua, "zostd.net.connect is not configured");
+    const handle = host_connect(binding.host.context, host, port) catch |err|
+        return failError(lua, "zostd.net.connect", err);
+
+    lua.pushInteger(@intCast(handle));
+    return 1;
+}
+
+/// Lua C function implementing `zostd.net.close(handle)`.
+fn netClose(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return fail(lua, "zostd.net.close expects a connection handle");
+    }
+    const handle = std.math.cast(u64, lua.toInteger(1)) orelse
+        return fail(lua, "zostd.net.close handle is out of range");
+
+    const binding = currentBinding(lua);
+    const host_close = binding.host.close_connection orelse
+        return fail(lua, "zostd.net.close is not configured");
+    host_close(binding.host.context, handle) catch |err|
+        return failError(lua, "zostd.net.close", err);
+
+    lua.pushBoolean(true);
+    return 1;
+}
+
+/// Lua C function implementing `zostd.net.read(handle, max_bytes)`.
+///
+/// `max_bytes` defaults to 4096 and is capped to `max_network_read`. Returns
+/// the received bytes, or the empty string at end of stream.
+fn netRead(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return fail(lua, "zostd.net.read expects a connection handle");
+    }
+    const handle = std.math.cast(u64, lua.toInteger(1)) orelse
+        return fail(lua, "zostd.net.read handle is out of range");
+
+    var requested: usize = 4096;
+    if (!lua.isNoneOrNil(2)) {
+        if (!lua.isNumber(2)) {
+            return fail(lua, "zostd.net.read expects a byte count");
+        }
+        requested = std.math.cast(usize, lua.toInteger(2)) orelse
+            return fail(lua, "zostd.net.read byte count is out of range");
+    }
+    requested = @min(requested, max_network_read);
+
+    const binding = currentBinding(lua);
+    const host_read = binding.host.read_network orelse
+        return fail(lua, "zostd.net.read is not configured");
+
+    const buffer = binding.allocator.alloc(u8, requested) catch |err|
+        return failError(lua, "zostd.net.read", err);
+    defer binding.allocator.free(buffer);
+
+    const count = host_read(binding.host.context, handle, buffer) catch |err|
+        return failError(lua, "zostd.net.read", err);
+    lua.pushLString(buffer[0..@min(count, buffer.len)]);
+    return 1;
+}
+
+/// Lua C function implementing `zostd.net.write(handle, data)`.
+///
+/// Returns the number of bytes accepted by the connection.
+fn netWrite(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return fail(lua, "zostd.net.write expects a connection handle");
+    }
+    const handle = std.math.cast(u64, lua.toInteger(1)) orelse
+        return fail(lua, "zostd.net.write handle is out of range");
+    const data = lua.toLString(2) catch
+        return fail(lua, "zostd.net.write expects string data");
+
+    const binding = currentBinding(lua);
+    const host_write = binding.host.write_network orelse
+        return fail(lua, "zostd.net.write is not configured");
+    const count = host_write(binding.host.context, handle, data) catch |err|
+        return failError(lua, "zostd.net.write", err);
+
+    lua.pushInteger(@intCast(count));
+    return 1;
+}
+
+/// Lua C function implementing `zostd.net.poll(handle, events, timeout_ms)`.
+///
+/// `events` is a combination of `zostd.net.poll_in` and
+/// `zostd.net.poll_out`; `timeout_ms` defaults to zero. Returns the event bits
+/// reported by the host, including `poll_error` and `poll_hup`. A zero result
+/// means the timeout elapsed.
+fn netPoll(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return fail(lua, "zostd.net.poll expects a connection handle");
+    }
+    const handle = std.math.cast(u64, lua.toInteger(1)) orelse
+        return fail(lua, "zostd.net.poll handle is out of range");
+    if (!lua.isNumber(2)) {
+        return fail(lua, "zostd.net.poll expects an event mask");
+    }
+    const events = std.math.cast(u8, lua.toInteger(2)) orelse
+        return fail(lua, "zostd.net.poll event mask is out of range");
+
+    var timeout_ms: u32 = 0;
+    if (!lua.isNoneOrNil(3)) {
+        if (!lua.isNumber(3)) {
+            return fail(lua, "zostd.net.poll expects a timeout in milliseconds");
+        }
+        timeout_ms = std.math.cast(u32, lua.toInteger(3)) orelse
+            return fail(lua, "zostd.net.poll timeout is out of range");
+    }
+
+    const binding = currentBinding(lua);
+    const host_poll = binding.host.poll_network orelse
+        return fail(lua, "zostd.net.poll is not configured");
+
+    var result: u8 = 0;
+    host_poll(binding.host.context, handle, events, timeout_ms, &result) catch |err|
+        return failError(lua, "zostd.net.poll", err);
+    lua.pushInteger(result);
     return 1;
 }
 

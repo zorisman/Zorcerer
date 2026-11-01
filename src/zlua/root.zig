@@ -155,6 +155,7 @@ const MockHost = struct {
     written_data: std.ArrayList(u8) = .empty,
     command: std.ArrayList(u8) = .empty,
     client_message: std.ArrayList(u8) = .empty,
+    net_written: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *MockHost) void {
         self.log_buffer.deinit(self.allocator);
@@ -162,6 +163,7 @@ const MockHost = struct {
         self.written_data.deinit(self.allocator);
         self.command.deinit(self.allocator);
         self.client_message.deinit(self.allocator);
+        self.net_written.deinit(self.allocator);
     }
 
     fn log(context: ?*anyopaque, message: []const u8) void {
@@ -204,6 +206,49 @@ const MockHost = struct {
     fn clientPrint(context: ?*anyopaque, message: []const u8) !void {
         const self: *MockHost = @ptrCast(@alignCast(context.?));
         try self.client_message.appendSlice(self.allocator, message);
+    }
+
+    /// Accepts port 27015 and returns the fixed handle 7.
+    fn netConnect(_: ?*anyopaque, host: []const u8, port: u16) !u64 {
+        if (!std.mem.eql(u8, host, "example.com") or port != 27015) {
+            return error.PermissionDenied;
+        }
+        return 7;
+    }
+
+    /// Accepts only the mock handle.
+    fn netClose(_: ?*anyopaque, handle: u64) !void {
+        if (handle != 7) return error.InvalidHandle;
+    }
+
+    /// Copies a fixed payload into the caller's buffer.
+    fn netRead(_: ?*anyopaque, handle: u64, destination: []u8) !usize {
+        if (handle != 7) return error.InvalidHandle;
+        const payload = "pong";
+        const count = @min(payload.len, destination.len);
+        @memcpy(destination[0..count], payload[0..count]);
+        return count;
+    }
+
+    /// Records the written payload and reports it as accepted.
+    fn netWrite(context: ?*anyopaque, handle: u64, source: []const u8) !usize {
+        const self: *MockHost = @ptrCast(@alignCast(context.?));
+        if (handle != 7) return error.InvalidHandle;
+        try self.net_written.appendSlice(self.allocator, source);
+        return source.len;
+    }
+
+    /// Reports the connection as readable.
+    fn netPoll(
+        _: ?*anyopaque,
+        handle: u64,
+        events: u8,
+        timeout_ms: u32,
+        out_events: *u8,
+    ) !void {
+        _ = timeout_ms;
+        if (handle != 7) return error.InvalidHandle;
+        out_events.* = events & zostd_bridge.net_poll_in;
     }
 
     /// Fills a fixed server snapshot for the `zostd.game` tests.
@@ -407,6 +452,65 @@ test "zostd host operations are callable from Lua" {
     try std.testing.expectEqualStrings("payload", host.written_data.items);
     try std.testing.expectEqualStrings("say hello", host.command.items);
     try std.testing.expectEqualStrings("Pong!", host.client_message.items);
+}
+
+test "zostd.net forwards outbound operations to the host" {
+    var host = MockHost{ .allocator = std.testing.allocator };
+    defer host.deinit();
+
+    var lua_runtime = try Runtime.init(std.testing.allocator);
+    defer lua_runtime.deinit();
+
+    lua_runtime.setHost(.{
+        .context = &host,
+        .connect = MockHost.netConnect,
+        .close_connection = MockHost.netClose,
+        .read_network = MockHost.netRead,
+        .write_network = MockHost.netWrite,
+        .poll_network = MockHost.netPoll,
+    });
+    lua_runtime.openSafeLibs();
+    lua_runtime.installZostd();
+
+    try lua_runtime.run(
+        \\assert(zostd.net.poll_in == 1)
+        \\assert(zostd.net.poll_out == 2)
+        \\assert(zostd.net.poll_error == 4)
+        \\assert(zostd.net.poll_hup == 8)
+        \\
+        \\local handle = assert(zostd.net.connect("example.com", 27015))
+        \\assert(handle == 7)
+        \\assert(zostd.net.write(handle, "ping") == 4)
+        \\local data = assert(zostd.net.read(handle, 8))
+        \\assert(data == "pong")
+        \\local events = assert(zostd.net.poll(handle, zostd.net.poll_in, 0))
+        \\assert(events == zostd.net.poll_in)
+        \\assert(zostd.net.close(handle) == true)
+        \\
+        \\local denied, denied_error = zostd.net.connect("example.com", 1)
+        \\assert(denied == nil)
+        \\assert(string.find(denied_error, "PermissionDenied", 1, true) ~= nil)
+    , "@zlua/zostd_net_test.lua");
+
+    try std.testing.expectEqualStrings("ping", host.net_written.items);
+}
+
+test "zostd.net reports unconfigured operations without raising" {
+    var lua_runtime = try Runtime.init(std.testing.allocator);
+    defer lua_runtime.deinit();
+
+    lua_runtime.openSafeLibs();
+    lua_runtime.installZostd();
+
+    try lua_runtime.run(
+        \\local handle, handle_error = zostd.net.connect("example.com", 80)
+        \\assert(handle == nil)
+        \\assert(string.find(handle_error, "not configured", 1, true) ~= nil)
+        \\
+        \\local closed, close_error = zostd.net.close(1)
+        \\assert(closed == nil)
+        \\assert(string.find(close_error, "not configured", 1, true) ~= nil)
+    , "@zlua/zostd_net_unconfigured_test.lua");
 }
 
 test "built-in plugin:// backend reads and writes inside the plugin root" {

@@ -147,6 +147,7 @@ fn testContext() abi.PluginContext {
         },
         .game = null,
         .files = null,
+        .network = null,
     };
 }
 

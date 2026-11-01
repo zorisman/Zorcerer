@@ -9,6 +9,8 @@ const JsonRpc = root.core.JsonRpc;
 const Manager = root.core.PluginManager;
 const EngineCommands = root.core.EngineCommands;
 const FileService = root.core.FileService;
+const NetworkService = root.core.NetworkService;
+const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 const LuaHost = root.core.LuaHost;
 const zlua = @import("zlua");
 const Log = root.io.Log;
@@ -773,7 +775,17 @@ test "Lua script queries the game through LuaHost" {
     const files = try service.createPluginFiles("demo");
     defer service.destroyPluginFiles(files);
 
-    var host_context = LuaHost.Context{ .manager = &manager, .files = files };
+    var policy: PluginConfiguration.NetworkPolicy = .{};
+    var network_service = try NetworkService.Service.init(std.testing.allocator);
+    defer network_service.deinit();
+    const network = try network_service.createPluginNetwork(&policy);
+    defer network_service.destroyPluginNetwork(network);
+
+    var host_context = LuaHost.Context{
+        .manager = &manager,
+        .files = files,
+        .network = network,
+    };
     var script = try zlua.Script.load(std.testing.allocator, std.testing.io, .{
         .plugins_directory = plugins_root,
         .directory_name = "demo",
@@ -825,9 +837,16 @@ test "Lua script sends a server command through LuaHost" {
     const files = try service.createPluginFiles("demo");
     defer service.destroyPluginFiles(files);
 
+    var policy: PluginConfiguration.NetworkPolicy = .{};
+    var network_service = try NetworkService.Service.init(std.testing.allocator);
+    defer network_service.deinit();
+    const network = try network_service.createPluginNetwork(&policy);
+    defer network_service.destroyPluginNetwork(network);
+
     var host_context = LuaHost.Context{
         .manager = &manager,
         .files = files,
+        .network = network,
         .plugin_id = "demo",
     };
     var script = try zlua.Script.load(std.testing.allocator, std.testing.io, .{

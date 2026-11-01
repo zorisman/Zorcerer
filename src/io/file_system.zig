@@ -1538,6 +1538,7 @@ fn mockContext() abi.PluginContext {
         },
         .game = null,
         .files = null,
+        .network = null,
     };
 }
 

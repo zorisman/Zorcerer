@@ -343,6 +343,43 @@ For Lua:
 - `game://` file access must be requested from the Entrypoint, which owns the engine filesystem interface.
 - `doFile` bypasses this policy entirely; use `loadBuffer` after a policy-checked read.
 
+### 3.7a Outbound networking policy
+
+Lua scripts receive outbound TCP networking through `zostd.net`. It runs
+entirely in the forked plugin-manager child; no engine pointer or engine-side
+socket is involved, and TLS, HTTP, WebSocket, and inbound listeners are not
+implemented.
+
+The script's manifest `[network]` table is the policy source. A script-only
+manifest uses the `script` key instead of `path`, and its `[network]` table
+applies to the directory's script. A directory without a valid manifest still
+runs its script, but with an empty deny-all policy. The policy keys are `allow`
+(`host`, `host:port`, `[ipv6]`, `[ipv6]:port`, and `*.suffix` entries),
+`allow_private`, `max_connections`, `max_frame_bytes`, `connect_timeout_ms`,
+`io_timeout_ms`, and `poll_timeout_ms`; values above the host's
+`max_network_*` caps are rejected at manifest validation.
+
+The Lua surface is:
+
+- `zostd.net.connect(host, port)` returns an opaque numeric handle or
+  `(nil, message)` when the policy rejects the destination or the connection
+  fails.
+- `zostd.net.close(handle)` closes a connection.
+- `zostd.net.read(handle, max_bytes)` returns a string, the empty string at end
+  of stream, or `(nil, message)`. `max_bytes` defaults to 4096 and is capped at
+  64 KiB.
+- `zostd.net.write(handle, data)` returns the number of bytes accepted or
+  `(nil, message)`.
+- `zostd.net.poll(handle, events, timeout_ms)` returns the reported event bits;
+  `events` uses `zostd.net.poll_in` and `poll_out`, and results may include
+  `poll_error` and `poll_hup`. A zero result means the timeout elapsed.
+  `timeout_ms` defaults to zero.
+
+Sockets are non-blocking and wait through bounded `poll` slices until the
+policy deadline. Host-name resolution happens on the plugin manager's dedicated
+resolver thread, not in the Lua state. Handles are valid only for the script
+that opened them and only until `close` or unload.
+
 ### 3.8 Event dispatch is synchronous
 
 `Ipc.Event` currently contains `pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown`, and `clientCommand` (`src/core/Ipc.zig`). There is no `gameFrame` event.
@@ -512,6 +549,7 @@ A first Lua-facing `zostd` surface should be small and capability-based:
 | `zostd.write_file(path, data)` | Writes a `plugin://` file | `std.Io` + policy |
 | `zostd.server_command(command)` | Requests an engine command | Entrypoint RPC |
 | `zostd.client_print(message)` | Prints to the client whose command is active | Entrypoint RPC |
+| `zostd.net.*` | Policy-checked outbound TCP connect/close/read/write/poll | Manager `NetworkApi` |
 | `zostd.on(event, callback)` | Registers a lifecycle callback | Registry ref |
 
 Design rules:
@@ -521,6 +559,8 @@ Design rules:
 - `server_command` is a request to the Entrypoint; it is not a direct engine call.
 - `client_print` is a request to the Entrypoint and is only valid during a `clientCommand` callback.
 - `game://` is not part of the first version. If added, it must be an Entrypoint RPC with chunking.
+- Outbound networking is deny-by-default and policy-driven. It stays in the
+  manager child; no engine pointer crosses the Lua boundary.
 - Version the API and reject incompatible scripts at load time.
 
 This is directly supported by:

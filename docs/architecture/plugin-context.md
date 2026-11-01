@@ -177,6 +177,61 @@ Scenarios:
     `zostd.read_file(path)` and `zostd.write_file(path, data)`; a path without
     a URI prefix is relative to the script's plugin directory.
     4. Networking
+    The context carries an optional `network` capability (`abi.NetworkApi`).
+    Like `game` and `files`, the field was appended to `PluginContext` without
+    changing `abi_version`; old plugins ignore it through `struct_size`. This
+    first version is outbound-only TCP: TLS, HTTP, WebSocket, and inbound
+    listeners are deferred and not part of the contract. No engine pointer or
+    engine-side socket is involved; every operation runs in the forked
+    plugin-manager child.
+
+    Each native plugin and each Lua script receives its own network context
+    with an independent handle table, borrowed policy, and connection count. A
+    handle opened by one plugin is never visible to another and is rejected as
+    `network_invalid_handle`.
+
+    The manifest's optional `[network]` table is deny-by-default:
+
+    - `allow` is an array of `host`, `host:port`, `[ipv6]`, or `[ipv6]:port`
+      strings. A leading `*.` matches the suffix and every subdomain of it, but
+      not the bare suffix. Host matching is ASCII case-insensitive.
+    - `allow_private` (default `false`) permits destinations that resolve into
+      loopback, RFC 1918, link-local, ULA, multicast, or unspecified address
+      space. The guard is applied to the resolved address, so a hostname cannot
+      bypass it accidentally.
+    - `max_connections` (default 4), `max_frame_bytes` (default 64 KiB),
+      `connect_timeout_ms` (default 3000), `io_timeout_ms` (default 3000), and
+      `poll_timeout_ms` (default 10) bound resource use. Manifest values are
+      rejected above the `PluginConfiguration.max_network_*` hard caps.
+
+    A directory without a manifest still runs its Lua script with an empty,
+    deny-all policy. A script-only manifest uses the `script` key instead of
+    `path`, and its `[network]` table applies to the directory's script.
+
+    Sockets are non-blocking. Connect, read, and write wait through bounded
+    `poll` slices (10 ms) until the policy deadline elapses, so a call cannot
+    stall the event thread for longer than its configured timeout. Host-name
+    resolution runs on a dedicated resolver thread; the caller waits for the
+    answer but never performs DNS work itself.
+
+    `connect` takes a host, port, and `NetworkProtocol` (currently only `tcp`)
+    and stores an opaque, non-zero handle. `read` returns the number of bytes
+    read, `0` at end of stream, or a negated `network_*` status; `write` returns
+    the number of bytes accepted or a negated status. `poll` waits for
+    `network_poll_in`/`network_poll_out` and reports `network_poll_error` and
+    `network_poll_hup`; a zero result means the timeout elapsed. Status values
+    are `network_ok`, `network_unavailable`, `network_permission_denied`,
+    `network_invalid_argument`, `network_resolution_failed`,
+    `network_connect_failed`, `network_timeout`, `network_would_block`,
+    `network_closed`, `network_resource_limit`, `network_io_error`, and
+    `network_invalid_handle`.
+
+    Networking is available during `load()` and `unload()`, matching the
+    existing child-side services. The host closes any connections a plugin
+    leaves open after its `unload()` returns. Lua scripts use the same
+    implementation through `zostd.net.connect`, `zostd.net.close`,
+    `zostd.net.read`, `zostd.net.write`, and `zostd.net.poll`, with the
+    `zostd.net.poll_in`, `poll_out`, `poll_error`, and `poll_hup` constants.
     5. Resource management
     6. Plugin-to-plugin communication
     7. Hot reload

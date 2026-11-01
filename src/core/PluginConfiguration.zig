@@ -7,6 +7,11 @@
 //! Besides the required identity keys, a manifest may contain an optional
 //! `[dependencies]` table. Its keys are plugin ids and its values are version
 //! requirements; see `VersionRequirement` for the accepted grammar.
+//!
+//! A manifest also selects what the plugin directory provides: a native
+//! library (`path`) or a Lua script (`script`). At least one of them must be
+//! present. The optional `[network]` table carries the outbound network policy
+//! that applies to whichever entry point the directory provides.
 
 const std = @import("std");
 const toml = @import("toml");
@@ -43,6 +48,100 @@ pub const PluginConfiguration = struct {
     /// Maximum number of entries accepted in the optional `[dependencies]`
     /// table.
     pub const max_dependencies: usize = 32;
+
+    /// Maximum accepted length of `script`, in bytes.
+    pub const max_script_len: usize = 1024;
+    /// Maximum number of `allow` entries accepted in `[network]`.
+    pub const max_network_rules: usize = 64;
+    /// Maximum accepted host length in one `[network].allow` entry, in bytes.
+    pub const max_network_host_len: usize = 255;
+    /// Hard cap accepted for `[network].max_connections`.
+    pub const max_network_connections: u16 = 32;
+    /// Hard cap accepted for `[network].max_frame_bytes`.
+    pub const max_network_frame_bytes: usize = 1024 * 1024;
+    /// Hard cap accepted for every `[network]` timeout, in milliseconds.
+    pub const max_network_timeout_ms: u32 = 30_000;
+
+    /// One host or host:port entry of `[network].allow`.
+    ///
+    /// `host` is a literal host name or IP address. `port` is null when the
+    /// rule allows every port on that host. A host that begins with `*.`
+    /// matches the suffix and every subdomain of it.
+    ///
+    /// Ownership: in a parsed configuration, `host` is allocated with the
+    /// configuration's allocator and freed by its `deinit()`.
+    pub const NetworkRule = struct {
+        /// Host name or IP address the rule applies to; may start with `*.`.
+        host: []const u8,
+        /// Port restriction, or null when every port is allowed.
+        port: ?u16 = null,
+
+        /// Returns whether this rule permits `host` and `port`.
+        ///
+        /// Host comparison is ASCII case-insensitive. A `*.` prefix matches
+        /// the suffix with at least one subdomain label, so `*.example.com`
+        /// matches `a.example.com` but not `example.com`. When the rule has a
+        /// port, the requested port must equal it.
+        ///
+        /// Side effects: none.
+        pub fn matches(self: @This(), host: []const u8, port: u16) bool {
+            if (self.port) |allowed_port| {
+                if (allowed_port != port) return false;
+            }
+            if (std.mem.startsWith(u8, self.host, "*.")) {
+                const suffix = self.host[1..];
+                if (host.len <= suffix.len) return false;
+                return std.ascii.endsWithIgnoreCase(host, suffix);
+            }
+            return std.ascii.eqlIgnoreCase(host, self.host);
+        }
+    };
+
+    /// Outbound network policy of one plugin.
+    ///
+    /// The policy is deny-by-default: an empty `rules` slice permits no
+    /// connection. Limits bound the resources a plugin can consume through
+    /// `NetworkApi`; values parsed from a manifest are additionally capped by
+    /// the `max_network_*` constants.
+    ///
+    /// Ownership: when parsed from a manifest, `rules` and their host strings
+    /// are owned by the configuration and released by `deinit()`. Literal
+    /// policies borrow their strings and must not be passed to `deinit()`.
+    pub const NetworkPolicy = struct {
+        /// Ordered allowlist of accepted destinations. Order does not affect
+        /// matching; the list is simply scanned linearly.
+        rules: []const NetworkRule = &.{},
+        /// Whether destinations in private, loopback, link-local, multicast,
+        /// or unspecified address space may be contacted. Disabled by
+        /// default so a hostname that resolves into the local network cannot
+        /// bypass an allowlist accidentally.
+        allow_private: bool = false,
+        /// Maximum number of simultaneously open connections per plugin.
+        max_connections: u16 = 4,
+        /// Largest buffer accepted by one `NetworkApi.read`/`write` call.
+        max_frame_bytes: usize = 64 * 1024,
+        /// Deadline for the resolve plus connect phase of one connection.
+        connect_timeout_ms: u32 = 3_000,
+        /// Deadline for one `NetworkApi.read` or `write` call.
+        io_timeout_ms: u32 = 3_000,
+        /// Longest time a single `NetworkApi.poll` call may block.
+        poll_timeout_ms: u32 = 10,
+
+        /// Returns whether the policy permits contacting `host` on `port`.
+        ///
+        /// The host is matched against every rule with
+        /// `NetworkRule.matches()`. Private address space is not checked here
+        /// because the check needs the resolved address; see
+        /// `addressIsPrivate()`.
+        ///
+        /// Side effects: none.
+        pub fn allows(self: @This(), host: []const u8, port: u16) bool {
+            for (self.rules) |rule| {
+                if (rule.matches(host, port)) return true;
+            }
+            return false;
+        }
+    };
 
     /// One entry of the manifest's optional `[dependencies]` table.
     ///
@@ -83,7 +182,9 @@ pub const PluginConfiguration = struct {
         "version",
         "author",
         "path",
+        "script",
         "dependencies",
+        "network",
     };
 
     /// Unique identifier of the plugin, also the name of the directory the
@@ -97,23 +198,33 @@ pub const PluginConfiguration = struct {
     /// Author string of the plugin, in the author's chosen format.
     author: []const u8,
     /// Path to the plugin's `.so` library, relative to the plugin directory.
-    path: []const u8,
+    /// Null for a script-only manifest.
+    path: ?[]const u8 = null,
+    /// Path to the plugin's Lua script, relative to the plugin directory.
+    /// Null for a native-only manifest. When both `path` and `script` are
+    /// present, the manager loads both entry points from the same directory.
+    script: ?[]const u8 = null,
     /// Optional dependencies declared under the manifest's `[dependencies]`
     /// table. Empty when the table is absent. When the configuration comes
     /// from `parseConfig()`, the strings are owned by the configuration.
     /// Configurations built directly from literals borrow their strings and
     /// must not be passed to `deinit()`.
     dependencies: []const Dependency = &.{},
+    /// Optional outbound network policy from the manifest's `[network]`
+    /// table. Empty (deny everything) when the table is absent.
+    network: NetworkPolicy = .{},
 
     /// Parses and validates the raw TOML text of a plugin manifest into a
     /// `PluginConfiguration`.
     ///
     /// Every required top-level key must be a field of this struct and every
     /// required field must be a top-level string value; the values must
-    /// additionally pass `validateValues()`. The optional `[dependencies]`
+    /// additionally pass `validateValues()`. `path` and `script` are optional
+    /// strings, but at least one must be present. The optional `[dependencies]`
     /// table maps plugin ids to version requirement strings and is parsed
-    /// into `dependencies`. Otherwise an error is returned and the
-    /// configuration cannot be used.
+    /// into `dependencies`; the optional `[network]` table is parsed into
+    /// `network`. Otherwise an error is returned and the configuration cannot
+    /// be used.
     ///
     /// Parameters:
     /// - `allocator`: owns every string of the returned configuration; the
@@ -184,12 +295,30 @@ pub const PluginConfiguration = struct {
 
         // Bind the parser-owned string slices first. They stay valid until
         // `parsed.deinit()` at the end of this function; the validated
-        // values are duplicated into `allocator` before then. `dependencies`
-        // is the one field whose manifest value is a table rather than a
-        // string, so it is parsed separately below.
+        // values are duplicated into `allocator` before then. `path` and
+        // `script` are optional strings, while `dependencies` and `network`
+        // carry tables and are parsed separately below.
         var parsed_values: @This() = undefined;
         inline for (std.meta.fields(@This())) |field| {
-            if (comptime std.mem.eql(u8, field.name, "dependencies")) continue;
+            if (comptime std.mem.eql(u8, field.name, "dependencies") or
+                std.mem.eql(u8, field.name, "network"))
+            {
+                continue;
+            }
+            if (comptime std.mem.eql(u8, field.name, "path") or
+                std.mem.eql(u8, field.name, "script"))
+            {
+                const optional_value = table.get(field.name);
+                if (optional_value) |value| {
+                    switch (value) {
+                        .string => |str| @field(parsed_values, field.name) = str,
+                        else => return error.WrongValueType,
+                    }
+                } else {
+                    @field(parsed_values, field.name) = null;
+                }
+                continue;
+            }
             const value = table.get(field.name) orelse return error.MissingRequiredField;
             switch (value) {
                 .string => |str| @field(parsed_values, field.name) = str,
@@ -201,6 +330,10 @@ pub const PluginConfiguration = struct {
         errdefer freeDependencies(allocator, dependencies);
         parsed_values.dependencies = dependencies;
 
+        const network = try parseNetwork(allocator, table.get("network"));
+        errdefer freeNetwork(allocator, network);
+        parsed_values.network = network;
+
         try parsed_values.validateValues();
 
         const id = try allocator.dupe(u8, parsed_values.id);
@@ -211,8 +344,17 @@ pub const PluginConfiguration = struct {
         errdefer allocator.free(version);
         const author = try allocator.dupe(u8, parsed_values.author);
         errdefer allocator.free(author);
-        const path = try allocator.dupe(u8, parsed_values.path);
-        errdefer allocator.free(path);
+
+        const path: ?[]const u8 = if (parsed_values.path) |value| value: {
+            const copy = try allocator.dupe(u8, value);
+            errdefer allocator.free(copy);
+            break :value copy;
+        } else null;
+        const script: ?[]const u8 = if (parsed_values.script) |value| value: {
+            const copy = try allocator.dupe(u8, value);
+            errdefer allocator.free(copy);
+            break :value copy;
+        } else null;
 
         return .{
             .id = id,
@@ -220,20 +362,26 @@ pub const PluginConfiguration = struct {
             .version = version,
             .author = author,
             .path = path,
+            .script = script,
             .dependencies = dependencies,
+            .network = network,
         };
     }
 
     /// Checks the values of an already parsed configuration.
     ///
-    /// `id` must be non-empty, at most `max_id_len` bytes, and consist only
-    /// of ASCII letters, digits, `_` and `-`. `name` and `author` must be
-    /// non-empty and fit their length limits. `version` must be a semantic
-    /// version. `path` must be a relative path that stays inside the plugin
+    /// At least one of `path` and `script` must be present. `id` must be
+    /// non-empty, at most `max_id_len` bytes, and consist only of ASCII
+    /// letters, digits, `_` and `-`. `name` and `author` must be non-empty and
+    /// fit their length limits. `version` must be a semantic version. `path`,
+    /// when present, must be a relative path that stays inside the plugin
     /// directory, is at most `max_path_len` bytes, and names a `.so` file.
-    /// `dependencies` must contain at most `max_dependencies` entries; every
-    /// entry needs a valid, unique id different from this plugin's own id,
-    /// and a requirement accepted by `VersionRequirement.parse()`.
+    /// `script`, when present, follows the same containment rules and must
+    /// name a `.lua` file. `dependencies` must contain at most
+    /// `max_dependencies` entries; every entry needs a valid, unique id
+    /// different from this plugin's own id, and a requirement accepted by
+    /// `VersionRequirement.parse()`. `network` limits must stay within their
+    /// hard caps.
     ///
     /// Errors: `error.InvalidValue` when any of the rules above is
     /// violated.
@@ -253,7 +401,9 @@ pub const PluginConfiguration = struct {
         if (self.author.len == 0 or self.author.len > max_author_len) {
             return error.InvalidValue;
         }
-        try validateLibraryPath(self.path);
+        if (self.path == null and self.script == null) return error.InvalidValue;
+        if (self.path) |path| try validateLibraryPath(path);
+        if (self.script) |script| try validateScriptPath(script);
 
         if (self.dependencies.len > max_dependencies) return error.InvalidValue;
         for (self.dependencies, 0..) |dependency, index| {
@@ -269,6 +419,34 @@ pub const PluginConfiguration = struct {
             _ = VersionRequirement.parse(dependency.requirement) catch
                 return error.InvalidValue;
         }
+
+        if (self.network.rules.len > max_network_rules) return error.InvalidValue;
+        if (self.network.max_connections > max_network_connections) {
+            return error.InvalidValue;
+        }
+        if (self.network.max_frame_bytes == 0 or
+            self.network.max_frame_bytes > max_network_frame_bytes)
+        {
+            return error.InvalidValue;
+        }
+        if (self.network.connect_timeout_ms == 0 or
+            self.network.connect_timeout_ms > max_network_timeout_ms or
+            self.network.io_timeout_ms == 0 or
+            self.network.io_timeout_ms > max_network_timeout_ms or
+            self.network.poll_timeout_ms > max_network_timeout_ms)
+        {
+            return error.InvalidValue;
+        }
+    }
+
+    /// Returns whether this configuration provides a native library.
+    ///
+    /// Script-only manifests are still valid configurations, but they do not
+    /// participate in native plugin dependency resolution or `dlopen()`.
+    ///
+    /// Side effects: none.
+    pub fn isNative(self: @This()) bool {
+        return self.path != null;
     }
 
     /// Checks the invariants that require the plugin's directory name.
@@ -292,15 +470,18 @@ pub const PluginConfiguration = struct {
     /// `allocator` must be the allocator passed to `parseConfig()`.
     /// Configurations built from literals must not be passed here.
     ///
-    /// Side effects: frees `id`, `name`, `version`, `author`, `path` and
-    /// every dependency id and requirement string.
+    /// Side effects: frees `id`, `name`, `version`, `author`, `path`,
+    /// `script`, every dependency id and requirement string, and every
+    /// `[network].allow` host.
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.version);
         allocator.free(self.author);
-        allocator.free(self.path);
+        if (self.path) |path| allocator.free(path);
+        if (self.script) |script| allocator.free(script);
         freeDependencies(allocator, self.dependencies);
+        freeNetwork(allocator, self.network);
     }
 };
 
@@ -396,6 +577,193 @@ fn dependencyLessThan(
     return std.mem.order(u8, left.id, right.id) == .lt;
 }
 
+/// Parses the manifest's optional `[network]` table into a policy.
+///
+/// A missing table yields the default deny-all policy. Unknown keys inside the
+/// table are rejected with `error.KeysNotImplemented`, so a typo cannot
+/// silently widen or narrow the policy. `allow` must be an array of strings;
+/// `allow_private` must be a boolean; every limit must be an integer that
+/// fits its field type and passes `validateValues()`.
+///
+/// The returned policy and its host strings are owned by `allocator`; release
+/// them with `freeNetwork()`.
+///
+/// Errors: `error.WrongValueType` for a wrong TOML type,
+/// `error.KeysNotImplemented` for an unknown key, `error.InvalidValue` for a
+/// malformed rule or an out-of-range limit, and `error.OutOfMemory`.
+fn parseNetwork(
+    allocator: std.mem.Allocator,
+    value: ?toml.Value,
+) !PluginConfiguration.NetworkPolicy {
+    const table_value = value orelse return .{};
+    const network_table = switch (table_value) {
+        .table => |table| table,
+        else => return error.WrongValueType,
+    };
+
+    var iterator = network_table.iterator();
+    while (iterator.next()) |entry| {
+        const known = [_][]const u8{
+            "allow",
+            "allow_private",
+            "max_connections",
+            "max_frame_bytes",
+            "connect_timeout_ms",
+            "io_timeout_ms",
+            "poll_timeout_ms",
+        };
+        var recognized = false;
+        for (known) |key| {
+            if (std.mem.eql(u8, entry.key_ptr.*, key)) recognized = true;
+        }
+        if (!recognized) return error.KeysNotImplemented;
+    }
+
+    var policy: PluginConfiguration.NetworkPolicy = .{};
+    errdefer freeNetwork(allocator, policy);
+
+    if (network_table.get("allow")) |allow_value| {
+        policy.rules = try parseNetworkRules(allocator, allow_value);
+    }
+    if (network_table.get("allow_private")) |private_value| {
+        policy.allow_private = switch (private_value) {
+            .boolean => |flag| flag,
+            else => return error.WrongValueType,
+        };
+    }
+    if (network_table.get("max_connections")) |limit_value| {
+        policy.max_connections = try parseNetworkInteger(u16, limit_value);
+    }
+    if (network_table.get("max_frame_bytes")) |limit_value| {
+        policy.max_frame_bytes = try parseNetworkInteger(usize, limit_value);
+    }
+    if (network_table.get("connect_timeout_ms")) |limit_value| {
+        policy.connect_timeout_ms = try parseNetworkInteger(u32, limit_value);
+    }
+    if (network_table.get("io_timeout_ms")) |limit_value| {
+        policy.io_timeout_ms = try parseNetworkInteger(u32, limit_value);
+    }
+    if (network_table.get("poll_timeout_ms")) |limit_value| {
+        policy.poll_timeout_ms = try parseNetworkInteger(u32, limit_value);
+    }
+    return policy;
+}
+
+/// Reads one non-negative integer limit of `T`.
+///
+/// Errors: `error.WrongValueType` when the value is not an integer and
+/// `error.InvalidValue` when it is negative or does not fit `T`.
+fn parseNetworkInteger(comptime T: type, value: toml.Value) !T {
+    const integer = switch (value) {
+        .integer => |number| number,
+        else => return error.WrongValueType,
+    };
+    if (integer < 0) return error.InvalidValue;
+    return std.math.cast(T, integer) orelse error.InvalidValue;
+}
+
+/// Parses `[network].allow` into a rule slice.
+///
+/// An empty array yields an empty slice without an allocation. Each entry must
+/// be a string containing a host, `host:port`, or `[ipv6]:port`, optionally
+/// with a leading `*.` wildcard. The returned slice and host strings are owned
+/// by `allocator`; release them with `freeNetwork()`.
+///
+/// Errors: `error.WrongValueType` for a non-array or non-string entry,
+/// `error.InvalidValue` for more than `max_network_rules` entries or a
+/// malformed rule, and `error.OutOfMemory`.
+fn parseNetworkRules(
+    allocator: std.mem.Allocator,
+    value: toml.Value,
+) ![]const PluginConfiguration.NetworkRule {
+    const list = switch (value) {
+        .array => |array| array,
+        else => return error.WrongValueType,
+    };
+    if (list.items.len == 0) return &.{};
+    if (list.items.len > PluginConfiguration.max_network_rules) {
+        return error.InvalidValue;
+    }
+
+    var rules = try allocator.alloc(PluginConfiguration.NetworkRule, list.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (rules[0..filled]) |rule| allocator.free(rule.host);
+        allocator.free(rules);
+    }
+
+    for (list.items) |item| {
+        const text = switch (item) {
+            .string => |string| string,
+            else => return error.WrongValueType,
+        };
+        const parsed = try parseNetworkRule(text);
+        const host = try allocator.dupe(u8, parsed.host);
+        errdefer allocator.free(host);
+        rules[filled] = .{ .host = host, .port = parsed.port };
+        filled += 1;
+    }
+    return rules;
+}
+
+/// Splits one allowlist entry into its host and optional port.
+///
+/// Supported forms are `host`, `host:port`, `[ipv6]`, and `[ipv6]:port`. A
+/// bare IPv6 literal may contain several colons; it is only split when it is
+/// bracketed. The returned `host` borrows `text`.
+///
+/// Errors: `error.InvalidValue` for an empty host, an oversized host, an empty
+/// wildcard suffix, an invalid port, or characters that cannot be part of a
+/// host name.
+fn parseNetworkRule(text: []const u8) error{InvalidValue}!struct {
+    host: []const u8,
+    port: ?u16,
+} {
+    if (text.len == 0) return error.InvalidValue;
+
+    var host = text;
+    var port: ?u16 = null;
+
+    if (text[0] == '[') {
+        const closing = std.mem.indexOfScalar(u8, text, ']') orelse return error.InvalidValue;
+        host = text[1..closing];
+        const rest = text[closing + 1 ..];
+        if (rest.len != 0) {
+            if (rest[0] != ':') return error.InvalidValue;
+            port = std.fmt.parseUnsigned(u16, rest[1..], 10) catch
+                return error.InvalidValue;
+        }
+    } else {
+        const colon_count = std.mem.count(u8, text, ":");
+        if (colon_count == 1) {
+            const colon = std.mem.indexOfScalar(u8, text, ':').?;
+            host = text[0..colon];
+            port = std.fmt.parseUnsigned(u16, text[colon + 1 ..], 10) catch
+                return error.InvalidValue;
+        }
+    }
+
+    if (host.len == 0 or host.len > PluginConfiguration.max_network_host_len) {
+        return error.InvalidValue;
+    }
+    for (host) |byte| {
+        if (byte == 0 or byte == '/' or byte == ' ' or byte == '\t' or byte == '\n') {
+            return error.InvalidValue;
+        }
+    }
+    if (std.mem.eql(u8, host, "*.")) return error.InvalidValue;
+    return .{ .host = host, .port = port };
+}
+
+/// Releases a policy produced by `parseNetwork()`.
+///
+/// The default policy and an empty `allow` array carry no allocation and are
+/// left untouched.
+fn freeNetwork(allocator: std.mem.Allocator, policy: PluginConfiguration.NetworkPolicy) void {
+    for (policy.rules) |rule| allocator.free(rule.host);
+    if (policy.rules.len != 0) allocator.free(policy.rules);
+}
+
 /// Returns whether `id` consists only of ASCII letters, digits, `_` and `-`.
 fn isValidId(id: []const u8) bool {
     for (id) |byte| {
@@ -419,6 +787,30 @@ fn validateLibraryPath(path: []const u8) !void {
         return error.InvalidValue;
     }
     if (path[0] == '/' or !std.mem.endsWith(u8, path, ".so")) {
+        return error.InvalidValue;
+    }
+
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) {
+            return error.InvalidValue;
+        }
+    }
+}
+
+/// Validates a manifest Lua script path that is relative to the plugin
+/// directory.
+///
+/// The path must be non-empty, at most `PluginConfiguration.max_script_len`
+/// bytes, relative (no leading `/`), free of `..` components, and end in
+/// `.lua`. A leading `./` is allowed.
+///
+/// Errors: `error.InvalidValue` when any rule is violated.
+fn validateScriptPath(path: []const u8) !void {
+    if (path.len == 0 or path.len > PluginConfiguration.max_script_len) {
+        return error.InvalidValue;
+    }
+    if (path[0] == '/' or !std.mem.endsWith(u8, path, ".lua")) {
         return error.InvalidValue;
     }
 
@@ -500,7 +892,7 @@ test "parseConfig parses fully correct TOML" {
     try std.testing.expectEqualStrings("Hello Example", config.name);
     try std.testing.expectEqualStrings("0.1.0", config.version);
     try std.testing.expectEqualStrings("Zorcerer", config.author);
-    try std.testing.expectEqualStrings("./hello_plugin.so", config.path);
+    try std.testing.expectEqualStrings("./hello_plugin.so", config.path.?);
     try std.testing.expectEqual(@as(usize, 0), config.dependencies.len);
 }
 
@@ -673,11 +1065,12 @@ test "parseConfig fails on wrong value types" {
 }
 
 test "parseConfig fails on missing keys" {
+    // `name` is required; `path` and `script` are optional.
     const source =
         \\id = "hello"
-        \\name = "Hello Example"
         \\version = "0.1.0"
         \\author = "Zorcerer"
+        \\path = "./hello_plugin.so"
     ;
     try std.testing.expectError(
         error.MissingRequiredField,
@@ -853,5 +1246,163 @@ test "readToml fails on a missing or non-table node" {
     try std.testing.expectError(
         error.NodeNotFound,
         readToml(Empty, "[t]\nx = 1\n", "a"),
+    );
+}
+
+test "parseConfig accepts a script-only manifest" {
+    const source =
+        \\id = "scripted"
+        \\name = "Scripted"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\script = "./main.lua"
+    ;
+    var config = try PluginConfiguration.parseConfig(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expect(config.path == null);
+    try std.testing.expectEqualStrings("./main.lua", config.script.?);
+    try std.testing.expect(!config.isNative());
+}
+
+test "parseConfig requires path or script" {
+    const source =
+        \\id = "empty"
+        \\name = "Empty"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
+}
+
+test "parseConfig rejects an invalid script path" {
+    const source =
+        \\id = "scripted"
+        \\name = "Scripted"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\script = "../escape.lua"
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, source),
+    );
+}
+
+test "parseConfig parses the optional network policy" {
+    const source =
+        \\id = "networked"
+        \\name = "Networked"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\script = "./main.lua"
+        \\
+        \\[network]
+        \\allow = ["example.com", "*.example.org", "127.0.0.1:27015", "[::1]:27016"]
+        \\allow_private = true
+        \\max_connections = 2
+        \\max_frame_bytes = 4096
+        \\connect_timeout_ms = 1500
+        \\io_timeout_ms = 500
+        \\poll_timeout_ms = 5
+    ;
+    var config = try PluginConfiguration.parseConfig(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expect(config.network.allow_private);
+    try std.testing.expectEqual(@as(u16, 2), config.network.max_connections);
+    try std.testing.expectEqual(@as(usize, 4096), config.network.max_frame_bytes);
+    try std.testing.expectEqual(@as(u32, 1500), config.network.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 500), config.network.io_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 5), config.network.poll_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 4), config.network.rules.len);
+
+    try std.testing.expect(config.network.allows("example.com", 80));
+    try std.testing.expect(config.network.allows("EXAMPLE.COM", 443));
+    try std.testing.expect(config.network.allows("a.example.org", 80));
+    try std.testing.expect(!config.network.allows("example.org", 80));
+    try std.testing.expect(config.network.allows("a.b.example.org", 80));
+    try std.testing.expect(config.network.allows("127.0.0.1", 27015));
+    try std.testing.expect(!config.network.allows("127.0.0.1", 27016));
+}
+
+test "parseConfig defaults to a deny-all network policy" {
+    const source =
+        \\id = "closed"
+        \\name = "Closed"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./closed.so"
+    ;
+    var config = try PluginConfiguration.parseConfig(std.testing.allocator, source);
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), config.network.rules.len);
+    try std.testing.expect(!config.network.allow_private);
+    try std.testing.expect(!config.network.allows("example.com", 80));
+}
+
+test "parseConfig rejects malformed network tables" {
+    const unknown_key =
+        \\id = "networked"
+        \\name = "Networked"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./networked.so"
+        \\
+        \\[network]
+        \\allow_all = true
+    ;
+    try std.testing.expectError(
+        error.KeysNotImplemented,
+        PluginConfiguration.parseConfig(std.testing.allocator, unknown_key),
+    );
+
+    const wrong_allow_type =
+        \\id = "networked"
+        \\name = "Networked"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./networked.so"
+        \\
+        \\[network]
+        \\allow = "example.com"
+    ;
+    try std.testing.expectError(
+        error.WrongValueType,
+        PluginConfiguration.parseConfig(std.testing.allocator, wrong_allow_type),
+    );
+
+    const bad_rule =
+        \\id = "networked"
+        \\name = "Networked"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./networked.so"
+        \\
+        \\[network]
+        \\allow = ["example.com:not-a-port"]
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, bad_rule),
+    );
+
+    const out_of_range =
+        \\id = "networked"
+        \\name = "Networked"
+        \\version = "0.1.0"
+        \\author = "Zorcerer"
+        \\path = "./networked.so"
+        \\
+        \\[network]
+        \\max_connections = 1000
+    ;
+    try std.testing.expectError(
+        error.InvalidValue,
+        PluginConfiguration.parseConfig(std.testing.allocator, out_of_range),
     );
 }
