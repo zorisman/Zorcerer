@@ -390,6 +390,7 @@ test "parent listener answers a child query while waiting for readiness" {
         .{ .context = null, .handle = testQueryHandler },
         null,
         null,
+        null,
     );
 }
 
@@ -423,6 +424,7 @@ test "parent listener answers a child file request while waiting for readiness" 
         null,
         null,
         .{ .context = null, .handle = testFileHandler },
+        null,
         null,
     );
 }
@@ -597,7 +599,59 @@ test "parent listener answers a child command while waiting for readiness" {
         null,
         null,
         .{ .context = null, .handle = testCommandHandler },
+        null,
     );
+}
+
+/// Answers one client-print request with a fixed result document.
+fn testClientPrintHandler(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    request: Ipc.ClientPrintRequest,
+) anyerror![]u8 {
+    if (!std.mem.eql(u8, request.message, "Pong!")) return error.UnexpectedMessage;
+    if (!std.mem.eql(u8, request.plugin_id, "demo")) return error.UnexpectedPluginId;
+    return allocator.dupe(u8, "{\"printed\":true}");
+}
+
+/// Child that sends one client-print request before reporting readiness.
+fn testClientPrintChild(fd: std.os.linux.fd_t) void {
+    Ipc.sendClientPrint(fd, .{
+        .message = "Pong!",
+        .plugin_id = "demo",
+    }) catch return;
+    const result = Ipc.receiveClientPrintResult(fd, std.heap.page_allocator) catch return;
+    if (!result.printed) return;
+    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+}
+
+test "parent listener answers a child client print while waiting for readiness" {
+    var child = try fork.forkChild(testClientPrintChild);
+    defer child.finish() catch {};
+
+    try JsonRpc.jsonListener(
+        child.socket,
+        null,
+        null,
+        null,
+        null,
+        .{ .context = null, .handle = testClientPrintHandler },
+    );
+}
+
+test "client print request round-trips through the IPC schema" {
+    var buffer: [Ipc.max_payload_len]u8 = undefined;
+    const text = try Ipc.encodeClientPrint(
+        &buffer,
+        .{ .message = "Pong!", .plugin_id = "demo" },
+    );
+
+    const parsed = try Ipc.parseClientPrint(std.testing.allocator, text);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Pong!", parsed.value.message);
+    try std.testing.expectEqualStrings("demo", parsed.value.plugin_id);
+    try std.testing.expect(parsed.id().eql(Ipc.client_print_request_id));
 }
 
 test "shutdown request round-trips through the IPC schema" {
@@ -868,4 +922,16 @@ fn testLuaGameQueryResponder(fd: std.os.linux.fd_t) void {
         defer allocator.free(quoted);
         Ipc.sendResultResponse(fd, parsed.id(), quoted) catch return;
     }
+}
+
+test "lua-hello example parses and loads with the default host" {
+    var script = try zlua.Script.load(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .plugins_directory = "example-plugins",
+            .directory_name = "lua-hello",
+        },
+    );
+    defer script.deinit();
 }

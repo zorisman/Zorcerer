@@ -37,12 +37,11 @@
 //! The IServerPluginCallbacks method list below follows the Valve
 //! Developer Wiki (https://developer.valvesoftware.com/wiki/IServerPluginCallbacks)
 //! and the historical public/engine/iserverplugin.h header. The first
-//! nine methods (Load through LevelShutdown) have been stable across
-//! every version of this interface I could find and are implemented for
-//! real. Everything after that - the client/command callbacks added in
-//! later interface versions (ClientConnect, ClientCommand,
+//! nine methods (Load through LevelShutdown) and `ClientCommand` have been
+//! implemented for real. The other client/command callbacks added in later
+//! interface versions (ClientActive through ClientConnect,
 //! NetworkIDValidated, OnQueryCvarValueFinished, OnEdictAllocated/Freed,
-//! ...) - is backed by `genericStub`, a placeholder that safely ignores
+//! ...) are backed by `genericStub`, a placeholder that safely ignores
 //! whatever arguments it's called with and returns 0 (== false ==
 //! PLUGIN_CONTINUE == null, a safe default for all of them).
 //!
@@ -90,6 +89,7 @@ const fork = @import("ForkProcess.zig");
 const JsonRpc = @import("JsonRpc.zig");
 const GameQueries = @import("GameQueries.zig");
 const EngineCommands = @import("EngineCommands.zig");
+const EngineClients = @import("EngineClients.zig");
 const EngineFilesystem = @import("EngineFilesystem.zig");
 const Vsp = @import("Vsp.zig");
 
@@ -111,6 +111,7 @@ const plugin_vtable = Vsp.VTable{
     .levelInit = levelInit,
     .serverActivate = serverActivate,
     .levelShutdown = levelShutdown,
+    .clientCommand = clientCommand,
 };
 
 /// Stable storage for the slot array generated from `plugin_vtable`. It must
@@ -152,6 +153,17 @@ var engine_commands = EngineCommands.Binding{};
 const engine_command_handler = JsonRpc.CommandHandler{
     .context = &engine_commands,
     .handle = EngineCommands.Binding.handle,
+};
+
+/// Engine-side client-console printer. Bound in `load()` and cleared in
+/// `unload()`; the plugin-manager child reaches it only over IPC while a
+/// `ClientCommand` callback is active.
+var engine_clients = EngineClients.Binding{};
+
+/// Callback table `JsonRpc.jsonListener` uses to print messages to clients.
+const engine_client_print_handler = JsonRpc.ClientPrintHandler{
+    .context = &engine_clients,
+    .handle = EngineClients.Binding.handle,
 };
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
@@ -315,6 +327,7 @@ fn load(
     // lifetime.
     game_queries.setEngine(engine);
     engine_commands.bind(engine orelse return false);
+    engine_clients.bind(engine orelse return false);
     var cvar_version_buffer: [32]u8 = undefined;
     const cvar_version = std.fmt.bufPrintZ(
         &cvar_version_buffer,
@@ -351,6 +364,7 @@ fn load(
         game_query_handler,
         engine_file_handler,
         engine_command_handler,
+        engine_client_print_handler,
     ) catch |err| {
         if (err != error.PluginLoadFailed) {
             Log.logLine("[Zorcerer] plugin manager startup failed: {s}\n", .{@errorName(err)});
@@ -390,6 +404,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
             game_query_handler,
             engine_file_handler,
             engine_command_handler,
+            engine_client_print_handler,
         ) catch |err| {
             Log.logLine(
                 "[Zorcerer] plugin manager shutdown exchange failed: {s}\n",
@@ -409,6 +424,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
     plugin_manager.deinit();
     game_queries.clear();
     engine_commands.clear();
+    engine_clients.clear();
     engine = null;
     // The Log module keeps the captured sink: the engine interface stays
     // resident for the whole process lifetime, so it remains valid, and
@@ -450,6 +466,7 @@ fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
         game_query_handler,
         engine_file_handler,
         engine_command_handler,
+        engine_client_print_handler,
     ) catch |err| {
         Log.logLine(
             "[Zorcerer] handling the plugin manager's reply to {s} failed: {s}\n",
@@ -521,6 +538,31 @@ fn levelShutdown(this: *anyopaque) callconv(.c) void {
     Log.logLine("[Zorcerer] LevelShutdown\n", .{});
     game_queries.clearMap();
     sendManagerEvent(.levelShutdown, null);
+}
+
+/// VSP `ClientCommand` callback: forwards a player's console command to the
+/// plugin manager and replies to the client if a script printed something.
+///
+/// `entity` is the issuing player's edict and `args` is the engine's
+/// `CCommand`; both are borrowed for the duration of this call. The command
+/// text is copied into the event payload before the callback returns, so no
+/// engine pointer crosses the process boundary.
+///
+/// While the manager handles the event, `zostd.client_print()` can reach this
+/// process through `engine.clientPrint` and is printed to `entity`. Returning
+/// `PLUGIN_STOP` when that happened keeps the game DLL from processing the
+/// same command and printing an unknown-command message.
+fn clientCommand(
+    this: *anyopaque,
+    entity: *anyopaque,
+    args: *const Vsp.CCommand,
+) callconv(.c) c_int {
+    _ = this;
+    const command = args.commandText() orelse return Vsp.plugin_continue;
+
+    engine_clients.beginCommand(entity);
+    sendManagerEvent(.clientCommand, command);
+    return if (engine_clients.endCommand()) Vsp.plugin_stop else Vsp.plugin_continue;
 }
 
 pub export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {

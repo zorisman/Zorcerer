@@ -211,9 +211,14 @@ pub const Manager = struct {
     logger: ?abi.Logger = null,
 
     /// The child's end of the IPC channel to the engine process, captured by
-    /// setIpcLogger(). Null means game queries and `game://` filesystem
-    /// access are unavailable.
+    /// setIpcLogger(). Null means game queries, `game://` filesystem access,
+    /// and client messages are unavailable.
     ipc_fd: ?std.os.linux.fd_t = null,
+
+    /// Whether a `clientCommand` event is currently being dispatched. Set by
+    /// `listenForEvents` around the fan-out so `zostd.client_print()` can
+    /// reject calls made outside a client command.
+    client_command_active: bool = false,
 
     /// Per-plugin filesystem service, created by `loadPlugins()` and
     /// destroyed by `deinit()`.
@@ -1065,6 +1070,53 @@ pub const Manager = struct {
         if (!result.accepted) return error.CommandRejected;
     }
 
+    /// Marks the start of one `clientCommand` fan-out.
+    ///
+    /// The manager brackets event dispatch with this method and
+    /// `endClientCommand()` so Lua's `zostd.client_print()` can only target the
+    /// client whose command is being handled.
+    pub fn beginClientCommand(self: *@This()) void {
+        self.client_command_active = true;
+    }
+
+    /// Marks the end of one `clientCommand` fan-out.
+    ///
+    /// After this returns, `zostd.client_print()` fails until the next
+    /// `clientCommand` event.
+    pub fn endClientCommand(self: *@This()) void {
+        self.client_command_active = false;
+    }
+
+    /// Sends one console message to the client whose `clientCommand` is being
+    /// handled and waits for the engine's acknowledgement.
+    ///
+    /// `plugin_id` is advisory attribution for the Entrypoint's audit log. The
+    /// message is validated locally first, then validated again by the
+    /// Entrypoint, which is the actual trust boundary.
+    ///
+    /// Errors: `error.NoActiveClientCommand` when called outside a
+    /// `clientCommand` event; `Ipc.ClientPrintError` when the text is empty,
+    /// too long, contains a NUL byte, or spans multiple lines;
+    /// `error.ClientPrintUnavailable` when no IPC channel is configured;
+    /// `error.ClientPrintRejected` when the parent did not print the message;
+    /// plus the framing, JSON, and response errors of `Ipc.sendClientPrint`
+    /// and `Ipc.receiveClientPrintResult`.
+    pub fn executeClientPrint(
+        self: *@This(),
+        plugin_id: []const u8,
+        message: []const u8,
+    ) !void {
+        if (!self.client_command_active) return error.NoActiveClientCommand;
+        try Ipc.validateClientPrint(message);
+        const fd = self.ipc_fd orelse return error.ClientPrintUnavailable;
+        try Ipc.sendClientPrint(fd, .{
+            .message = message,
+            .plugin_id = plugin_id,
+        });
+        const result = try Ipc.receiveClientPrintResult(fd, self.allocator);
+        if (!result.printed) return error.ClientPrintRejected;
+    }
+
     /// Translates a query failure into an ABI status.
     fn queryStatus(err: anyerror) c_int {
         return switch (err) {
@@ -1416,7 +1468,10 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
         defer parsed.deinit();
 
         if (event_manager) |manager| {
+            const is_client_command = parsed.value.event == .clientCommand;
+            if (is_client_command) manager.beginClientCommand();
             manager.dispatchEvent(@tagName(parsed.value.event), parsed.value.payload);
+            if (is_client_command) manager.endClientCommand();
         }
 
         const request_id = parsed.id();

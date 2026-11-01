@@ -154,12 +154,14 @@ const MockHost = struct {
     written_path: std.ArrayList(u8) = .empty,
     written_data: std.ArrayList(u8) = .empty,
     command: std.ArrayList(u8) = .empty,
+    client_message: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *MockHost) void {
         self.log_buffer.deinit(self.allocator);
         self.written_path.deinit(self.allocator);
         self.written_data.deinit(self.allocator);
         self.command.deinit(self.allocator);
+        self.client_message.deinit(self.allocator);
     }
 
     fn log(context: ?*anyopaque, message: []const u8) void {
@@ -197,6 +199,11 @@ const MockHost = struct {
     fn serverCommand(context: ?*anyopaque, command: []const u8) !void {
         const self: *MockHost = @ptrCast(@alignCast(context.?));
         try self.command.appendSlice(self.allocator, command);
+    }
+
+    fn clientPrint(context: ?*anyopaque, message: []const u8) !void {
+        const self: *MockHost = @ptrCast(@alignCast(context.?));
+        try self.client_message.appendSlice(self.allocator, message);
     }
 
     /// Fills a fixed server snapshot for the `zostd.game` tests.
@@ -372,6 +379,7 @@ test "zostd host operations are callable from Lua" {
         .read_file = MockHost.readFile,
         .write_file = MockHost.writeFile,
         .server_command = MockHost.serverCommand,
+        .client_print = MockHost.clientPrint,
     });
     lua_runtime.openSafeLibs();
     lua_runtime.installZostd();
@@ -391,12 +399,14 @@ test "zostd host operations are callable from Lua" {
         \\
         \\assert(zostd.write_file("plugin://out.txt", "payload") == true)
         \\assert(zostd.server_command("say hello") == true)
+        \\assert(zostd.client_print("Pong!") == true)
     , "@zlua/zostd_host_test.lua");
 
     try std.testing.expectEqualStrings("hello from lua", host.log_buffer.items);
     try std.testing.expectEqualStrings("plugin://out.txt", host.written_path.items);
     try std.testing.expectEqualStrings("payload", host.written_data.items);
     try std.testing.expectEqualStrings("say hello", host.command.items);
+    try std.testing.expectEqualStrings("Pong!", host.client_message.items);
 }
 
 test "built-in plugin:// backend reads and writes inside the plugin root" {
@@ -496,6 +506,36 @@ test "zostd event callbacks receive event name and payload" {
         host.log_buffer.items,
         "zostd.on(custom) failed",
     ) != null);
+}
+
+test "clientCommand payload reaches Lua and client_print replies" {
+    var host = MockHost{ .allocator = std.testing.allocator };
+    defer host.deinit();
+
+    var lua_runtime = try Runtime.init(std.testing.allocator);
+    defer lua_runtime.deinit();
+
+    lua_runtime.setHost(.{
+        .context = &host,
+        .client_print = MockHost.clientPrint,
+    });
+    lua_runtime.openSafeLibs();
+    lua_runtime.installZostd();
+
+    try lua_runtime.run(
+        \\zostd.on("clientCommand", function(event, payload)
+        \\    local command = tostring(payload or ""):match("^%s*(.-)%s*$"):lower()
+        \\    if command == "zlua ping" then
+        \\        assert(zostd.client_print("Pong!") == true)
+        \\    end
+        \\end)
+    , "@zlua/zostd_client_command_test.lua");
+
+    lua_runtime.dispatchEvent("clientCommand", "zlua ping");
+    try std.testing.expectEqualStrings("Pong!", host.client_message.items);
+
+    lua_runtime.dispatchEvent("clientCommand", "zlua nope");
+    try std.testing.expectEqualStrings("Pong!", host.client_message.items);
 }
 
 test "runtime reports syntax and runtime errors on the Lua stack" {

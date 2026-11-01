@@ -6,17 +6,17 @@
 //! `zostd.types` table, which mirrors the value types declared in
 //! `src/zostd/types`. The second part is the host-facing function table
 //! (`version`, `log`, `plugin_id`, `read_file`, `write_file`,
-//! `server_command`, and `on`), together with the read-only `zostd.game`
-//! query table (`server_info`, `player_info`, `entity_exists`, `server_cvar`,
-//! and `client_cvar`).
+//! `server_command`, `client_print`, and `on`), together with the read-only
+//! `zostd.game` query table (`server_info`, `player_info`, `entity_exists`,
+//! `server_cvar`, and `client_cvar`).
 //!
 //! Host operations are supplied through `Host`. When a callback is absent the
 //! bridge uses conservative defaults: logging is dropped, the plugin id is the
 //! configured id (possibly empty), `plugin://` file access is resolved against
-//! the configured plugin root, and `server_command` is unavailable. The
-//! functions never raise a Lua error on invalid input; they return
-//! `(nil, error_message)` or a boolean instead, so no longjmp crosses a Zig
-//! callback frame.
+//! the configured plugin root, and `server_command`/`client_print` are
+//! unavailable. The functions never raise a Lua error on invalid input; they
+//! return `(nil, error_message)` or a boolean instead, so no longjmp crosses a
+//! Zig callback frame.
 
 const std = @import("std");
 const luajit = @import("luajit");
@@ -58,6 +58,11 @@ pub const Host = struct {
 
     /// Requests that the host execute one engine server command.
     server_command: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+
+    /// Prints one message in the console of the client whose command is
+    /// currently being handled. Outside a client-command callback the host
+    /// returns an error.
+    client_print: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
 
     /// Fills `out` with a server-state snapshot.
     server_info: ?*const fn (?*anyopaque, *GameServerInfo) c_int = null,
@@ -195,6 +200,7 @@ pub fn install(lua: *Lua, binding: *Binding) void {
     setFunction(lua, "read_file", binding, readFile);
     setFunction(lua, "write_file", binding, writeFile);
     setFunction(lua, "server_command", binding, serverCommand);
+    setFunction(lua, "client_print", binding, clientPrint);
     setFunction(lua, "on", binding, on);
 
     lua.pushLString("types");
@@ -642,6 +648,25 @@ fn serverCommand(lua: *Lua) callconv(.c) i32 {
         return fail(lua, "zostd.server_command is not configured");
     host_server_command(binding.host.context, command) catch |err|
         return failError(lua, "zostd.server_command", err);
+
+    lua.pushBoolean(true);
+    return 1;
+}
+
+/// Lua C function implementing `zostd.client_print(message)`.
+///
+/// Only valid during a `clientCommand` callback. Returns `true` on success or
+/// `(nil, error_message)` when the host rejected the message or no client
+/// command is active.
+fn clientPrint(lua: *Lua) callconv(.c) i32 {
+    const message = lua.toLString(1) catch
+        return fail(lua, "zostd.client_print expects a message string");
+    const binding = currentBinding(lua);
+
+    const host_client_print = binding.host.client_print orelse
+        return fail(lua, "zostd.client_print is not configured");
+    host_client_print(binding.host.context, message) catch |err|
+        return failError(lua, "zostd.client_print", err);
 
     lua.pushBoolean(true);
     return 1;

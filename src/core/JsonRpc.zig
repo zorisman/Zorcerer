@@ -169,6 +169,24 @@ pub const CommandHandler = struct {
     ) anyerror![]u8,
 };
 
+/// Answers client-console message requests sent by the plugin-manager child.
+///
+/// `handle` runs in the engine process, validates the message, prints it to the
+/// client whose `ClientCommand` callback is active, and returns a JSON document
+/// describing the result. The listener owns and frees that text after sending
+/// the response. An error means the message was not handed to the engine; the
+/// child receives a JSON-RPC error.
+pub const ClientPrintHandler = struct {
+    /// Opaque value passed back to `handle`; may be null.
+    context: ?*anyopaque,
+    /// Executes one client-print request and returns its JSON result text.
+    handle: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        request: Ipc.ClientPrintRequest,
+    ) anyerror![]u8,
+};
+
 /// Executes one engine command request and sends its JSON-RPC response.
 ///
 /// A null handler answers `MethodNotFound` instead of stalling the child.
@@ -219,15 +237,66 @@ fn handleCommand(
     try Ipc.sendResultResponse(socket, id, quoted);
 }
 
+/// Executes one client-print request and sends its JSON-RPC response.
+///
+/// A null handler answers `MethodNotFound` instead of stalling the child.
+/// Message validation failures answer `InvalidParams`; other handler failures
+/// answer `InternalError` with the error name. Notifications (requests without
+/// an ID) are executed without a reply, as JSON-RPC requires.
+///
+/// Errors are the allocation and framing errors from message composition and
+/// `Ipc.writeFrame`.
+fn handleClientPrint(
+    socket: std.os.linux.fd_t,
+    request: Ipc.ClientPrintRequest,
+    id: zjr.RpcId,
+    handler: ?ClientPrintHandler,
+) !void {
+    const allocator = std.heap.page_allocator;
+
+    const active_handler = handler orelse {
+        if (!id.isNotification()) {
+            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Client prints are not available");
+        }
+        return;
+    };
+
+    const result_text = active_handler.handle(active_handler.context, allocator, request) catch |err| {
+        if (!id.isNotification()) {
+            switch (err) {
+                error.EmptyClientPrint,
+                error.ClientPrintTooLong,
+                error.EmbeddedNul,
+                error.MultilineClientPrint,
+                error.ControlCharacter,
+                => try Ipc.sendErrorResponse(socket, id, .InvalidParams, @errorName(err)),
+                else => try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err)),
+            }
+        }
+        return;
+    };
+    defer allocator.free(result_text);
+
+    if (id.isNotification()) return;
+
+    // Client-print results are typed JSON documents; transmitting them as a
+    // JSON string keeps every response result a string, like command
+    // responses.
+    const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
+    defer allocator.free(quoted);
+    try Ipc.sendResultResponse(socket, id, quoted);
+}
+
 /// Listener for the manager's messages: reads framed JSON-RPC messages from
 /// `socket` until the expected response or readiness arrives.
 ///
 /// Notifications (`.stderr` log lines and `.ready`) are executed without a
 /// reply, so child logging cannot terminate the listener or satisfy a pending
-/// event exchange. Child game queries, filesystem requests, and engine
-/// commands are executed through `query_handler`, `file_handler`, and
-/// `command_handler` while the listener keeps waiting for its own response.
-/// Responses are matched against `expected_response_id`.
+/// event exchange. Child game queries, filesystem requests, engine commands,
+/// and client prints are executed through `query_handler`, `file_handler`,
+/// `command_handler`, and `client_print_handler` while the listener keeps
+/// waiting for its own response. Responses are matched against
+/// `expected_response_id`.
 ///
 /// `expected_response_id` is null while waiting for readiness: the listener
 /// returns after a successful `.ready` and fails with `error.PluginLoadFailed`
@@ -240,7 +309,7 @@ fn handleCommand(
 /// `error.EmptyMessage` for a zero-length payload, `error.UnexpectedResponseId`
 /// for a response that does not match a pending event, the framing errors of
 /// `Ipc.readFrame`, the JSON errors of `Ipc.parseQuery`,
-/// `Ipc.parseFileRequest`, `Ipc.parseServerCommand`,
+/// `Ipc.parseFileRequest`, `Ipc.parseServerCommand`, `Ipc.parseClientPrint`,
 /// `Ipc.parseRequest`/`Ipc.parseResponse`, and the response-shape errors of
 /// `handleResponse`.
 pub fn jsonListener(
@@ -249,6 +318,7 @@ pub fn jsonListener(
     query_handler: ?QueryHandler,
     file_handler: ?FileHandler,
     command_handler: ?CommandHandler,
+    client_print_handler: ?ClientPrintHandler,
 ) !void {
     const allocator = std.heap.page_allocator;
 
@@ -283,6 +353,22 @@ pub fn jsonListener(
             continue;
         } else |err| switch (err) {
             // Not a command request: fall through to operation/response
+            // handling.
+            error.UnknownMethod, error.NotRpcRequest => {},
+            else => return err,
+        }
+
+        if (Ipc.parseClientPrint(allocator, frame.text())) |client_print| {
+            defer client_print.deinit();
+            try handleClientPrint(
+                socket,
+                client_print.value,
+                client_print.id(),
+                client_print_handler,
+            );
+            continue;
+        } else |err| switch (err) {
+            // Not a client-print request: fall through to operation/response
             // handling.
             error.UnknownMethod, error.NotRpcRequest => {},
             else => return err,
