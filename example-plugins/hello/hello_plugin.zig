@@ -13,10 +13,11 @@
 //!
 //! On load(), the plugin creates/overwrites `plugin://hello.txt` with a
 //! report that lists the non-directory entries of `game://materials`, one
-//! name per line. On unload(), it deletes that same file. Both operations
-//! go through the host filesystem API in src/io/file_system.zig, which
-//! routes `plugin://` URIs to std.Io and `game://` URIs to the Source
-//! Engine filesystem.
+//! name per line. It then logs a one-line server snapshot through the
+//! read-only game-query capability when the host provides one. On unload(), it
+//! deletes that same file. Both file operations go through the host filesystem
+//! API in src/io/file_system.zig, which routes `plugin://` URIs to std.Io and
+//! `game://` URIs to the Source Engine filesystem.
 //!
 //! The plugin still derives its own roots because PluginContext carries no
 //! root directories yet: the manager treats its working directory as the
@@ -145,6 +146,47 @@ fn consolePrint(ctx: *abi.PluginContext, message: [:0]const u8) void {
     }
 }
 
+/// Logs a one-line server snapshot through the read-only game-query
+/// capability.
+///
+/// Does nothing when the host does not provide `ctx.game`. Query failures are
+/// logged rather than propagated: the example must keep loading on a host
+/// without an engine channel.
+fn logServerInfo(ctx: *abi.PluginContext) void {
+    const game = ctx.game orelse return;
+    if (game.struct_size < @sizeOf(abi.GameApi)) return;
+
+    var info: abi.ServerInfo = std.mem.zeroes(abi.ServerInfo);
+    info.struct_size = @sizeOf(abi.ServerInfo);
+    const status = game.server_info(game.context, &info);
+    if (status != abi.query_ok and status != abi.query_truncated) {
+        var error_buffer: [128]u8 = undefined;
+        const error_message = std.fmt.bufPrintZ(
+            &error_buffer,
+            "hello_plugin: server info unavailable (query status {d})\n",
+            .{status},
+        ) catch return;
+        consolePrint(ctx, error_message);
+        return;
+    }
+
+    const map_length = @min(info.map_name_len, info.map_name.len);
+    const dir_length = @min(info.game_dir_len, info.game_dir.len);
+    var message_buffer: [512]u8 = undefined;
+    const message = std.fmt.bufPrintZ(
+        &message_buffer,
+        "hello_plugin: map {s}, {d} entities, {s} mode, {d}s uptime, game dir {s}\n",
+        .{
+            info.map_name[0..map_length],
+            info.entity_count,
+            if (info.dedicated != 0) "dedicated" else "listen",
+            info.server_time,
+            info.game_dir[0..dir_length],
+        },
+    ) catch return;
+    consolePrint(ctx, message);
+}
+
 export fn load(ctx: *abi.PluginContext) callconv(.c) c_int {
     if (ctx.abi_version != abi.abi_version or
         ctx.struct_size < @sizeOf(abi.PluginContext))
@@ -170,6 +212,7 @@ export fn load(ctx: *abi.PluginContext) callconv(.c) c_int {
         std.debug.print("hello_plugin: could not write {s} ({s})\n", .{ report_uri, @errorName(err) });
         return 1;
     };
+    logServerInfo(ctx);
 
     var message_buffer: [256]u8 = undefined;
     const message = std.fmt.bufPrintZ(

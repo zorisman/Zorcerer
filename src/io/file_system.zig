@@ -1536,6 +1536,7 @@ fn mockContext() abi.PluginContext {
             .author = abi.Text.fromSlice("Zorcerer"),
             .library_path = abi.Text.fromSlice("./hello_plugin.so"),
         },
+        .game = null,
     };
 }
 

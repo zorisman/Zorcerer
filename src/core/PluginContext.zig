@@ -118,6 +118,11 @@ pub const PluginContext = extern struct {
     logger: ?*const Logger,
     /// Identity and manifest data of the plugin receiving this context.
     plugin: PluginInfo,
+    /// Read-only game-state queries, or null when the host has no IPC channel
+    /// to the engine process (for example in unit tests). Added after version
+    /// 2 without changing `abi_version`; old plugins ignore it via
+    /// `struct_size`.
+    game: ?*const GameApi,
 };
 
 /// Plugin's `load` export.
@@ -159,3 +164,148 @@ pub const Event = extern struct {
 /// value should be `plugin_continue`; any other value stops delivery to the
 /// remaining plugins (see `plugin_stop`).
 pub const OnEventFn = *const fn (ctx: *PluginContext, event: *const Event) callconv(.c) c_int;
+
+// --- Game queries -----------------------------------------------------------
+
+/// Status returned by a `GameApi` query: the query succeeded.
+pub const query_ok: c_int = 0;
+/// Status returned when the host has no engine channel or interface for the
+/// query (for example before `load()` finished or after `unload()`).
+pub const query_unavailable: c_int = 1;
+/// Status returned when the host could not complete the query because the
+/// transport to the engine process failed. The output is left unspecified.
+pub const query_transport_error: c_int = 2;
+/// Status returned when the query succeeded but a text value did not fit its
+/// fixed-size output buffer. The stored length still reports the full value
+/// length, so the plugin can detect truncation and retry with its own buffer.
+pub const query_truncated: c_int = 3;
+
+/// Capacity of every text field in the game-query output structs. It matches
+/// the Source engine's `MAX_PATH`, which bounds engine-returned directory,
+/// map, name, and cvar strings used by these queries.
+pub const query_text_capacity: usize = 260;
+
+/// Result of `GameApi.server_info`: a read-only snapshot of server state.
+///
+/// The caller must set `struct_size` to `@sizeOf(ServerInfo)` before the call.
+/// Text fields are not zero-terminated; their `*_len` field reports the full
+/// value length, which may exceed the array capacity when the query returned
+/// `query_truncated`.
+pub const ServerInfo = extern struct {
+    /// Size of this struct in bytes as provided by the plugin.
+    struct_size: usize,
+    /// Nonzero when the engine is a dedicated server.
+    dedicated: u8,
+    /// Nonzero when the server is paused.
+    paused: u8,
+    /// Reserved padding; must be zero.
+    reserved: [2]u8,
+    /// Number of entity slots the engine reports in use.
+    entity_count: c_int,
+    /// Engine build number (`IVEngineServer::GetServerVersion`).
+    server_version: c_int,
+    /// Seconds since server start (`IVEngineServer::GetServerTime`).
+    server_time: f32,
+    /// Full length of `game_dir`, including bytes not stored.
+    game_dir_len: usize,
+    /// The game/mod directory, for example `tf`.
+    game_dir: [query_text_capacity]u8,
+    /// Full length of `map_name`, including bytes not stored. Zero outside an
+    /// active level.
+    map_name_len: usize,
+    /// Current map name, cached from `levelInit`.
+    map_name: [query_text_capacity]u8,
+};
+
+/// Result of `GameApi.player_info`: engine-side identity of one client.
+///
+/// The caller must set `struct_size` before the call. When `present` is zero
+/// the player slot is empty and the remaining fields are zeroed.
+pub const PlayerInfo = extern struct {
+    /// Size of this struct in bytes as provided by the plugin.
+    struct_size: usize,
+    /// Nonzero when the engine returned info for the requested slot.
+    present: u8,
+    /// Nonzero when the client is a bot.
+    fake_player: u8,
+    /// Nonzero when the client is an HLTV proxy.
+    is_hltv: u8,
+    /// Reserved padding; must be zero.
+    reserved: u8,
+    /// Entity index the caller requested.
+    index: c_int,
+    /// Server-assigned user id.
+    user_id: c_int,
+    /// Steam friends id.
+    friends_id: u32,
+    /// Full length of `name`, including bytes not stored.
+    name_len: usize,
+    /// Player display name.
+    name: [query_text_capacity]u8,
+    /// Full length of `guid`, including bytes not stored.
+    guid_len: usize,
+    /// Steam id string.
+    guid: [query_text_capacity]u8,
+    /// Full length of `friends_name`, including bytes not stored.
+    friends_name_len: usize,
+    /// Steam friends name.
+    friends_name: [query_text_capacity]u8,
+};
+
+/// Result of `GameApi.entity_exists`: whether an entity index is in use.
+pub const EntityInfo = extern struct {
+    /// Size of this struct in bytes as provided by the plugin.
+    struct_size: usize,
+    /// Nonzero when the engine has an entity at the requested index.
+    exists: u8,
+    /// Reserved padding; must be zero.
+    reserved: [7]u8,
+};
+
+/// Result of `GameApi.server_cvar` and `GameApi.client_cvar`.
+///
+/// The caller must set `struct_size` before the call. `found == 0` means no
+/// such cvar exists (server query) or the client is not connected (client
+/// query); the remaining fields are zeroed.
+pub const CvarValue = extern struct {
+    /// Size of this struct in bytes as provided by the plugin.
+    struct_size: usize,
+    /// Nonzero when the cvar was found.
+    found: u8,
+    /// Reserved padding; must be zero.
+    reserved: [3]u8,
+    /// Integer representation of the cvar value.
+    int_value: c_int,
+    /// Floating-point representation of the cvar value.
+    float_value: f32,
+    /// Full length of `text`, including bytes not stored.
+    text_len: usize,
+    /// String representation of the cvar value.
+    text: [query_text_capacity]u8,
+};
+
+/// Read-only, synchronous access to game state, called from plugin code.
+///
+/// Every function returns one of the `query_*` status values. They are
+/// synchronous: the manager forwards the query to the engine process over the
+/// IPC channel and blocks until the answer arrives. The engine-forked child
+/// never dereferences an engine pointer itself.
+///
+/// Lifetime: `context` is owned by the host; `struct_size` follows the same
+/// append-only rule as `PluginContext`.
+pub const GameApi = extern struct {
+    /// Size of this struct in bytes as provided by the host.
+    struct_size: usize,
+    /// Opaque host context; pass back unchanged.
+    context: ?*anyopaque,
+    /// Fills `out` with a server-state snapshot.
+    server_info: *const fn (context: ?*anyopaque, out: *ServerInfo) callconv(.c) c_int,
+    /// Fills `out` with the identity of the player at entity index `index`.
+    player_info: *const fn (context: ?*anyopaque, index: c_int, out: *PlayerInfo) callconv(.c) c_int,
+    /// Fills `out` with whether entity index `index` is in use.
+    entity_info: *const fn (context: ?*anyopaque, index: c_int, out: *EntityInfo) callconv(.c) c_int,
+    /// Fills `out` with the server cvar named `name`.
+    server_cvar: *const fn (context: ?*anyopaque, name: Text, out: *CvarValue) callconv(.c) c_int,
+    /// Fills `out` with client `index`'s cvar named `name`.
+    client_cvar: *const fn (context: ?*anyopaque, index: c_int, name: Text, out: *CvarValue) callconv(.c) c_int,
+};

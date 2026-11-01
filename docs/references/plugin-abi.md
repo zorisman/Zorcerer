@@ -1,6 +1,6 @@
 # ## Bottom line
 
-**The native plugin ABI is currently `load()` + `unload()` + an optional `onEvent()` hook + a logger + plugin identity (ABI version 2) — enough to open a `.so`, identify it, and deliver the five implemented runtime events.**
+**The native plugin ABI is currently `load()` + `unload()` + an optional `onEvent()` hook + a logger + plugin identity + an optional read-only game-query table (ABI version 2) — enough to open a `.so`, identify it, deliver the five implemented runtime events, and read server/player/entity/cvar state through the parent process.**
 
 - More ABI **surface** is needed: host-mediated engine access, file/service access, and additional event sites.
 - More exported **symbols** are not necessarily needed. Keeping `load`/`unload` as the only required exports, adding optional `onEvent`, and growing the versioned `PluginContext` contract is the cleaner direction.
@@ -80,9 +80,17 @@ the path, then notifies and tears down Lua scripts.
 The ABI itself is in `src/core/PluginContext.zig` (version 2):
 
 ```zig
-PluginContext { abi_version, struct_size, logger, plugin: PluginInfo }
+PluginContext { abi_version, struct_size, logger, plugin: PluginInfo, game: ?*const GameApi }
 PluginInfo { id, name, version, author, library_path }  // Text = ptr + len
 Event { struct_size, name: Text, payload: Text }        // borrowed for one call
+GameApi {
+    struct_size, context,
+    server_info(ctx, *ServerInfo) -> status,
+    player_info(ctx, index, *PlayerInfo) -> status,
+    entity_info(ctx, index, *EntityInfo) -> status,
+    server_cvar(ctx, name: Text, *CvarValue) -> status,
+    client_cvar(ctx, index, name: Text, *CvarValue) -> status,
+}
 load(ctx: *PluginContext) -> int
 unload(ctx: *PluginContext) -> int
 onEvent(ctx: *PluginContext, event: *const Event) -> int   // optional
@@ -92,6 +100,35 @@ Context strings borrow the manager's validated manifest and stay valid until
 after `unload()`. Plugins must check `abi_version` and `struct_size` before
 reading the remaining fields. `payload` is JSON text or empty; `onEvent`
 returns `0` (`PLUGIN_CONTINUE`) to keep event delivery going.
+
+`game` is appended after `PluginInfo`: the ABI version stays `2`, and an old
+plugin that only reads the fields it knows about is unaffected because
+`struct_size` is the outer bound. The manager exposes `game` only when an IPC
+channel to the engine process exists.
+
+### Game-query status and truncation
+
+Every `GameApi` function returns one of these `c_int` statuses:
+
+| Status | Value | Meaning |
+|---|---|---|
+| `query_ok` | 0 | Query succeeded; output is complete. |
+| `query_unavailable` | 1 | No IPC channel, engine interface, or cvar interface, or `out.struct_size` is too small. |
+| `query_transport_error` | 2 | The query could not be answered (framing, JSON, or protocol failure). Output is unspecified. |
+| `query_truncated` | 3 | Query succeeded but a text value exceeded its fixed buffer. |
+
+The caller sets `out.struct_size = @sizeOf(T)` before each call. Text fields
+are not zero-terminated. Each `*_len` field reports the full value length, even
+when `query_truncated` means only the first `query_text_capacity` (260) bytes
+were stored; a plugin can compare `len` with the array capacity to detect the
+loss. `present`/`exists`/`found` distinguish an empty result from an error.
+
+Queries are synchronous and read-only: the forked child sends a JSON-RPC
+request over the existing IPC socket, the engine-process listener answers it,
+and the caller blocks until the answer arrives. There is no timeout, matching
+the existing synchronous event exchange; a stalled engine process stalls the
+caller. Queries work during `load()` (the parent is waiting for readiness) and
+during event delivery (the parent is waiting for the event response).
 
 ---
 
@@ -106,7 +143,8 @@ returns `0` (`PLUGIN_CONTINUE`) to keep event delivery going.
 | GameFrame | **no** | **no** |
 | Client callbacks | **no** | **no** |
 | Plugin id / manifest data | id, name, version, author, library path | id and root only |
-| Engine commands / cvars / game FS | **no** | `server_command` exists but is not wired by the manager |
+| Read-only game queries | `ctx.game`: server info, player info, entity existence, server/client cvar reads | `zostd.game.*` |
+| Engine commands / write access / game FS | **no** | `server_command` exists but is not wired by the manager |
 | IPC/event payloads | JSON text for `levelInit`/`serverActivate` | same payload string |
 
 `Manager.dispatchEvent()` delivers each engine event to Lua scripts first and
@@ -150,8 +188,13 @@ action, because these events are post-action notifications.
    inside `PluginContext`. Root directories are not part of the context yet;
    the example plugin still derives them locally.
 
-3. **Host-mediated engine operations — required for real plugins.**
-   Add function pointers for operations such as `server_command`, cvar get/set, `game://` file access, and controlled interface queries. These must go through the parent Entrypoint over IPC and be allowlisted there; the child must never dereference inherited engine vtables.
+3. **Host-mediated engine operations — partially implemented.**
+   Read-only game queries are available through `PluginContext.game`: server
+   info, player info, entity existence, and server/client cvar reads. They run
+   in the engine process and are answered over IPC; the child never
+   dereferences inherited engine vtables. Operations such as `server_command`,
+   cvar *writes*, and `game://` file access are still absent and would follow
+   the same allowlisted parent-side path.
 
 4. **ABI version/size negotiation — implemented.**
    `PluginContext` now starts with `abi_version` and `struct_size`. New fields
@@ -174,7 +217,7 @@ action, because these events are post-action notifications.
 
 ### Suggested priority
 
-**P0:** host-mediated engine calls. Native event delivery, plugin identity/config, and ABI size/version negotiation are implemented in ABI version 2.
+**P0:** host-mediated engine calls. Native event delivery, plugin identity/config, read-only game queries, and ABI size/version negotiation are implemented in ABI version 2.
 
 **P1:** real `GameFrame`/client VSP callbacks, richer IPC payloads, per-plugin permissions/allowlists, dependency ordering.
 

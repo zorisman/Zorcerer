@@ -145,6 +145,7 @@ fn testContext() abi.PluginContext {
             .author = abi.Text.fromSlice("Zorcerer"),
             .library_path = abi.Text.fromSlice("./fixture.so"),
         },
+        .game = null,
     };
 }
 

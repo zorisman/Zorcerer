@@ -203,6 +203,23 @@ pub const Manager = struct {
     /// handed to every plugin inside its PluginContext. Null until setLogger().
     logger: ?abi.Logger = null,
 
+    /// The child's end of the IPC channel to the engine process, captured by
+    /// setIpcLogger(). Null means game queries are unavailable.
+    ipc_fd: ?std.os.linux.fd_t = null,
+
+    /// ABI table handed to plugins through `PluginContext.game` when
+    /// `ipc_fd` is set. `context` is filled with this manager's address in
+    /// `buildContext()`.
+    game_api: abi.GameApi = .{
+        .struct_size = @sizeOf(abi.GameApi),
+        .context = null,
+        .server_info = gameServerInfo,
+        .player_info = gamePlayerInfo,
+        .entity_info = gameEntityInfo,
+        .server_cvar = gameServerCvar,
+        .client_cvar = gameClientCvar,
+    },
+
     /// Optional in-process observer for manager lifecycle events.
     /// When null, events are logged through the manager's logger.
     manager_listener: ?ManagerListener = null,
@@ -414,6 +431,7 @@ pub const Manager = struct {
     pub fn setIpcLogger(self: *@This(), fd: std.os.linux.fd_t) void {
         Log.setupIpc(fd);
         self.logger = .{ .context = self, .print = Log.pluginPrint };
+        self.ipc_fd = fd;
     }
 
     /// Installs the in-process observer for manager lifecycle events.
@@ -436,6 +454,7 @@ pub const Manager = struct {
         self: *@This(),
         configuration: *const PluginConfiguration,
     ) abi.PluginContext {
+        self.game_api.context = self;
         return .{
             .abi_version = abi.abi_version,
             .struct_size = @sizeOf(abi.PluginContext),
@@ -447,6 +466,7 @@ pub const Manager = struct {
                 .author = abi.Text.fromSlice(configuration.author),
                 .library_path = abi.Text.fromSlice(configuration.path),
             },
+            .game = if (self.ipc_fd != null) &self.game_api else null,
         };
     }
 
@@ -917,7 +937,15 @@ pub const Manager = struct {
         // moved into the manager's LuaScript entry on success.
         runtime.setPluginId(plugin_id);
         runtime.setPluginRoot(plugin_root);
-        runtime.setHost(.{ .context = self, .log = luaLog });
+        runtime.setHost(.{
+            .context = self,
+            .log = luaLog,
+            .server_info = luaGameServerInfo,
+            .player_info = luaGamePlayerInfo,
+            .entity_exists = luaGameEntityExists,
+            .server_cvar = luaGameServerCvar,
+            .client_cvar = luaGameClientCvar,
+        });
         runtime.openSafeLibs();
         runtime.installZostd();
 
@@ -995,7 +1023,242 @@ pub const Manager = struct {
     fn dispatchToPlugins(self: *@This(), event: []const u8, payload: ?[]const u8) void {
         dispatchEventToPlugins(self.plugins.items, event, payload);
     }
+
+    /// Sends one query over the IPC channel and returns the result document.
+    ///
+    /// The returned text is allocated with the manager's allocator and owned
+    /// by the caller. The exchange is synchronous: the parent answers while it
+    /// is already waiting for readiness or an event response.
+    ///
+    /// Errors: `error.QueryUnavailable` when no IPC channel is configured,
+    /// plus the framing, JSON, and response errors of `Ipc.sendQuery` and
+    /// `Ipc.receiveQueryResult`.
+    fn fetchQuery(self: *@This(), request: Ipc.QueryRequest) ![]u8 {
+        const fd = self.ipc_fd orelse return error.QueryUnavailable;
+        try Ipc.sendQuery(fd, request);
+        return Ipc.receiveQueryResult(fd, self.allocator);
+    }
+
+    /// Translates a query failure into an ABI status.
+    fn queryStatus(err: anyerror) c_int {
+        return switch (err) {
+            error.QueryUnavailable => abi.query_unavailable,
+            else => abi.query_transport_error,
+        };
+    }
+
+    /// Executes the `server_info` query into `out`.
+    fn queryServerInfo(self: *@This(), out: *abi.ServerInfo) c_int {
+        const text = self.fetchQuery(.{ .query = .server_info }) catch |err|
+            return queryStatus(err);
+        defer self.allocator.free(text);
+
+        var parsed = std.json.parseFromSlice(
+            Ipc.ServerInfo,
+            self.allocator,
+            text,
+            .{},
+        ) catch return abi.query_transport_error;
+        defer parsed.deinit();
+
+        out.* = std.mem.zeroes(abi.ServerInfo);
+        out.struct_size = @sizeOf(abi.ServerInfo);
+        out.dedicated = @intFromBool(parsed.value.dedicated);
+        out.paused = @intFromBool(parsed.value.paused);
+        out.entity_count = parsed.value.entity_count;
+        out.server_version = parsed.value.server_version;
+        out.server_time = parsed.value.server_time;
+
+        var truncated = false;
+        const game_dir = storeText(&out.game_dir, parsed.value.game_dir);
+        out.game_dir_len = game_dir.len;
+        truncated = truncated or game_dir.truncated;
+
+        const map_name = storeText(&out.map_name, parsed.value.map_name);
+        out.map_name_len = map_name.len;
+        truncated = truncated or map_name.truncated;
+
+        return if (truncated) abi.query_truncated else abi.query_ok;
+    }
+
+    /// Executes the `player_info` query for `index` into `out`.
+    fn queryPlayerInfo(self: *@This(), index: c_int, out: *abi.PlayerInfo) c_int {
+        const text = self.fetchQuery(.{ .query = .player_info, .index = index }) catch |err|
+            return queryStatus(err);
+        defer self.allocator.free(text);
+
+        var parsed = std.json.parseFromSlice(
+            Ipc.PlayerInfo,
+            self.allocator,
+            text,
+            .{},
+        ) catch return abi.query_transport_error;
+        defer parsed.deinit();
+
+        out.* = std.mem.zeroes(abi.PlayerInfo);
+        out.struct_size = @sizeOf(abi.PlayerInfo);
+        out.index = parsed.value.index;
+        out.present = @intFromBool(parsed.value.present);
+        if (!parsed.value.present) return abi.query_ok;
+
+        out.user_id = parsed.value.user_id;
+        out.friends_id = parsed.value.friends_id;
+        out.fake_player = @intFromBool(parsed.value.fake_player);
+        out.is_hltv = @intFromBool(parsed.value.is_hltv);
+
+        var truncated = false;
+        const name = storeText(&out.name, parsed.value.name);
+        out.name_len = name.len;
+        truncated = truncated or name.truncated;
+
+        const guid = storeText(&out.guid, parsed.value.guid);
+        out.guid_len = guid.len;
+        truncated = truncated or guid.truncated;
+
+        const friends_name = storeText(&out.friends_name, parsed.value.friends_name);
+        out.friends_name_len = friends_name.len;
+        truncated = truncated or friends_name.truncated;
+
+        return if (truncated) abi.query_truncated else abi.query_ok;
+    }
+
+    /// Executes the `entity_exists` query for `index` into `out`.
+    fn queryEntityInfo(self: *@This(), index: c_int, out: *abi.EntityInfo) c_int {
+        const text = self.fetchQuery(.{ .query = .entity_exists, .index = index }) catch |err|
+            return queryStatus(err);
+        defer self.allocator.free(text);
+
+        var parsed = std.json.parseFromSlice(
+            Ipc.EntityInfo,
+            self.allocator,
+            text,
+            .{},
+        ) catch return abi.query_transport_error;
+        defer parsed.deinit();
+
+        out.* = std.mem.zeroes(abi.EntityInfo);
+        out.struct_size = @sizeOf(abi.EntityInfo);
+        out.exists = @intFromBool(parsed.value.exists);
+        return abi.query_ok;
+    }
+
+    /// Executes the `server_cvar` query for `name` into `out`.
+    fn queryServerCvar(self: *@This(), name: []const u8, out: *abi.CvarValue) c_int {
+        const text = self.fetchQuery(.{ .query = .server_cvar, .name = name }) catch |err|
+            return queryStatus(err);
+        defer self.allocator.free(text);
+
+        var parsed = std.json.parseFromSlice(
+            Ipc.CvarValue,
+            self.allocator,
+            text,
+            .{},
+        ) catch return abi.query_transport_error;
+        defer parsed.deinit();
+
+        return fillCvarValue(parsed.value, out);
+    }
+
+    /// Executes the `client_cvar` query for client `index` into `out`.
+    fn queryClientCvar(
+        self: *@This(),
+        index: c_int,
+        name: []const u8,
+        out: *abi.CvarValue,
+    ) c_int {
+        const text = self.fetchQuery(.{
+            .query = .client_cvar,
+            .index = index,
+            .name = name,
+        }) catch |err| return queryStatus(err);
+        defer self.allocator.free(text);
+
+        var parsed = std.json.parseFromSlice(
+            Ipc.CvarValue,
+            self.allocator,
+            text,
+            .{},
+        ) catch return abi.query_transport_error;
+        defer parsed.deinit();
+
+        return fillCvarValue(parsed.value, out);
+    }
 };
+
+/// Copies `source` into `destination`.
+///
+/// Returns the full source length, which callers store so a plugin can detect
+/// truncation, and whether any bytes were dropped.
+fn storeText(destination: []u8, source: []const u8) struct { len: usize, truncated: bool } {
+    const stored = @min(destination.len, source.len);
+    @memcpy(destination[0..stored], source[0..stored]);
+    return .{ .len = source.len, .truncated = source.len > destination.len };
+}
+
+/// Fills an ABI cvar result from its JSON form.
+fn fillCvarValue(value: Ipc.CvarValue, out: *abi.CvarValue) c_int {
+    out.* = std.mem.zeroes(abi.CvarValue);
+    out.struct_size = @sizeOf(abi.CvarValue);
+    out.found = @intFromBool(value.found);
+    out.int_value = value.int_value;
+    out.float_value = value.float_value;
+
+    const text = storeText(&out.text, value.text);
+    out.text_len = text.len;
+    return if (text.truncated) abi.query_truncated else abi.query_ok;
+}
+
+/// `GameApi.server_info` implementation handed to native plugins.
+fn gameServerInfo(context: ?*anyopaque, out: *abi.ServerInfo) callconv(.c) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    if (out.struct_size < @sizeOf(abi.ServerInfo)) return abi.query_unavailable;
+    return self.queryServerInfo(out);
+}
+
+/// `GameApi.player_info` implementation handed to native plugins.
+fn gamePlayerInfo(
+    context: ?*anyopaque,
+    index: c_int,
+    out: *abi.PlayerInfo,
+) callconv(.c) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    if (out.struct_size < @sizeOf(abi.PlayerInfo)) return abi.query_unavailable;
+    return self.queryPlayerInfo(index, out);
+}
+
+/// `GameApi.entity_info` implementation handed to native plugins.
+fn gameEntityInfo(
+    context: ?*anyopaque,
+    index: c_int,
+    out: *abi.EntityInfo,
+) callconv(.c) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    if (out.struct_size < @sizeOf(abi.EntityInfo)) return abi.query_unavailable;
+    return self.queryEntityInfo(index, out);
+}
+
+/// `GameApi.server_cvar` implementation handed to native plugins.
+fn gameServerCvar(
+    context: ?*anyopaque,
+    name: abi.Text,
+    out: *abi.CvarValue,
+) callconv(.c) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    if (out.struct_size < @sizeOf(abi.CvarValue)) return abi.query_unavailable;
+    return self.queryServerCvar(name.slice(), out);
+}
+
+/// `GameApi.client_cvar` implementation handed to native plugins.
+fn gameClientCvar(
+    context: ?*anyopaque,
+    index: c_int,
+    name: abi.Text,
+    out: *abi.CvarValue,
+) callconv(.c) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    if (out.struct_size < @sizeOf(abi.CvarValue)) return abi.query_unavailable;
+    return self.queryClientCvar(index, name.slice(), out);
+}
 
 /// Delivers one event to the initialized plugins in `plugins`, in slice order.
 ///
@@ -1041,6 +1304,114 @@ var event_manager: ?*Manager = null;
 fn luaLog(context: ?*anyopaque, message: []const u8) void {
     _ = context;
     Log.logLine("[zlua] {s}\n", .{message});
+}
+
+/// Forwards `zostd.game.server_info()` from a Lua script to the query client.
+fn luaGameServerInfo(context: ?*anyopaque, out: *zlua.zostd.GameServerInfo) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    var info = std.mem.zeroes(abi.ServerInfo);
+    info.struct_size = @sizeOf(abi.ServerInfo);
+
+    const status = self.queryServerInfo(&info);
+    if (status != abi.query_ok and status != abi.query_truncated) return status;
+
+    out.dedicated = info.dedicated != 0;
+    out.paused = info.paused != 0;
+    out.entity_count = info.entity_count;
+    out.server_version = info.server_version;
+    out.server_time = info.server_time;
+    out.game_dir_len = info.game_dir_len;
+    @memcpy(&out.game_dir, &info.game_dir);
+    out.map_name_len = info.map_name_len;
+    @memcpy(&out.map_name, &info.map_name);
+    return status;
+}
+
+/// Forwards `zostd.game.player_info()` from a Lua script to the query client.
+fn luaGamePlayerInfo(
+    context: ?*anyopaque,
+    index: c_int,
+    out: *zlua.zostd.GamePlayerInfo,
+) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    var info = std.mem.zeroes(abi.PlayerInfo);
+    info.struct_size = @sizeOf(abi.PlayerInfo);
+
+    const status = self.queryPlayerInfo(index, &info);
+    if (status != abi.query_ok and status != abi.query_truncated) return status;
+
+    out.* = std.mem.zeroes(zlua.zostd.GamePlayerInfo);
+    out.present = info.present != 0;
+    out.index = info.index;
+    out.user_id = info.user_id;
+    out.friends_id = info.friends_id;
+    out.fake_player = info.fake_player != 0;
+    out.is_hltv = info.is_hltv != 0;
+    out.name_len = info.name_len;
+    @memcpy(&out.name, &info.name);
+    out.guid_len = info.guid_len;
+    @memcpy(&out.guid, &info.guid);
+    out.friends_name_len = info.friends_name_len;
+    @memcpy(&out.friends_name, &info.friends_name);
+    return status;
+}
+
+/// Forwards `zostd.game.entity_exists()` from a Lua script to the query client.
+fn luaGameEntityExists(context: ?*anyopaque, index: c_int, out: *bool) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    var info = std.mem.zeroes(abi.EntityInfo);
+    info.struct_size = @sizeOf(abi.EntityInfo);
+
+    const status = self.queryEntityInfo(index, &info);
+    if (status != abi.query_ok) return status;
+    out.* = info.exists != 0;
+    return status;
+}
+
+/// Forwards `zostd.game.server_cvar()` from a Lua script to the query client.
+fn luaGameServerCvar(
+    context: ?*anyopaque,
+    name: []const u8,
+    out: *zlua.zostd.GameCvarValue,
+) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    var value = std.mem.zeroes(abi.CvarValue);
+    value.struct_size = @sizeOf(abi.CvarValue);
+
+    const status = self.queryServerCvar(name, &value);
+    if (status != abi.query_ok and status != abi.query_truncated) return status;
+    return copyCvarValue(value, status, out);
+}
+
+/// Forwards `zostd.game.client_cvar()` from a Lua script to the query client.
+fn luaGameClientCvar(
+    context: ?*anyopaque,
+    index: c_int,
+    name: []const u8,
+    out: *zlua.zostd.GameCvarValue,
+) c_int {
+    const self: *Manager = @ptrCast(@alignCast(context orelse return abi.query_unavailable));
+    var value = std.mem.zeroes(abi.CvarValue);
+    value.struct_size = @sizeOf(abi.CvarValue);
+
+    const status = self.queryClientCvar(index, name, &value);
+    if (status != abi.query_ok and status != abi.query_truncated) return status;
+    return copyCvarValue(value, status, out);
+}
+
+/// Copies an ABI cvar result into its Lua-bridge counterpart.
+fn copyCvarValue(
+    value: abi.CvarValue,
+    status: c_int,
+    out: *zlua.zostd.GameCvarValue,
+) c_int {
+    out.* = std.mem.zeroes(zlua.zostd.GameCvarValue);
+    out.found = value.found != 0;
+    out.int_value = value.int_value;
+    out.float_value = value.float_value;
+    out.text_len = value.text_len;
+    @memcpy(&out.text, &value.text);
+    return status;
 }
 
 /// Serves the Entrypoint's callback events on the manager's end of the IPC
@@ -1227,6 +1598,7 @@ fn testPluginContext() abi.PluginContext {
             .author = abi.Text.fromSlice("Zorcerer"),
             .library_path = abi.Text.fromSlice("test-plugin.so"),
         },
+        .game = null,
     };
 }
 

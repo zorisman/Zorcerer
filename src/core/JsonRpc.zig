@@ -35,13 +35,71 @@ pub fn validateResponseId(actual: zjr.RpcId, expected_response_id: ?i64) !void {
     if (!actual.eql(expected)) return error.UnexpectedResponseId;
 }
 
+/// Answers game queries sent by the plugin-manager child.
+///
+/// `handle` runs in the engine process, builds a JSON document describing the
+/// queried value, and returns it allocated with the allocator it receives. The
+/// listener owns and frees that text after sending the response. An error means
+/// the query could not be answered; the child receives a JSON-RPC error.
+pub const QueryHandler = struct {
+    /// Opaque value passed back to `handle`; may be null.
+    context: ?*anyopaque,
+    /// Executes one query and returns its JSON result text.
+    handle: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        request: Ipc.QueryRequest,
+    ) anyerror![]u8,
+};
+
+/// Executes one game query and sends its JSON-RPC response.
+///
+/// A null handler answers `MethodNotFound` instead of stalling the child. A
+/// handler failure answers `InternalError` with the error name. Notifications
+/// (requests without an ID) are executed without a reply, as JSON-RPC requires.
+///
+/// Errors are the allocation and framing errors from message composition and
+/// `Ipc.writeFrame`.
+fn handleQuery(
+    socket: std.os.linux.fd_t,
+    request: Ipc.QueryRequest,
+    id: zjr.RpcId,
+    handler: ?QueryHandler,
+) !void {
+    const allocator = std.heap.page_allocator;
+
+    const active_handler = handler orelse {
+        if (!id.isNotification()) {
+            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Query is not available");
+        }
+        return;
+    };
+
+    const result_text = active_handler.handle(active_handler.context, allocator, request) catch |err| {
+        if (!id.isNotification()) {
+            try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err));
+        }
+        return;
+    };
+    defer allocator.free(result_text);
+
+    if (id.isNotification()) return;
+
+    // Query results are typed JSON documents; transmitting them as a JSON
+    // string keeps every response result a string, like event responses.
+    const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
+    defer allocator.free(quoted);
+    try Ipc.sendResultResponse(socket, id, quoted);
+}
+
 /// Listener for the manager's messages: reads framed JSON-RPC messages from
 /// `socket` until the expected response or readiness arrives.
 ///
 /// Notifications (`.stderr` log lines and `.ready`) are executed without a
 /// reply, so child logging cannot terminate the listener or satisfy a pending
-/// event exchange. Requests carrying an ID are answered with a JSON-RPC
-/// result, and responses are matched against `expected_response_id`.
+/// event exchange. Child game queries are executed through `query_handler`
+/// while the listener keeps waiting for its own response. Responses are matched
+/// against `expected_response_id`.
 ///
 /// `expected_response_id` is null while waiting for readiness: the listener
 /// returns after a successful `.ready` and fails with `error.PluginLoadFailed`
@@ -53,13 +111,27 @@ pub fn validateResponseId(actual: zjr.RpcId, expected_response_id: ?i64) !void {
 /// for a response that does not match a pending event, the framing errors of
 /// `Ipc.readFrame`, the JSON errors of `Ipc.parseRequest`/`Ipc.parseResponse`,
 /// and the response-shape errors of `handleResponse`.
-pub fn jsonListener(socket: std.os.linux.fd_t, expected_response_id: ?i64) !void {
+pub fn jsonListener(
+    socket: std.os.linux.fd_t,
+    expected_response_id: ?i64,
+    query_handler: ?QueryHandler,
+) !void {
     const allocator = std.heap.page_allocator;
 
     while (true) {
         const frame = try Ipc.readFrame(socket);
         if (!frame.framed) return error.InvalidFrame;
         if (!frame.received) return error.EmptyMessage;
+
+        if (Ipc.parseQuery(allocator, frame.text())) |query| {
+            defer query.deinit();
+            try handleQuery(socket, query.value, query.id(), query_handler);
+            continue;
+        } else |err| switch (err) {
+            // Not a query: fall through to operation/response handling.
+            error.UnknownMethod, error.NotRpcRequest => {},
+            else => return err,
+        }
 
         const request = Ipc.parseRequest(allocator, frame.text()) catch |err| switch (err) {
             error.NotRpcRequest => {

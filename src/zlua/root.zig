@@ -194,7 +194,165 @@ const MockHost = struct {
         const self: *MockHost = @ptrCast(@alignCast(context.?));
         try self.command.appendSlice(self.allocator, command);
     }
+
+    /// Fills a fixed server snapshot for the `zostd.game` tests.
+    fn gameServerInfo(_: ?*anyopaque, out: *zostd_bridge.GameServerInfo) c_int {
+        out.* = std.mem.zeroes(zostd_bridge.GameServerInfo);
+        out.dedicated = true;
+        out.paused = false;
+        out.entity_count = 12;
+        out.server_version = 9000;
+        out.server_time = 1.5;
+        const game_dir = "tf";
+        @memcpy(out.game_dir[0..game_dir.len], game_dir);
+        out.game_dir_len = game_dir.len;
+        const map_name = "cp_process";
+        @memcpy(out.map_name[0..map_name.len], map_name);
+        out.map_name_len = map_name.len;
+        return zostd_bridge.game_query_ok;
+    }
+
+    /// Fills a player for slot 1 and reports an empty slot otherwise.
+    fn gamePlayerInfo(
+        _: ?*anyopaque,
+        index: c_int,
+        out: *zostd_bridge.GamePlayerInfo,
+    ) c_int {
+        out.* = std.mem.zeroes(zostd_bridge.GamePlayerInfo);
+        out.index = index;
+        if (index != 1) return zostd_bridge.game_query_ok;
+
+        out.present = true;
+        out.user_id = 5;
+        out.friends_id = 77;
+        out.fake_player = true;
+        const name = "Alice";
+        @memcpy(out.name[0..name.len], name);
+        out.name_len = name.len;
+        const guid = "STEAM";
+        @memcpy(out.guid[0..guid.len], guid);
+        out.guid_len = guid.len;
+        const friends_name = "Bob";
+        @memcpy(out.friends_name[0..friends_name.len], friends_name);
+        out.friends_name_len = friends_name.len;
+        return zostd_bridge.game_query_ok;
+    }
+
+    /// Reports entity 1 as present.
+    fn gameEntityExists(_: ?*anyopaque, index: c_int, out: *bool) c_int {
+        out.* = index == 1;
+        return zostd_bridge.game_query_ok;
+    }
+
+    /// Reports `sv_cheats` as a found server cvar.
+    fn gameServerCvar(
+        _: ?*anyopaque,
+        name: []const u8,
+        out: *zostd_bridge.GameCvarValue,
+    ) c_int {
+        out.* = std.mem.zeroes(zostd_bridge.GameCvarValue);
+        if (!std.mem.eql(u8, name, "sv_cheats")) return zostd_bridge.game_query_ok;
+
+        out.found = true;
+        out.int_value = 1;
+        out.float_value = 1.0;
+        const text = "1";
+        @memcpy(out.text[0..text.len], text);
+        out.text_len = text.len;
+        return zostd_bridge.game_query_ok;
+    }
+
+    /// Reports `cl_name` for client 1.
+    fn gameClientCvar(
+        _: ?*anyopaque,
+        index: c_int,
+        name: []const u8,
+        out: *zostd_bridge.GameCvarValue,
+    ) c_int {
+        out.* = std.mem.zeroes(zostd_bridge.GameCvarValue);
+        if (index != 1 or !std.mem.eql(u8, name, "cl_name")) {
+            return zostd_bridge.game_query_ok;
+        }
+
+        out.found = true;
+        const text = "client";
+        @memcpy(out.text[0..text.len], text);
+        out.text_len = text.len;
+        return zostd_bridge.game_query_ok;
+    }
 };
+
+test "zostd.game queries expose host snapshots to Lua" {
+    var host = MockHost{ .allocator = std.testing.allocator };
+    defer host.deinit();
+
+    var lua_runtime = try Runtime.init(std.testing.allocator);
+    defer lua_runtime.deinit();
+
+    lua_runtime.setHost(.{
+        .context = &host,
+        .server_info = MockHost.gameServerInfo,
+        .player_info = MockHost.gamePlayerInfo,
+        .entity_exists = MockHost.gameEntityExists,
+        .server_cvar = MockHost.gameServerCvar,
+        .client_cvar = MockHost.gameClientCvar,
+    });
+    lua_runtime.openSafeLibs();
+    lua_runtime.installZostd();
+
+    try lua_runtime.run(
+        \\local info = assert(zostd.game.server_info())
+        \\assert(info.dedicated == true)
+        \\assert(info.paused == false)
+        \\assert(info.entity_count == 12)
+        \\assert(info.server_version == 9000)
+        \\assert(info.server_time == 1.5)
+        \\assert(info.game_dir == "tf")
+        \\assert(info.map_name == "cp_process")
+        \\
+        \\local player = assert(zostd.game.player_info(1))
+        \\assert(player.index == 1)
+        \\assert(player.user_id == 5)
+        \\assert(player.friends_id == 77)
+        \\assert(player.fake_player == true)
+        \\assert(player.is_hltv == false)
+        \\assert(player.name == "Alice")
+        \\assert(player.guid == "STEAM")
+        \\assert(player.friends_name == "Bob")
+        \\assert(zostd.game.player_info(2) == nil)
+        \\
+        \\assert(zostd.game.entity_exists(1) == true)
+        \\assert(zostd.game.entity_exists(2) == false)
+        \\
+        \\local cvar = assert(zostd.game.server_cvar("sv_cheats"))
+        \\assert(cvar.int_value == 1)
+        \\assert(cvar.float_value == 1.0)
+        \\assert(cvar.text == "1")
+        \\assert(zostd.game.server_cvar("missing") == nil)
+        \\
+        \\local client = assert(zostd.game.client_cvar(1, "cl_name"))
+        \\assert(client.text == "client")
+        \\assert(zostd.game.client_cvar(2, "cl_name") == nil)
+    , "@zlua/zostd_game_test.lua");
+}
+
+test "zostd.game reports unconfigured queries without raising" {
+    var lua_runtime = try Runtime.init(std.testing.allocator);
+    defer lua_runtime.deinit();
+
+    lua_runtime.openSafeLibs();
+    lua_runtime.installZostd();
+
+    try lua_runtime.run(
+        \\local info, info_error = zostd.game.server_info()
+        \\assert(info == nil)
+        \\assert(string.find(info_error, "not configured", 1, true) ~= nil)
+        \\
+        \\local exists, exists_error = zostd.game.entity_exists(1)
+        \\assert(exists == false)
+        \\assert(string.find(exists_error, "not configured", 1, true) ~= nil)
+    , "@zlua/zostd_game_unconfigured_test.lua");
+}
 
 test "zostd host operations are callable from Lua" {
     var host = MockHost{ .allocator = std.testing.allocator };

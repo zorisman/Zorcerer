@@ -87,6 +87,7 @@ const Log = root.io.Log;
 const abi = root.abi;
 const fork = @import("ForkProcess.zig");
 const JsonRpc = @import("JsonRpc.zig");
+const GameQueries = @import("GameQueries.zig");
 const Vsp = @import("Vsp.zig");
 
 /// An IServerPluginCallbacks instance is just a vptr as far as the engine
@@ -117,6 +118,16 @@ var source_vtable: [Vsp.VTable.slot_count]Vsp.Slot = undefined;
 
 var plugin_instance = PluginObject{ .vptr = &source_vtable };
 var engine: ?*anyopaque = null;
+
+/// Engine-side state for the read-only game queries served to the plugin
+/// manager. Filled in `load()` and cleared in `unload()`.
+var game_queries = GameQueries.Queries{};
+
+/// Callback table `JsonRpc.jsonListener` uses to answer child game queries.
+const game_query_handler = JsonRpc.QueryHandler{
+    .context = &game_queries,
+    .handle = GameQueries.Queries.handle,
+};
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
 /// discover/cache the plugin .so files under tf/addons/zorcerer/plugins/, run
@@ -228,6 +239,21 @@ fn load(
 
     Log.logLine("[Zorcerer] Load() reached, engine version confirmed: {s}\n", .{engine_version});
 
+    // Game queries run here, in the engine process. Resolve the cvar interface
+    // now, while the engine's factory is still available; the pointer itself
+    // stays valid for the whole process lifetime.
+    game_queries.setEngine(engine);
+    var cvar_version_buffer: [32]u8 = undefined;
+    const cvar_version = std.fmt.bufPrintZ(
+        &cvar_version_buffer,
+        "{s}",
+        .{Indexes.cvar_interface_version},
+    ) catch null;
+    game_queries.setCvar(if (cvar_version) |version_z|
+        interface_factory(version_z.ptr, null)
+    else
+        null);
+
     if (manager_child != null) {
         Log.logLine("[Zorcerer] plugin manager is already running; refusing a second one\n", .{});
         return false;
@@ -243,7 +269,7 @@ fn load(
     // so it refuses the startup instead of returning a successful load. The
     // child keeps running (and the socket open) afterwards; unload() is what
     // closes the socket and reaps it.
-    JsonRpc.jsonListener(manager_child.?.socket, null) catch |err| {
+    JsonRpc.jsonListener(manager_child.?.socket, null, game_query_handler) catch |err| {
         if (err != error.PluginLoadFailed) {
             Log.logLine("[Zorcerer] plugin manager startup failed: {s}\n", .{@errorName(err)});
         }
@@ -278,6 +304,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
     // Releases the manifests the parent parsed in load(). The child's plugin
     // state lived in its own copy of the manager and is already gone.
     plugin_manager.deinit();
+    game_queries.clear();
     engine = null;
     // The Log module keeps the captured sink: the engine interface stays
     // resident for the whole process lifetime, so it remains valid, and
@@ -313,7 +340,7 @@ fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
         return;
     };
 
-    JsonRpc.jsonListener(child.socket, Ipc.event_request_id) catch |err| {
+    JsonRpc.jsonListener(child.socket, Ipc.event_request_id, game_query_handler) catch |err| {
         Log.logLine(
             "[Zorcerer] handling the plugin manager's reply to {s} failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
@@ -347,6 +374,7 @@ fn levelInit(this: *anyopaque, map_name: [*:0]const u8) callconv(.c) void {
     _ = this;
     const name = std.mem.span(map_name);
     Log.logLine("[Zorcerer] LevelInit: {s}\n", .{name});
+    game_queries.setMap(name);
 
     const allocator = std.heap.page_allocator;
     const payload = std.json.Stringify.valueAlloc(allocator, .{ .map = name }, .{}) catch null;
@@ -381,6 +409,7 @@ fn serverActivate(
 fn levelShutdown(this: *anyopaque) callconv(.c) void {
     _ = this;
     Log.logLine("[Zorcerer] LevelShutdown\n", .{});
+    game_queries.clearMap();
     sendManagerEvent(.levelShutdown, null);
 }
 

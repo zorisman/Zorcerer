@@ -99,6 +99,35 @@ Scenarios:
     later plugins, matching Source's `PLUGIN_STOP` convention within the
     plugin fan-out.
     2. Game queries
+    The context carries an optional `game` capability (`abi.GameApi`). It is
+    read-only and synchronous: a query travels from the forked plugin manager
+    to the engine process over the same IPC socket the manager already uses for
+    events, and the caller blocks until the typed answer arrives. The child
+    never dereferences an engine pointer, and queries have no timeout; a
+    stalled engine process stalls the caller, matching the existing synchronous
+    event exchange.
+
+    `server_info` returns the dedicated flag, pause state, entity count, server
+    version, uptime, game directory, and the map name cached from `levelInit`
+    (empty outside a level). `player_info` returns engine identity for one
+    entity index, `entity_info` reports whether an index is in use, and
+    `server_cvar` / `client_cvar` read one cvar value. The cvar interfaces are
+    resolved once in `load()` (`VEngineCvar004`); player and server queries use
+    the already-verified `IVEngineServer` build.
+
+    Every function writes into caller-owned fixed-size structs. The caller sets
+    `struct_size` first; lengths in the results report the full value length so
+    a plugin can detect truncation. Status values are `query_ok`,
+    `query_unavailable` (no channel or interface), `query_transport_error`
+    (the engine answer failed), and `query_truncated` (data was stored but did
+    not fit). Lua scripts use the same implementation through
+    `zostd.game.server_info()`, `player_info()`, `entity_exists()`,
+    `server_cvar()`, and `client_cvar()`.
+
+    Queries are available while a plugin's `load()` runs, because the parent is
+    already waiting for the child's readiness, and during event delivery,
+    because the parent is waiting for the event response. The map name is
+    cleared on `levelShutdown`; the other values reflect live engine state.
     3. File system
     4. Networking
     5. Resource management

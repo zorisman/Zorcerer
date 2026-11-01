@@ -320,3 +320,94 @@ test "manager answers an unknown event instead of stalling" {
     );
     try std.testing.expectEqualStrings("Event is invalid", rpc_response.err().message);
 }
+
+test "query request round-trips through the IPC schema" {
+    var buffer: [256]u8 = undefined;
+    const text = try Ipc.encodeQuery(&buffer, .{
+        .query = .player_info,
+        .index = 3,
+        .name = "cl_name",
+    });
+
+    const parsed = try Ipc.parseQuery(std.testing.allocator, text);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(Ipc.Query.player_info, parsed.value.query);
+    try std.testing.expectEqual(@as(c_int, 3), parsed.value.index);
+    try std.testing.expectEqualStrings("cl_name", parsed.value.name);
+    try std.testing.expect(parsed.id().eql(Ipc.query_request_id));
+}
+
+test "query schema rejects non-query methods and bad parameters" {
+    try std.testing.expectError(
+        error.UnknownMethod,
+        Ipc.parseQuery(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"x\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidParams,
+        Ipc.parseQuery(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"query.playerInfo\",\"params\":{\"index\":\"x\"},\"id\":100}",
+        ),
+    );
+}
+
+/// Answers every child query with a fixed server-info document.
+fn testQueryHandler(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    request: Ipc.QueryRequest,
+) anyerror![]u8 {
+    if (request.query != .server_info) return error.UnexpectedQuery;
+    return allocator.dupe(u8, "{\"dedicated\":true}");
+}
+
+/// Child that asks one question before reporting readiness.
+fn testQueryChild(fd: std.os.linux.fd_t) void {
+    Ipc.sendQuery(fd, .{ .query = .server_info }) catch return;
+    const text = Ipc.receiveQueryResult(fd, std.heap.page_allocator) catch return;
+    defer std.heap.page_allocator.free(text);
+
+    if (!std.mem.eql(u8, text, "{\"dedicated\":true}")) return;
+    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+}
+
+test "parent listener answers a child query while waiting for readiness" {
+    var child = try fork.forkChild(testQueryChild);
+    defer child.finish() catch {};
+
+    try JsonRpc.jsonListener(
+        child.socket,
+        null,
+        .{ .context = null, .handle = testQueryHandler },
+    );
+}
+
+test "query client receives a result from a responder" {
+    var child = try fork.forkChild(testQueryResponder);
+    defer child.finish() catch {};
+
+    try Ipc.sendQuery(child.socket, .{
+        .query = .entity_exists,
+        .index = 4,
+    });
+    const text = try Ipc.receiveQueryResult(child.socket, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    var parsed = try std.json.parseFromSlice(Ipc.EntityInfo, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.exists);
+}
+
+/// Answers one query request with a fixed entity document.
+fn testQueryResponder(fd: std.os.linux.fd_t) void {
+    const frame = Ipc.readFrame(fd) catch return;
+    const parsed = Ipc.parseQuery(std.heap.page_allocator, frame.text()) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value.query != .entity_exists or parsed.value.index != 4) return;
+    Ipc.sendResultResponse(fd, parsed.id(), "\"{\\\"exists\\\":true}\"") catch {};
+}

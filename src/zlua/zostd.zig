@@ -6,7 +6,9 @@
 //! `zostd.types` table, which mirrors the value types declared in
 //! `src/zostd/types`. The second part is the host-facing function table
 //! (`version`, `log`, `plugin_id`, `read_file`, `write_file`,
-//! `server_command`, and `on`).
+//! `server_command`, and `on`), together with the read-only `zostd.game`
+//! query table (`server_info`, `player_info`, `entity_exists`, `server_cvar`,
+//! and `client_cvar`).
 //!
 //! Host operations are supplied through `Host`. When a callback is absent the
 //! bridge uses conservative defaults: logging is dropped, the plugin id is the
@@ -54,6 +56,104 @@ pub const Host = struct {
 
     /// Requests that the host execute one engine server command.
     server_command: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+
+    /// Fills `out` with a server-state snapshot.
+    server_info: ?*const fn (?*anyopaque, *GameServerInfo) c_int = null,
+
+    /// Fills `out` with the player identity for entity index `index`.
+    player_info: ?*const fn (?*anyopaque, c_int, *GamePlayerInfo) c_int = null,
+
+    /// Sets `out` to whether entity index `index` is in use.
+    entity_exists: ?*const fn (?*anyopaque, c_int, *bool) c_int = null,
+
+    /// Fills `out` with the server cvar named `name`.
+    server_cvar: ?*const fn (?*anyopaque, []const u8, *GameCvarValue) c_int = null,
+
+    /// Fills `out` with client `index`'s cvar named `name`.
+    client_cvar: ?*const fn (?*anyopaque, c_int, []const u8, *GameCvarValue) c_int = null,
+};
+
+/// Status returned by a game-query host callback when it succeeded. Other
+/// values are forwarded to the script as an error; the bridge does not
+/// interpret their meaning.
+pub const game_query_ok: c_int = 0;
+
+/// Status returned by a game-query host callback when the query succeeded but
+/// a text value was truncated to fit its fixed buffer. The bridge still returns
+/// the available data because the length fields identify the truncation.
+pub const game_query_truncated: c_int = 3;
+
+/// Returns whether `status` represents a usable query result.
+fn gameQuerySucceeded(status: c_int) bool {
+    return status == game_query_ok or status == game_query_truncated;
+}
+
+/// Capacity of the text buffers in the Lua game-query results.
+pub const game_text_capacity: usize = 260;
+
+/// Server-state snapshot exposed by `zostd.game.server_info()`.
+pub const GameServerInfo = struct {
+    /// Whether the engine is a dedicated server.
+    dedicated: bool = false,
+    /// Whether the server is paused.
+    paused: bool = false,
+    /// Number of entity slots the engine reports in use.
+    entity_count: i32 = 0,
+    /// Engine build number.
+    server_version: i32 = 0,
+    /// Seconds since server start.
+    server_time: f32 = 0,
+    /// Full length of `game_dir`, including bytes not stored.
+    game_dir_len: usize = 0,
+    /// Game/mod directory, for example `tf`.
+    game_dir: [game_text_capacity]u8 = undefined,
+    /// Full length of `map_name`, including bytes not stored.
+    map_name_len: usize = 0,
+    /// Current map name, or empty outside a level.
+    map_name: [game_text_capacity]u8 = undefined,
+};
+
+/// Player identity exposed by `zostd.game.player_info(index)`.
+pub const GamePlayerInfo = struct {
+    /// Whether the engine returned info for the requested slot.
+    present: bool = false,
+    /// Entity index the script requested.
+    index: i32 = 0,
+    /// Server-assigned user id.
+    user_id: i32 = 0,
+    /// Steam friends id.
+    friends_id: u32 = 0,
+    /// Whether the client is a bot.
+    fake_player: bool = false,
+    /// Whether the client is an HLTV proxy.
+    is_hltv: bool = false,
+    /// Full length of `name`, including bytes not stored.
+    name_len: usize = 0,
+    /// Player display name.
+    name: [game_text_capacity]u8 = undefined,
+    /// Full length of `guid`, including bytes not stored.
+    guid_len: usize = 0,
+    /// Steam id string.
+    guid: [game_text_capacity]u8 = undefined,
+    /// Full length of `friends_name`, including bytes not stored.
+    friends_name_len: usize = 0,
+    /// Steam friends name.
+    friends_name: [game_text_capacity]u8 = undefined,
+};
+
+/// Cvar value exposed by `zostd.game.server_cvar()` and
+/// `zostd.game.client_cvar()`.
+pub const GameCvarValue = struct {
+    /// Whether the cvar was found.
+    found: bool = false,
+    /// Integer representation of the value.
+    int_value: i32 = 0,
+    /// Floating-point representation of the value.
+    float_value: f32 = 0,
+    /// Full length of `text`, including bytes not stored.
+    text_len: usize = 0,
+    /// String representation of the value.
+    text: [game_text_capacity]u8 = undefined,
 };
 
 /// Per-runtime state captured by every Lua C closure installed by `install()`.
@@ -99,8 +199,26 @@ pub fn install(lua: *Lua, binding: *Binding) void {
     installTypes(lua);
     lua.setTable(-3);
 
+    lua.pushLString("game");
+    installGame(lua, binding);
+    lua.setTable(-3);
+
     lua.setGlobal("zostd");
     installCallbackRegistry(lua);
+}
+
+/// Installs the `zostd.game` table with the read-only query functions.
+///
+/// Every entry forwards to a `Host` callback; when the host did not install
+/// one, the function returns `(nil, message)` (or `false, message` for
+/// `entity_exists`) instead of raising a Lua error.
+fn installGame(lua: *Lua, binding: *Binding) void {
+    lua.createTable(0, 5);
+    setFunction(lua, "server_info", binding, gameServerInfo);
+    setFunction(lua, "player_info", binding, gamePlayerInfo);
+    setFunction(lua, "entity_exists", binding, gameEntityExists);
+    setFunction(lua, "server_cvar", binding, gameServerCvar);
+    setFunction(lua, "client_cvar", binding, gameClientCvar);
 }
 
 /// Installs the `zostd.types` table.
@@ -383,6 +501,13 @@ fn fail(lua: *Lua, message: []const u8) i32 {
     return 2;
 }
 
+/// Pushes `false, message` and reports two Lua results.
+fn failBoolean(lua: *Lua, message: []const u8) i32 {
+    lua.pushBoolean(false);
+    lua.pushLString(message);
+    return 2;
+}
+
 /// Pushes `nil, action: error_name` for a host callback failure.
 fn failError(lua: *Lua, action: []const u8, err: anyerror) i32 {
     var buffer: [256]u8 = undefined;
@@ -495,6 +620,188 @@ fn serverCommand(lua: *Lua) callconv(.c) i32 {
 
     lua.pushBoolean(true);
     return 1;
+}
+
+/// Lua C function implementing `zostd.game.server_info()`.
+fn gameServerInfo(lua: *Lua) callconv(.c) i32 {
+    const binding = currentBinding(lua);
+    const host_server_info = binding.host.server_info orelse
+        return fail(lua, "zostd.game.server_info is not configured");
+
+    var info = GameServerInfo{};
+    const status = host_server_info(binding.host.context, &info);
+    if (!gameQuerySucceeded(status)) {
+        return failGameStatus(lua, "zostd.game.server_info", status);
+    }
+
+    lua.createTable(0, 7);
+    pushTableBoolean(lua, "dedicated", info.dedicated);
+    pushTableBoolean(lua, "paused", info.paused);
+    pushTableInteger(lua, "entity_count", info.entity_count);
+    pushTableInteger(lua, "server_version", info.server_version);
+    pushTableNumber(lua, "server_time", info.server_time);
+    pushTableString(lua, "game_dir", info.game_dir[0..@min(info.game_dir_len, info.game_dir.len)]);
+    pushTableString(lua, "map_name", info.map_name[0..@min(info.map_name_len, info.map_name.len)]);
+    return 1;
+}
+
+/// Lua C function implementing `zostd.game.player_info(index)`.
+fn gamePlayerInfo(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return fail(lua, "zostd.game.player_info expects an entity index");
+    }
+    const index = std.math.cast(c_int, lua.toInteger(1)) orelse
+        return fail(lua, "zostd.game.player_info index is out of range");
+
+    const binding = currentBinding(lua);
+    const host_player_info = binding.host.player_info orelse
+        return fail(lua, "zostd.game.player_info is not configured");
+
+    var info = GamePlayerInfo{};
+    const status = host_player_info(binding.host.context, index, &info);
+    if (!gameQuerySucceeded(status)) {
+        return failGameStatus(lua, "zostd.game.player_info", status);
+    }
+    if (!info.present) {
+        lua.pushNil();
+        return 1;
+    }
+
+    lua.createTable(0, 9);
+    pushTableInteger(lua, "index", info.index);
+    pushTableInteger(lua, "user_id", info.user_id);
+    pushTableInteger(lua, "friends_id", info.friends_id);
+    pushTableBoolean(lua, "fake_player", info.fake_player);
+    pushTableBoolean(lua, "is_hltv", info.is_hltv);
+    pushTableString(lua, "name", info.name[0..@min(info.name_len, info.name.len)]);
+    pushTableString(lua, "guid", info.guid[0..@min(info.guid_len, info.guid.len)]);
+    pushTableString(
+        lua,
+        "friends_name",
+        info.friends_name[0..@min(info.friends_name_len, info.friends_name.len)],
+    );
+    return 1;
+}
+
+/// Lua C function implementing `zostd.game.entity_exists(index)`.
+fn gameEntityExists(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return failBoolean(lua, "zostd.game.entity_exists expects an entity index");
+    }
+    const index = std.math.cast(c_int, lua.toInteger(1)) orelse
+        return failBoolean(lua, "zostd.game.entity_exists index is out of range");
+
+    const binding = currentBinding(lua);
+    const host_entity_exists = binding.host.entity_exists orelse
+        return failBoolean(lua, "zostd.game.entity_exists is not configured");
+
+    var exists = false;
+    const status = host_entity_exists(binding.host.context, index, &exists);
+    if (!gameQuerySucceeded(status)) {
+        return failGameStatusBoolean(lua, "zostd.game.entity_exists", status);
+    }
+
+    lua.pushBoolean(exists);
+    return 1;
+}
+
+/// Lua C function implementing `zostd.game.server_cvar(name)`.
+fn gameServerCvar(lua: *Lua) callconv(.c) i32 {
+    const name = lua.toLString(1) catch
+        return fail(lua, "zostd.game.server_cvar expects a cvar name");
+
+    const binding = currentBinding(lua);
+    const host_server_cvar = binding.host.server_cvar orelse
+        return fail(lua, "zostd.game.server_cvar is not configured");
+
+    var value = GameCvarValue{};
+    const status = host_server_cvar(binding.host.context, name, &value);
+    if (!gameQuerySucceeded(status)) {
+        return failGameStatus(lua, "zostd.game.server_cvar", status);
+    }
+    return pushCvarValue(lua, value);
+}
+
+/// Lua C function implementing `zostd.game.client_cvar(index, name)`.
+fn gameClientCvar(lua: *Lua) callconv(.c) i32 {
+    if (!lua.isNumber(1)) {
+        return fail(lua, "zostd.game.client_cvar expects a client index");
+    }
+    const index = std.math.cast(c_int, lua.toInteger(1)) orelse
+        return fail(lua, "zostd.game.client_cvar index is out of range");
+    const name = lua.toLString(2) catch
+        return fail(lua, "zostd.game.client_cvar expects a cvar name");
+
+    const binding = currentBinding(lua);
+    const host_client_cvar = binding.host.client_cvar orelse
+        return fail(lua, "zostd.game.client_cvar is not configured");
+
+    var value = GameCvarValue{};
+    const status = host_client_cvar(binding.host.context, index, name, &value);
+    if (!gameQuerySucceeded(status)) {
+        return failGameStatus(lua, "zostd.game.client_cvar", status);
+    }
+    return pushCvarValue(lua, value);
+}
+
+/// Pushes a cvar result table, or `nil` when the cvar was not found.
+fn pushCvarValue(lua: *Lua, value: GameCvarValue) i32 {
+    if (!value.found) {
+        lua.pushNil();
+        return 1;
+    }
+
+    lua.createTable(0, 4);
+    pushTableInteger(lua, "int_value", value.int_value);
+    pushTableNumber(lua, "float_value", value.float_value);
+    pushTableString(lua, "text", value.text[0..@min(value.text_len, value.text.len)]);
+    return 1;
+}
+
+/// Pushes `nil, "<action>: query status N"`.
+fn failGameStatus(lua: *Lua, action: []const u8, status: c_int) i32 {
+    var buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "{s}: query status {d}",
+        .{ action, status },
+    ) catch action;
+    return fail(lua, message);
+}
+
+/// Pushes `false, "<action>: query status N"` for a failed boolean query.
+fn failGameStatusBoolean(lua: *Lua, action: []const u8, status: c_int) i32 {
+    var buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "{s}: query status {d}",
+        .{ action, status },
+    ) catch action;
+    return failBoolean(lua, message);
+}
+
+/// Sets a boolean field on the table at the top of the stack.
+fn pushTableBoolean(lua: *Lua, name: [:0]const u8, value: bool) void {
+    lua.pushBoolean(value);
+    lua.setField(-2, name);
+}
+
+/// Sets an integer field on the table at the top of the stack.
+fn pushTableInteger(lua: *Lua, name: [:0]const u8, value: anytype) void {
+    lua.pushInteger(@intCast(value));
+    lua.setField(-2, name);
+}
+
+/// Sets a floating-point field on the table at the top of the stack.
+fn pushTableNumber(lua: *Lua, name: [:0]const u8, value: anytype) void {
+    lua.pushNumber(@floatCast(value));
+    lua.setField(-2, name);
+}
+
+/// Sets a string field on the table at the top of the stack.
+fn pushTableString(lua: *Lua, name: [:0]const u8, value: []const u8) void {
+    lua.pushLString(value);
+    lua.setField(-2, name);
 }
 
 /// Lua C function implementing `zostd.on(event, callback)`.
