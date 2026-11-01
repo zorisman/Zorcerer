@@ -146,6 +146,7 @@ fn testContext() abi.PluginContext {
             .library_path = abi.Text.fromSlice("./fixture.so"),
         },
         .game = null,
+        .files = null,
     };
 }
 

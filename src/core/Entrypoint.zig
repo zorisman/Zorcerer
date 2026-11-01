@@ -29,8 +29,9 @@
 //! readiness report is a `ready` notification whose `params.message` is the
 //! child's readiness text. The callbacks send a request named after the event
 //! and receive a JSON-RPC result `"Event is X"` (or an error response).
-//! `unload` closes the parent's socket end, which tells the child to unload
-//! its plugins and exit, then reaps it.
+//! `unload` sends the child a `shutdown` request so plugin `unload()` hooks
+//! can still use the filesystem and game queries, waits for the reply, then
+//! closes the parent's socket end and reaps the child.
 //!
 //! *** VERIFY BEFORE USE ***
 //! The IServerPluginCallbacks method list below follows the Valve
@@ -88,6 +89,7 @@ const abi = root.abi;
 const fork = @import("ForkProcess.zig");
 const JsonRpc = @import("JsonRpc.zig");
 const GameQueries = @import("GameQueries.zig");
+const EngineFilesystem = @import("EngineFilesystem.zig");
 const Vsp = @import("Vsp.zig");
 
 /// An IServerPluginCallbacks instance is just a vptr as far as the engine
@@ -127,6 +129,17 @@ var game_queries = GameQueries.Queries{};
 const game_query_handler = JsonRpc.QueryHandler{
     .context = &game_queries,
     .handle = GameQueries.Queries.handle,
+};
+
+/// Engine-side `game://` filesystem service. Bound in `load()` and released
+/// in `unload()`; the plugin-manager child reaches it only over IPC.
+var engine_filesystem = EngineFilesystem.Binding.init(std.heap.page_allocator);
+
+/// Callback table `JsonRpc.jsonListener` uses to answer child filesystem
+/// requests.
+const engine_file_handler = JsonRpc.FileHandler{
+    .context = &engine_filesystem,
+    .handle = EngineFilesystem.Binding.handle,
 };
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
@@ -178,6 +191,51 @@ fn pluginManagerChild(fd: std.os.linux.fd_t) void {
     Ipc.sendReady(fd, fork.manager_ready_message) catch return;
     Manager.listenForEvents(fd);
     plugin_manager.unloadAll();
+}
+
+/// Binds the engine filesystem used to serve `game://` requests from the
+/// plugin manager.
+///
+/// The full `IFileSystem` interface answers `VFileSystem022`; its
+/// `IBaseFileSystem` half is requested separately when the engine exposes it
+/// as a top-level interface, and `Binding.bind` falls back to the
+/// `QueryInterface` slot or the secondary subobject otherwise. A missing or
+/// incompatible filesystem is logged but not fatal: `plugin://` access keeps
+/// working and `game://` requests then report `file_unavailable`.
+///
+/// Side effects: replaces the process-global binding's interface pointers,
+/// resolved virtuals, and handle tables.
+fn bindEngineFilesystem(interface_factory: Vsp.CreateInterfaceFn) void {
+    var filesystem_version_buffer: [64]u8 = undefined;
+    const filesystem_version = std.fmt.bufPrintZ(
+        &filesystem_version_buffer,
+        "{s}",
+        .{Indexes.filesystem_interface_version},
+    ) catch {
+        Log.logLine("[Zorcerer] engine filesystem version string is too long\n", .{});
+        return;
+    };
+    const filesystem = interface_factory(filesystem_version.ptr, null);
+
+    var base_version_buffer: [64]u8 = undefined;
+    const base_version = std.fmt.bufPrintZ(
+        &base_version_buffer,
+        "{s}",
+        .{Indexes.basefilesystem_interface_version},
+    ) catch null;
+    const base = if (base_version) |version|
+        interface_factory(version.ptr, null)
+    else
+        null;
+
+    engine_filesystem.bind(filesystem, base) catch |err| {
+        Log.logLine(
+            "[Zorcerer] game:// filesystem unavailable: {s}\n",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    Log.logLine("[Zorcerer] game:// filesystem bound\n", .{});
 }
 
 fn load(
@@ -259,6 +317,10 @@ fn load(
         return false;
     }
 
+    // Bind before the fork so the child's first `game://` request always has
+    // a handler in this process.
+    bindEngineFilesystem(interface_factory);
+
     manager_child = fork.forkChild(pluginManagerChild) catch |err| {
         Log.logLine("[Zorcerer] forking the plugin manager failed: {s}\n", .{@errorName(err)});
         return false;
@@ -269,7 +331,12 @@ fn load(
     // so it refuses the startup instead of returning a successful load. The
     // child keeps running (and the socket open) afterwards; unload() is what
     // closes the socket and reaps it.
-    JsonRpc.jsonListener(manager_child.?.socket, null, game_query_handler) catch |err| {
+    JsonRpc.jsonListener(
+        manager_child.?.socket,
+        null,
+        game_query_handler,
+        engine_file_handler,
+    ) catch |err| {
         if (err != error.PluginLoadFailed) {
             Log.logLine("[Zorcerer] plugin manager startup failed: {s}\n", .{@errorName(err)});
         }
@@ -293,13 +360,33 @@ fn unload(this: *anyopaque) callconv(.c) void {
     Log.logLine("[Zorcerer] unloading, removing demo hooks.\n", .{});
 
     if (manager_child) |*child| {
-        // Closing our end is the shutdown signal: the child's event listener
-        // sees EOF, unloads its plugins and exits, so finish() can reap it.
+        // The shutdown request lets the child run unload() while the channel
+        // and the engine filesystem are still usable. If it cannot be sent,
+        // finish() still closes the socket, which makes the child exit.
+        Ipc.sendShutdown(child.socket) catch |err| {
+            Log.logLine(
+                "[Zorcerer] sending shutdown to the plugin manager failed: {s}\n",
+                .{@errorName(err)},
+            );
+        };
+        JsonRpc.jsonListener(
+            child.socket,
+            Ipc.shutdown_request_id,
+            game_query_handler,
+            engine_file_handler,
+        ) catch |err| {
+            Log.logLine(
+                "[Zorcerer] plugin manager shutdown exchange failed: {s}\n",
+                .{@errorName(err)},
+            );
+        };
         child.finish() catch |err| {
             Log.logLine("[Zorcerer] plugin manager shutdown failed: {s}\n", .{@errorName(err)});
         };
         manager_child = null;
     }
+
+    engine_filesystem.deinit();
 
     // Releases the manifests the parent parsed in load(). The child's plugin
     // state lived in its own copy of the manager and is already gone.
@@ -340,7 +427,12 @@ fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
         return;
     };
 
-    JsonRpc.jsonListener(child.socket, Ipc.event_request_id, game_query_handler) catch |err| {
+    JsonRpc.jsonListener(
+        child.socket,
+        Ipc.event_request_id,
+        game_query_handler,
+        engine_file_handler,
+    ) catch |err| {
         Log.logLine(
             "[Zorcerer] handling the plugin manager's reply to {s} failed: {s}\n",
             .{ @tagName(event), @errorName(err) },

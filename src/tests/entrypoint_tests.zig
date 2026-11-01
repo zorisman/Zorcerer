@@ -383,7 +383,104 @@ test "parent listener answers a child query while waiting for readiness" {
         child.socket,
         null,
         .{ .context = null, .handle = testQueryHandler },
+        null,
     );
+}
+
+/// Answers one filesystem request with a fixed result document.
+fn testFileHandler(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    request: Ipc.FileRequest,
+) anyerror![]u8 {
+    if (request.op != .open) return error.UnexpectedRequest;
+    if (!std.mem.eql(u8, request.path, "game://materials")) return error.UnexpectedPath;
+    return allocator.dupe(u8, "{\"status\":0,\"handle\":5}");
+}
+
+/// Child that asks one filesystem question before reporting readiness.
+fn testFileChild(fd: std.os.linux.fd_t) void {
+    Ipc.sendFileRequest(fd, .{ .op = .open, .path = "game://materials" }) catch return;
+    const result = Ipc.receiveFileResult(fd, std.heap.page_allocator) catch return;
+    defer result.deinit();
+
+    if (result.value.status != 0 or result.value.handle != 5) return;
+    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+}
+
+test "parent listener answers a child file request while waiting for readiness" {
+    var child = try fork.forkChild(testFileChild);
+    defer child.finish() catch {};
+
+    try JsonRpc.jsonListener(
+        child.socket,
+        null,
+        null,
+        .{ .context = null, .handle = testFileHandler },
+    );
+}
+
+test "file request round-trips through the IPC schema" {
+    var buffer: [Ipc.max_payload_len]u8 = undefined;
+    const text = try Ipc.encodeFileRequest(&buffer, .{
+        .op = .write,
+        .path = "plugin://note.txt",
+        .mode = 1,
+        .handle = 9,
+        .offset = -4,
+        .origin = 2,
+        .length = 64,
+        .data = "aGVsbG8=",
+    });
+
+    const parsed = try Ipc.parseFileRequest(std.testing.allocator, text);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(Ipc.FileOp.write, parsed.value.op);
+    try std.testing.expectEqualStrings("plugin://note.txt", parsed.value.path);
+    try std.testing.expectEqual(@as(c_int, 1), parsed.value.mode);
+    try std.testing.expectEqual(@as(u64, 9), parsed.value.handle);
+    try std.testing.expectEqual(@as(i64, -4), parsed.value.offset);
+    try std.testing.expectEqual(@as(c_int, 2), parsed.value.origin);
+    try std.testing.expectEqual(@as(usize, 64), parsed.value.length);
+    try std.testing.expectEqualStrings("aGVsbG8=", parsed.value.data);
+    try std.testing.expect(parsed.id().eql(Ipc.file_request_id));
+}
+
+test "file schema rejects non-file methods" {
+    try std.testing.expectError(
+        error.UnknownMethod,
+        Ipc.parseFileRequest(
+            std.testing.allocator,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"pause\",\"id\":1}",
+        ),
+    );
+}
+
+test "shutdown request round-trips through the IPC schema" {
+    const parsed = try Ipc.parseShutdown(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"shutdown\",\"id\":200}",
+    );
+    defer parsed.deinit();
+    try std.testing.expect(parsed.id().eql(Ipc.shutdown_request_id));
+}
+
+test "manager acknowledges shutdown and stops listening" {
+    var child = try fork.forkChild(Manager.listenForEvents);
+    defer child.finish() catch {};
+
+    try Ipc.sendShutdown(child.socket);
+
+    const frame = try Ipc.readFrame(child.socket);
+    try std.testing.expect(frame.received);
+
+    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+    defer response.deinit();
+    const rpc_response = try response.value();
+    try std.testing.expect(!rpc_response.hasErr());
+    try std.testing.expect(rpc_response.id.eql(Ipc.shutdown_request_id));
+    try std.testing.expectEqualStrings("OK", rpc_response.result.string);
 }
 
 test "query client receives a result from a responder" {

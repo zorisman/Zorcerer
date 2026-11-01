@@ -57,3 +57,11 @@ test "src/core/Entrypoint.zig" {
 test "src/core/Ipc.zig" {
     std.testing.refAllDecls(tests.ipc_tests);
 }
+
+test "src/core/FileService.zig" {
+    std.testing.refAllDecls(@import("core/FileService.zig"));
+}
+
+test "src/core/EngineFilesystem.zig" {
+    std.testing.refAllDecls(@import("core/EngineFilesystem.zig"));
+}

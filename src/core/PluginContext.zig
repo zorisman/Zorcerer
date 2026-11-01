@@ -123,6 +123,10 @@ pub const PluginContext = extern struct {
     /// 2 without changing `abi_version`; old plugins ignore it via
     /// `struct_size`.
     game: ?*const GameApi,
+    /// Filesystem access, or null when the host does not provide it. Like
+    /// `game`, this field was appended after version 2 without changing
+    /// `abi_version`; old plugins ignore it via `struct_size`.
+    files: ?*const FileApi,
 };
 
 /// Plugin's `load` export.
@@ -308,4 +312,155 @@ pub const GameApi = extern struct {
     server_cvar: *const fn (context: ?*anyopaque, name: Text, out: *CvarValue) callconv(.c) c_int,
     /// Fills `out` with client `index`'s cvar named `name`.
     client_cvar: *const fn (context: ?*anyopaque, index: c_int, name: Text, out: *CvarValue) callconv(.c) c_int,
+};
+
+// --- Filesystem -------------------------------------------------------------
+
+/// Status returned by a `FileApi` operation: the operation succeeded.
+pub const file_ok: c_int = 0;
+/// Status returned when the host has no filesystem service, no IPC channel to
+/// the engine process, or no engine filesystem binding for a `game://` path.
+pub const file_unavailable: c_int = 1;
+/// Status returned when the host could not complete a `game://` operation
+/// because the transport to the engine process failed.
+pub const file_transport_error: c_int = 2;
+/// Status returned when the requested access is not permitted, for example a
+/// write to `game://`, a `..` component, or an unsupported URI scheme.
+pub const file_permission_denied: c_int = 3;
+/// Status returned when the backend reports that the file or directory does
+/// not exist.
+pub const file_not_found: c_int = 4;
+/// Status returned when the backend refused to open the file or directory.
+pub const file_open_failed: c_int = 5;
+/// Status returned for an I/O failure after a handle was opened.
+pub const file_io_error: c_int = 6;
+/// Status returned when `handle` does not name an open file or directory owned
+/// by the calling plugin.
+pub const file_invalid_handle: c_int = 7;
+/// Status returned for a malformed argument, such as an unknown open mode.
+pub const file_invalid_argument: c_int = 8;
+/// Status returned when an engine-side file name, directory name, or wildcard
+/// exceeds the implementation limit.
+pub const file_name_too_long: c_int = 9;
+/// Status returned by `find_next` when the directory enumeration is exhausted.
+pub const file_end: c_int = 10;
+
+/// Open modes accepted by `FileApi.open`.
+///
+/// `game://` content is read-only, so only `.read` is accepted for it.
+pub const FileMode = enum(c_int) {
+    /// Open an existing file for reading.
+    read = 0,
+    /// Create or truncate a file for writing.
+    write = 1,
+    /// Create a file or keep its content and write at the end.
+    append = 2,
+};
+
+/// Seek origins accepted by `FileApi.seek`.
+pub const FileSeekFrom = enum(c_int) {
+    /// Offset from the beginning of the file.
+    start = 0,
+    /// Offset relative to the current position.
+    current = 1,
+    /// Offset relative to the end of the file.
+    end = 2,
+};
+
+/// Synchronous filesystem access called from plugin code.
+///
+/// Paths use two URI schemes:
+/// - `plugin://<tail>` addresses the calling plugin's own directory and is
+///   read/write. The plugin manager opens it directly through the host
+///   filesystem.
+/// - `game://<tail>` addresses the running game's mod directory and is
+///   read-only. The plugin manager forwards it to the engine process over IPC;
+///   the forked child never dereferences an engine filesystem pointer.
+///
+/// Handles are opaque, non-zero integers owned by the host. They are valid
+/// only for the plugin context that opened them and only until `close` or
+/// `find_close` is called, or until the plugin's `unload()` returns. The host
+/// closes any handle a plugin leaves open when the plugin unloads.
+///
+/// Every function is synchronous. `read` and `write` return the byte count on
+/// success and a negated `file_*` status on failure; the other functions
+/// return a `file_*` status directly. `read` may return fewer bytes than
+/// requested, including 0 at end of file; callers must loop for whole-file
+/// I/O.
+///
+/// Lifetime: `context` is owned by the host and is this plugin's filesystem
+/// context. `struct_size` follows the same append-only rule as
+/// `PluginContext`.
+pub const FileApi = extern struct {
+    /// Size of this struct in bytes as provided by the host.
+    struct_size: usize,
+    /// Opaque host context; pass back unchanged.
+    context: ?*anyopaque,
+    /// Opens `path` with `mode` and stores its handle in `out_handle`.
+    open: *const fn (
+        context: ?*anyopaque,
+        path: Text,
+        mode: FileMode,
+        out_handle: *u64,
+    ) callconv(.c) c_int,
+    /// Closes a file handle opened by `open`.
+    close: *const fn (context: ?*anyopaque, handle: u64) callconv(.c) c_int,
+    /// Reads at most `destination.len` bytes from `handle`.
+    ///
+    /// Returns the number of bytes read (0 at end of file) or a negated
+    /// `file_*` status.
+    read: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        destination: [*]u8,
+        destination_len: usize,
+    ) callconv(.c) isize,
+    /// Writes at most `source.len` bytes to `handle`.
+    ///
+    /// Returns the number of bytes written or a negated `file_*` status.
+    write: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        source: [*]const u8,
+        source_len: usize,
+    ) callconv(.c) isize,
+    /// Moves the file pointer of `handle` by `offset` from `origin`.
+    seek: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        offset: i64,
+        origin: FileSeekFrom,
+    ) callconv(.c) c_int,
+    /// Stores the current file pointer of `handle` in `out_offset`.
+    tell: *const fn (context: ?*anyopaque, handle: u64, out_offset: *u64) callconv(.c) c_int,
+    /// Stores the size of the file behind `handle` in `out_size`.
+    size: *const fn (context: ?*anyopaque, handle: u64, out_size: *u64) callconv(.c) c_int,
+    /// Asks the backend to flush buffered data for `handle`.
+    flush: *const fn (context: ?*anyopaque, handle: u64) callconv(.c) c_int,
+    /// Deletes `path`. Only `plugin://` paths are removable.
+    remove: *const fn (context: ?*anyopaque, path: Text) callconv(.c) c_int,
+    /// Opens the directory `path` for enumeration and stores its handle in
+    /// `out_handle`.
+    find_open: *const fn (
+        context: ?*anyopaque,
+        path: Text,
+        out_handle: *u64,
+    ) callconv(.c) c_int,
+    /// Copies the next entry name of `handle` into `name`.
+    ///
+    /// On success, `out_len` receives the name length and `out_is_directory`
+    /// receives non-zero for directories. If the name does not fit
+    /// `name.len`, the function returns `file_name_too_long` and `out_len`
+    /// receives the required capacity. It returns `file_end` when the
+    /// enumeration is exhausted, in which case `out_len` is zero.
+    find_next: *const fn (
+        context: ?*anyopaque,
+        handle: u64,
+        name: [*]u8,
+        name_len: usize,
+        out_len: *usize,
+        out_is_directory: *u8,
+    ) callconv(.c) c_int,
+    /// Ends a directory enumeration started by `find_open`.
+    find_close: *const fn (context: ?*anyopaque, handle: u64) callconv(.c) c_int,
 };

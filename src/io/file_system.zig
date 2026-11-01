@@ -1537,6 +1537,7 @@ fn mockContext() abi.PluginContext {
             .library_path = abi.Text.fromSlice("./hello_plugin.so"),
         },
         .game = null,
+        .files = null,
     };
 }
 

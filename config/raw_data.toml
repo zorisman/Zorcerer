@@ -36,6 +36,14 @@ names = [
 ]
 
 [[const]]
+# Engine filesystem interface versions used to resolve the game:// backend.
+header = "public/filesystem.h"
+names = [
+    "FILESYSTEM_INTERFACE_VERSION",
+    "BASEFILESYSTEM_INTERFACE_VERSION",
+]
+
+[[const]]
 header = "public/engine/iserverplugin.h"
 names = [
     "INTERFACEVERSION_ISERVERPLUGINHELPERS",
@@ -133,6 +141,11 @@ methods = ["*"]
 
 # NOTE: no CBasePlayerWeapon query - this TF2-branch checkout defines
 # no class CBasePlayerWeapon anywhere (weapons derive from CTFWeaponBase).
+
+[[class]]
+header = "public/filesystem.h"
+name = "IBaseFileSystem"
+methods = ["*"]
 
 [[class]]
 header = "public/eiface.h"

@@ -92,19 +92,81 @@ fn handleQuery(
     try Ipc.sendResultResponse(socket, id, quoted);
 }
 
+/// Answers filesystem requests sent by the plugin-manager child.
+///
+/// `handle` runs in the engine process and returns the JSON document
+/// describing one `Ipc.FileResult`, allocated with the allocator it receives.
+/// The listener owns and frees that text after sending the response. An error
+/// means the request could not be processed; the child receives a JSON-RPC
+/// error and reports it as a transport failure.
+pub const FileHandler = struct {
+    /// Opaque value passed back to `handle`; may be null.
+    context: ?*anyopaque,
+    /// Executes one filesystem request and returns its JSON result text.
+    handle: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        request: Ipc.FileRequest,
+    ) anyerror![]u8,
+};
+
+/// Executes one filesystem request and sends its JSON-RPC response.
+///
+/// A null handler answers `MethodNotFound` instead of stalling the child. A
+/// handler failure answers `InternalError` with the error name. Notifications
+/// (requests without an ID) are executed without a reply, as JSON-RPC
+/// requires.
+///
+/// Errors are the allocation and framing errors from message composition and
+/// `Ipc.writeFrame`.
+fn handleFile(
+    socket: std.os.linux.fd_t,
+    request: Ipc.FileRequest,
+    id: zjr.RpcId,
+    handler: ?FileHandler,
+) !void {
+    const allocator = std.heap.page_allocator;
+
+    const active_handler = handler orelse {
+        if (!id.isNotification()) {
+            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Filesystem is not available");
+        }
+        return;
+    };
+
+    const result_text = active_handler.handle(active_handler.context, allocator, request) catch |err| {
+        if (!id.isNotification()) {
+            try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err));
+        }
+        return;
+    };
+    defer allocator.free(result_text);
+
+    if (id.isNotification()) return;
+
+    // File results are typed JSON documents; transmitting them as a JSON
+    // string keeps every response result a string, like query and event
+    // responses.
+    const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
+    defer allocator.free(quoted);
+    try Ipc.sendResultResponse(socket, id, quoted);
+}
+
 /// Listener for the manager's messages: reads framed JSON-RPC messages from
 /// `socket` until the expected response or readiness arrives.
 ///
 /// Notifications (`.stderr` log lines and `.ready`) are executed without a
 /// reply, so child logging cannot terminate the listener or satisfy a pending
-/// event exchange. Child game queries are executed through `query_handler`
-/// while the listener keeps waiting for its own response. Responses are matched
-/// against `expected_response_id`.
+/// event exchange. Child game queries and filesystem requests are executed
+/// through `query_handler` and `file_handler` while the listener keeps waiting
+/// for its own response. Responses are matched against `expected_response_id`.
 ///
 /// `expected_response_id` is null while waiting for readiness: the listener
 /// returns after a successful `.ready` and fails with `error.PluginLoadFailed`
 /// on a failed readiness text. For event exchanges it is
-/// `Ipc.event_request_id`: the listener returns after handling that response.
+/// `Ipc.event_request_id`; for the shutdown handshake it is
+/// `Ipc.shutdown_request_id`. The listener returns after handling that
+/// response.
 ///
 /// Errors: `error.InvalidFrame` when the frame marker is missing,
 /// `error.EmptyMessage` for a zero-length payload, `error.UnexpectedResponseId`
@@ -115,6 +177,7 @@ pub fn jsonListener(
     socket: std.os.linux.fd_t,
     expected_response_id: ?i64,
     query_handler: ?QueryHandler,
+    file_handler: ?FileHandler,
 ) !void {
     const allocator = std.heap.page_allocator;
 
@@ -129,6 +192,16 @@ pub fn jsonListener(
             continue;
         } else |err| switch (err) {
             // Not a query: fall through to operation/response handling.
+            error.UnknownMethod, error.NotRpcRequest => {},
+            else => return err,
+        }
+
+        if (Ipc.parseFileRequest(allocator, frame.text())) |file| {
+            defer file.deinit();
+            try handleFile(socket, file.value, file.id(), file_handler);
+            continue;
+        } else |err| switch (err) {
+            // Not a filesystem request: fall through to the next schema.
             error.UnknownMethod, error.NotRpcRequest => {},
             else => return err,
         }

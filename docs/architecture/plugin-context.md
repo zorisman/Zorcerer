@@ -129,6 +129,53 @@ Scenarios:
     because the parent is waiting for the event response. The map name is
     cleared on `levelShutdown`; the other values reflect live engine state.
     3. File system
+    The context carries an optional `files` capability (`abi.FileApi`). Like
+    `game`, the field was appended to `PluginContext` without changing
+    `abi_version`; old plugins ignore it through `struct_size`.
+
+    Two URI schemes are accepted:
+
+    - `plugin://<tail>` addresses the calling plugin's own directory under the
+      configured plugin root and is read/write. The plugin-manager child opens
+      these paths directly through the host OS filesystem.
+    - `game://<tail>` addresses the running game's mod directory and is
+      read-only. The child forwards these requests to the engine process over
+      the existing IPC socket; the parent translates `<tail>` into an engine
+      name under pathID `GAME` and calls `IFileSystem`/`IBaseFileSystem`. The
+      forked child never receives or dereferences an engine filesystem pointer.
+      Writes and removals against `game://` return `file_permission_denied`
+      before any engine call.
+
+    `tail` is validated before use: `..` components, backslashes, and embedded
+    NULs are refused with `file_permission_denied`, and a plugin id that could
+    escape the plugin root is rejected when its filesystem context is created.
+
+    Every operation is synchronous. `open`, `close`, `seek`, `tell`, `size`,
+    `flush`, `remove`, `find_open`, `find_next`, and `find_close` return a
+    `file_*` status. `read` and `write` return the number of bytes transferred,
+    or a negated `file_*` status; `read` may return fewer bytes than requested,
+    including 0 at end of file, so whole-file callers must loop.
+
+    Handles are opaque, non-zero integers valid only in the plugin context that
+    opened them and only until `close`/`find_close`, or until the plugin's
+    `unload()` returns. File handles and directory enumerations share one
+    table per plugin, so a handle from another plugin is rejected as
+    `file_invalid_handle`. The host closes any handle a plugin leaves open
+    after `unload()`, while the IPC channel is still open.
+
+    Directory enumeration uses `find_open` to start a session, `find_next` to
+    copy one entry name (and receive its directory flag), and `find_close` to
+    end it. `find_next` returns `file_end` when the enumeration is exhausted
+    and `file_name_too_long` when the caller's buffer is too small, reporting
+    the required length when the backend can determine it.
+
+    File access is available during a plugin's `load()`, because the parent is
+    already waiting for the child's readiness, and during `unload()`, because
+    `Entrypoint.unload()` now sends an explicit `shutdown` request and the
+    parent keeps answering filesystem requests until the child acknowledges it
+    and exits. Lua scripts use the same service through
+    `zostd.read_file(path)` and `zostd.write_file(path, data)`; a path without
+    a URI prefix is relative to the script's plugin directory.
     4. Networking
     5. Resource management
     6. Plugin-to-plugin communication

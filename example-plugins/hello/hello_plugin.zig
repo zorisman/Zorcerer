@@ -15,134 +15,128 @@
 //! report that lists the non-directory entries of `game://materials`, one
 //! name per line. It then logs a one-line server snapshot through the
 //! read-only game-query capability when the host provides one. On unload(), it
-//! deletes that same file. Both file operations go through the host filesystem
-//! API in src/io/file_system.zig, which routes `plugin://` URIs to std.Io and
-//! `game://` URIs to the Source Engine filesystem.
+//! deletes that same file. Both file operations go through `ctx.files`
+//! (`abi.FileApi`): the host opens `plugin://` paths on its own filesystem and
+//! forwards `game://` paths to the engine process over IPC, so the plugin
+//! never dereferences an engine filesystem pointer.
 //!
-//! The plugin still derives its own roots because PluginContext carries no
-//! root directories yet: the manager treats its working directory as the
-//! game directory and loads plugins from
-//! `tf/addons/zorcerer/plugins/<id>/`, so the Zorcerer root is
-//! `<cwd>/tf/addons/zorcerer` and the game root is `<cwd>/tf`. The context
-//! supplies the plugin id and manifest identity used for filesystem
-//! resolution and log messages.
-//!
-//! Enumerating `game://` needs an engine filesystem binding, which the
-//! context does not carry yet. Until the host supplies one, load() still
-//! creates the report but records that the material listing is
-//! unavailable instead of pretending it succeeded.
+//! `unload()` keeps using the same `ctx.files` capability; the host closes
+//! any handles the plugin leaves open after `unload()` returns.
 
 const std = @import("std");
 const abi = @import("plugin-context");
-const filesystem = @import("zorcerer-filesystem");
 
-/// `std.Io` adapter used for `plugin://` I/O. The manager owns no instance
-/// the plugin could borrow, so the plugin keeps a single-threaded adapter
-/// of its own; filesystem operations on `plugin://` do not allocate.
-var threaded_io: std.Io.Threaded = .init_single_threaded;
-
-/// Absolute Zorcerer root backing `plugin://` URIs, derived by
-/// `resolveRoots()`. Stored statically because `setZorcererRoot()` keeps
-/// the pointer and the plugin may use it until unload().
-var zorcerer_root: [std.Io.Dir.max_path_bytes]u8 = undefined;
-
-/// Absolute game root (the `tf` directory) backing `game://` URIs, derived
-/// by `resolveRoots()`; same lifetime rule as `zorcerer_root`.
-var game_root: [std.Io.Dir.max_path_bytes]u8 = undefined;
-
-/// Report location relative to this plugin's own directory, as interpreted
-/// by `filesystem.parsePath()`.
+/// Report location inside this plugin's own directory.
 const report_uri = "plugin://hello.txt";
 
 /// Directory whose non-directory entries the report lists.
 const materials_uri = "game://materials";
 
-/// Derives this process' game and Zorcerer roots from the working
-/// directory and registers them with the filesystem module.
-///
-/// The manager resolves plugins relative to the process' working directory
-/// (`tf/addons/zorcerer/plugins`), so the same convention is mirrored here:
-/// `<cwd>/tf/addons/zorcerer` for `plugin://` and `<cwd>/tf` for `game://`.
-///
-/// Errors: any failure of `std.Io.Dir.realPath` (for example the current
-/// directory no longer exists) and `error.RootPathTooLong` when a derived
-/// root does not fit the static buffers.
-///
-/// Side effects: overwrites both static root buffers and hands their
-/// pointers to `filesystem.setZorcererRoot()` / `filesystem.setGameRoot()`.
-fn resolveRoots(io: std.Io) !void {
-    // `std.Io.Dir.cwd().realPath()` asks procfs for fd -100 (AT_FDCWD),
-    // which Linux does not expose; opening "." yields a real handle whose
-    // canonical path can be read.
-    const cwd_dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
-    defer cwd_dir.close(io);
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try cwd_dir.realPath(io, &cwd_buffer);
-    const cwd = cwd_buffer[0..cwd_len];
-
-    const zorcerer = std.fmt.bufPrint(
-        &zorcerer_root,
-        "{s}/tf/addons/zorcerer",
-        .{cwd},
-    ) catch return error.RootPathTooLong;
-    const game = std.fmt.bufPrint(&game_root, "{s}/tf", .{cwd}) catch
-        return error.RootPathTooLong;
-
-    filesystem.setZorcererRoot(zorcerer);
-    filesystem.setGameRoot(game);
-}
-
-/// Creates/overwrites `plugin://hello.txt` and writes the non-directory
-/// entry names of `game://materials` into it, one per line.
-///
-/// `ctx` is the manager-provided context for this plugin; `plugin.id`
-/// names the directory `plugin://` resolves under.
-///
-/// Errors: URI resolution failures (`filesystem.parsePath`), file opening
-/// and writing failures, and directory enumeration failures. When the
-/// engine filesystem is not bound, the function does not fail: it writes an
-/// explanatory line into the report.
-///
-/// Side effects: creates or truncates `hello.txt` in the plugin directory.
-/// If anything fails after the file was created, the file is removed again
-/// so a failed load() leaves no stray report (the manager never calls
-/// unload() for a plugin whose load() failed).
-fn writeReport(io: std.Io, ctx: *abi.PluginContext) !void {
-    const report = try filesystem.parsePath(ctx, report_uri);
-
-    var output = try filesystem.File.open(io, null, report, .write);
-    errdefer filesystem.File.remove(io, report) catch {};
-    defer output.close();
-
-    const materials = try filesystem.parsePath(ctx, materials_uri);
-    var directory = filesystem.Directory.open(io, null, materials) catch |err| switch (err) {
-        // There is no engine filesystem binding in the context yet. Record
-        // the limitation instead of failing a load() over host plumbing.
-        error.EngineNotBound => {
-            try output.writeAll("game://materials: engine filesystem binding not available\n");
-            return;
-        },
-        else => return err,
-    };
-    defer directory.close();
-
-    // `entry.name` is only valid until the next `next()` call, so each
-    // name is written immediately; directories are skipped to keep the
-    // listing non-recursive.
-    var name_buffer: [filesystem.max_engine_name_len]u8 = undefined;
-    while (try directory.next(&name_buffer)) |entry| {
-        if (entry.is_directory) continue;
-        try output.writeAll(entry.name);
-        try output.writeAll("\n");
-    }
-}
+/// Buffer size for one directory entry name. The host reports names that do
+/// not fit as `file_name_too_long` instead of truncating them.
+const max_entry_name_len: usize = 1024;
 
 /// Sends one message through the logger the plugin manager configured.
 /// Does nothing when the host could not provide one.
 fn consolePrint(ctx: *abi.PluginContext, message: [:0]const u8) void {
     if (ctx.logger) |logger| {
         logger.print(logger.context, message.ptr);
+    }
+}
+
+/// Writes all of `bytes` to an open `FileApi` handle.
+///
+/// The host may accept fewer bytes than requested, so this loops until every
+/// byte is written.
+///
+/// Errors: `error.WriteFailed` when the host reports a negative status or
+/// stops making progress.
+fn writeAll(files: *const abi.FileApi, handle: u64, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written != bytes.len) {
+        const count = files.write(
+            files.context,
+            handle,
+            bytes.ptr + written,
+            bytes.len - written,
+        );
+        if (count <= 0) return error.WriteFailed;
+        written += @intCast(count);
+    }
+}
+
+/// Deletes the report file through the host filesystem API.
+///
+/// Errors: `error.RemoveFailed` when the host does not report `file_ok`.
+fn removeReport(files: *const abi.FileApi) !void {
+    const status = files.remove(files.context, abi.Text.fromSlice(report_uri));
+    if (status != abi.file_ok) return error.RemoveFailed;
+}
+
+/// Creates/overwrites `plugin://hello.txt` and writes the non-directory
+/// entry names of `game://materials` into it, one per line.
+///
+/// Errors: `error.ReportOpenFailed` when the report cannot be opened,
+/// `error.DirectoryReadFailed` when enumeration fails after opening, and
+/// `error.WriteFailed` from `writeAll`. A missing `game://` service is not an
+/// error: the function records that limitation in the report instead.
+///
+/// Side effects: creates or truncates `hello.txt` in the plugin directory.
+/// If anything fails after the file was created, the file is removed again so
+/// a failed load() leaves no stray report (the manager never calls unload()
+/// for a plugin whose load() failed).
+fn writeReport(files: *const abi.FileApi) !void {
+    var output: u64 = 0;
+    const open_status = files.open(
+        files.context,
+        abi.Text.fromSlice(report_uri),
+        .write,
+        &output,
+    );
+    if (open_status != abi.file_ok) return error.ReportOpenFailed;
+
+    errdefer removeReport(files) catch {};
+    defer _ = files.close(files.context, output);
+
+    var directory: u64 = 0;
+    const find_status = files.find_open(
+        files.context,
+        abi.Text.fromSlice(materials_uri),
+        &directory,
+    );
+    if (find_status != abi.file_ok) {
+        // The host may have no engine filesystem binding; record the
+        // limitation instead of failing a load() over host plumbing.
+        try writeAll(
+            files,
+            output,
+            "game://materials: engine filesystem binding not available\n",
+        );
+        return;
+    }
+    defer _ = files.find_close(files.context, directory);
+
+    // Entry names are only valid for one `find_next` call, so each name is
+    // written immediately; directories are skipped to keep the listing
+    // non-recursive.
+    var name_buffer: [max_entry_name_len]u8 = undefined;
+    while (true) {
+        var name_len: usize = 0;
+        var is_directory: u8 = 0;
+        const status = files.find_next(
+            files.context,
+            directory,
+            &name_buffer,
+            name_buffer.len,
+            &name_len,
+            &is_directory,
+        );
+        if (status == abi.file_end) break;
+        if (status != abi.file_ok) return error.DirectoryReadFailed;
+        if (is_directory != 0) continue;
+
+        try writeAll(files, output, name_buffer[0..name_len]);
+        try writeAll(files, output, "\n");
     }
 }
 
@@ -203,12 +197,18 @@ export fn load(ctx: *abi.PluginContext) callconv(.c) c_int {
         return 1;
     }
 
-    const io = threaded_io.io();
-    resolveRoots(io) catch |err| {
-        std.debug.print("hello_plugin: could not resolve filesystem roots ({s})\n", .{@errorName(err)});
-        return 1;
+    const files = ctx.files orelse {
+        consolePrint(ctx, "hello_plugin: host provides no filesystem API\n");
+        logServerInfo(ctx);
+        return 0;
     };
-    writeReport(io, ctx) catch |err| {
+    if (files.struct_size < @sizeOf(abi.FileApi)) {
+        consolePrint(ctx, "hello_plugin: host filesystem API is too old\n");
+        logServerInfo(ctx);
+        return 0;
+    }
+
+    writeReport(files) catch |err| {
         std.debug.print("hello_plugin: could not write {s} ({s})\n", .{ report_uri, @errorName(err) });
         return 1;
     };
@@ -231,19 +231,16 @@ export fn unload(ctx: *abi.PluginContext) callconv(.c) c_int {
         return 1;
     }
 
-    const io = threaded_io.io();
-    // load() already registered the roots; resolving again keeps unload()
-    // self-contained (both calls are allocation-free).
-    resolveRoots(io) catch |err| {
-        std.debug.print("hello_plugin: could not resolve filesystem roots ({s})\n", .{@errorName(err)});
-        return 1;
+    const files = ctx.files orelse {
+        consolePrint(ctx, "hello_plugin: host provides no filesystem API\n");
+        return 0;
     };
+    if (files.struct_size < @sizeOf(abi.FileApi)) {
+        consolePrint(ctx, "hello_plugin: host filesystem API is too old\n");
+        return 0;
+    }
 
-    const report = filesystem.parsePath(ctx, report_uri) catch |err| {
-        std.debug.print("hello_plugin: could not resolve {s} ({s})\n", .{ report_uri, @errorName(err) });
-        return 1;
-    };
-    filesystem.File.remove(io, report) catch |err| {
+    removeReport(files) catch |err| {
         std.debug.print("hello_plugin: could not remove {s} ({s})\n", .{ report_uri, @errorName(err) });
         return 1;
     };
