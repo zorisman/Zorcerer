@@ -20,10 +20,13 @@ const zlua = @import("zlua");
 
 /// Per-script host context passed back to every `zostd` callback.
 pub const Context = struct {
-    /// Manager that owns the script and answers game queries.
+    /// Manager that owns the script and answers game queries and commands.
     manager: *Manager,
     /// Filesystem context of the script's plugin directory.
     files: *FileService.PluginFiles,
+    /// Id of the script's plugin directory. Advisory attribution for command
+    /// audit logs; an empty slice means the caller did not supply one.
+    plugin_id: []const u8 = "",
 };
 
 /// Returns the host table for one script.
@@ -34,8 +37,10 @@ pub fn host(context: *Context) zlua.zostd.Host {
     return .{
         .context = context,
         .log = logMessage,
+        .plugin_id = pluginId,
         .read_file = readFile,
         .write_file = writeFile,
+        .server_command = serverCommand,
         .server_info = gameServerInfo,
         .player_info = gamePlayerInfo,
         .entity_exists = gameEntityExists,
@@ -54,6 +59,23 @@ fn contextOf(raw: ?*anyopaque) ?*Context {
 fn logMessage(context: ?*anyopaque, message: []const u8) void {
     _ = context;
     Log.logLine("[zlua] {s}\n", .{message});
+}
+
+/// Returns the script's plugin id, or an empty slice when no context is set.
+fn pluginId(context: ?*anyopaque) []const u8 {
+    return (contextOf(context) orelse return "").plugin_id;
+}
+
+/// Implements `zostd.server_command()` by forwarding the command through the
+/// manager's IPC channel.
+///
+/// The call returns after the Entrypoint has handed the command to the engine.
+/// It does not report whether the engine recognized or successfully executed
+/// it. Errors: the `Manager.executeServerCommand` errors, or
+/// `error.Unavailable` when the context is missing.
+fn serverCommand(context: ?*anyopaque, command: []const u8) anyerror!void {
+    const host_context = contextOf(context) orelse return error.Unavailable;
+    return host_context.manager.executeServerCommand(host_context.plugin_id, command);
 }
 
 /// Implements `zostd.read_file()` through the script's filesystem context.

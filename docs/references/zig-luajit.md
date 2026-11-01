@@ -284,11 +284,26 @@ The Entrypoint owns the engine interfaces and forks the manager child (`docs/Arc
 
 Consequence: Lua in the manager cannot safely call `IVEngineServer`, `IFileSystem`, or other engine interfaces directly. Engine effects must be requested from the Entrypoint over IPC.
 
-### 3.6 The existing `serverCommand` hook
+### 3.6 Lua-to-engine commands
 
-The Entrypoint already installs a detour on `IVEngineServer::ServerCommand` at `Indexes.IVEngineServer.server_command` (index 36), and currently recognizes only the test command `zorcerer ping` (`src/Entrypoint.zig:131-141`, `:287-333`).
+There is no `IVEngineServer::ServerCommand` detour. The current source executes
+Lua's `zostd.server_command()` in the opposite direction:
 
-The manager answers that test through the same framed JSON-RPC channel (`src/PluginManager.zig:432-435`, `src/Ipc.zig:42-47`, `:489-616`). This is the most important existing seam for a first Lua scenario.
+1. `LuaHost.serverCommand()` calls `Manager.executeServerCommand()`.
+2. The manager sends an `Ipc.ServerCommandRequest` with method
+   `engine.serverCommand` and request ID `102`.
+3. The Entrypoint's `JsonRpc.jsonListener()` routes the request to
+   `EngineCommands.Binding.handle()`.
+4. The handler revalidates the text and resolves
+   `Indexes.IVEngineServer.server_command` (index 36) through the engine
+   pointer already held by the parent process.
+5. The handler queues the command with `ServerCommand()` and answers
+   `{"accepted":true}`.
+
+The child never dereferences an engine pointer. `ServerCommand()` returns no
+status, so Lua learns that the Entrypoint accepted the command, not that the
+engine recognized or successfully executed it. The queued line executes at the
+engine's normal command-buffer point.
 
 The Source SDK reference notes that numeric vtable indices are a binary-verification concern (`docs/references/source-sdk-2013.md:326-328`), while the interface version is `VEngineServer023` (`source-sdk-2013.md:169`). The existing Entrypoint version gate (`src/Entrypoint.zig:919-925`) is what keeps the generated index honest; a new scenario should reuse that mechanism rather than hand-picking a slot.
 
@@ -318,41 +333,42 @@ For Lua:
 
 ### Scenario A — `zlua` admin console command
 
-**Verdict: valid with modest changes; recommended first product increment.**
+**Verdict: not implemented. This is the inverse direction of the current
+Lua-to-engine command channel.**
 
-#### Shape
+The current implementation lets a loaded Lua script call the engine through
+`zostd.server_command()`. It does not let the server console invoke `zlua ...`.
+That would require a different entry path: a `ServerCommand` detour or a
+registered `ConCommand`, plus a persistent console Lua state.
 
-1. `serverCommandDetour` recognizes a `zlua ...` prefix in addition to the existing test ping.
-2. The Entrypoint forwards the command text to the manager through the existing framed JSON-RPC channel, using a generalized `serverCommand` request or a new `zlua` method.
-3. The manager owns one persistent console Lua state, executes the command in a protected call, and returns either:
-   - a single engine command string for the Entrypoint to execute via the original `ServerCommand`, or
-   - a status/error string, with output sent through IPC `stderr` notifications.
-4. The Entrypoint validates the returned command against an allowlist and then calls the original `ServerCommand`.
+#### Shape if added later
 
-This mirrors the existing test round trip exactly: `serverCommandDetour` → `exchangeServerCommand` → manager `serveServerCommandTest` → response → `callOriginalServerCommand` (`src/Entrypoint.zig:287-321`, `src/PluginManager.zig:432-435`).
+1. A detour or `ConCommand` recognizes a `zlua ...` prefix.
+2. The Entrypoint forwards the console text to the manager.
+3. The manager executes it in a console Lua state and returns either an engine
+   command line or a status/error string.
+4. The Entrypoint validates the returned command under its own policy before
+   handing it to the engine.
 
-#### Why it is valid against the docs/references
+#### Why the child cannot execute it directly
 
 - `docs/Architecture.md:6` and `:31-32` place ZLua in the plugin manager, not the Entrypoint.
-- `docs/references/json_ipc.md:24` explicitly recommends a semantic method such as `engine.serverCommand` rather than exposing raw vtable functions.
+- `docs/references/json_ipc.md:24` recommends semantic methods such as `engine.serverCommand` rather than exposing raw vtable functions.
 - `docs/references/json_ipc.md:83` requires the Entrypoint to enforce the method allowlist and safety policy.
-- `src/Entrypoint.zig:328-333` already installs the `ServerCommand` hook, and `src/Ipc.zig` already has the request/response machinery.
 - The manager child does not touch engine interfaces; all engine effects return through the Entrypoint.
 
-#### Required changes
+#### Required changes for this scenario
 
-- `src/Ipc.zig`: generalize the existing `serverCommand` request/response, or add a dedicated `zlua` method with the same framing.
-- `src/Entrypoint.zig`: route `zlua` commands to the manager; validate/allowlist returned commands; preserve the re-entry guard.
+- `src/Entrypoint.zig`: install and own the console entry detour or `ConCommand`.
+- `src/Ipc.zig`: add a manager request/response schema for the console text and its result.
 - `src/PluginManager.zig`: add a console Lua state and dispatch path.
-- New `src/ZLua.zig` (or similar): state creation, safe library setup, protected execution, logging, error handling.
-- `build.zig`: fix the `luajit`/`c`/LuaJIT link wiring.
+- Reuse the existing engine pointer and command binding rather than introducing a second command path.
 
 #### Risks and limits
 
 - The 4096-byte IPC payload limit applies to both the command and the reply. Reject oversized input with a clear error rather than truncating silently.
 - A slow script blocks the engine callback because the exchange is synchronous.
 - Console output can be large; send it as log notifications or chunk it.
-- The `ServerCommand` detour must stay re-entry guarded, as it is today (`src/Entrypoint.zig:139-141`, `:294-305`).
 - Console scripts are still code running in the manager's address space. Sandboxing protects against accidents, not against a malicious script that escapes Lua.
 
 #### Security policy for v1
@@ -521,7 +537,7 @@ The bindings expose `openJITLib()` and `openFFILib()` (`root.zig:1829-1850`), bu
 
 | Scenario | Where Lua runs | Engine access | Documentation support | Effort | Main risk | Verdict |
 |---|---|---|---|---|---|---|
-| A. `zlua` console | Manager child | Via Entrypoint IPC | Architecture, `json_ipc`, existing `ServerCommand` hook | Small–medium | Synchronous blocking, 4096-byte limit | **Recommended first** |
+| A. `zlua` console | Manager child | Via Entrypoint IPC | Requires a new console entry point; no `ServerCommand` hook exists | Small–medium | Synchronous blocking, 4096-byte limit | Not implemented |
 | B. Script plugins | Manager child | `plugin://` direct; `game://` via IPC | Architecture ZLua, FAQ, `json_ipc`, filesystem policy | Large | Manager is not a security boundary; DoS | **Target design** |
 | C. Native plugin embeds Lua | Manager child, plugin-owned | Plugin's own filesystem module | FAQ plugin extension point, plugin ABI | Medium | Multiple LuaJIT copies, PIC/link | **Best build proof** |
 | D. `zostd` Lua API | Manager child | Policy layer | Architecture `zostd`, `json_ipc`, filesystem policy | Medium–large | Scope creep, versioning | **Enabler** |
@@ -578,6 +594,12 @@ Lua bytecode is not a safe sandbox input; a malformed chunk can crash or corrupt
 ---
 
 ## 7. Recommended implementation path
+
+**Current-source note (2026-11-01):** Phases 0 and 2 are implemented: LuaJIT
+links into `zorcerer.so`, and the manager loads per-plugin Lua scripts with a
+`zostd` API, including `zostd.server_command()` over `engine.serverCommand` IPC.
+Phase 1 (console Lua) is not implemented. The phase text below is the original
+plan and is retained for context.
 
 ### Phase 0 — Build spike (must happen first)
 
@@ -649,7 +671,10 @@ Implement Scenario B:
 - `extern/zig-luajit` is a usable Zig binding layer, but it is not a self-contained runtime. It needs `luajit_build`, a `c` module, and a LuaJIT link artifact.
 - Zorcerer's current `build.zig` registration is incomplete: the module exists, but the `c` import and dependency graph do not. The missing pieces are hidden only because nothing under `src/` imports `luajit` yet.
 - The only architecture-consistent place for Lua is the forked manager child. The Entrypoint must remain the engine-facing security boundary.
-- The first practical scenario is a `zlua` console command through the existing `ServerCommand` hook. It validates the build, lifecycle, sandbox, and IPC with the smallest surface change.
+- The first shipped scenario is script plugins with per-plugin Lua states and a
+  curated `zostd` API, which now includes `zostd.server_command()`. A `zlua`
+  console command remains unimplemented; it would need a new console entry
+  point, because no `ServerCommand` hook exists in the current source.
 - The documented ZLua target is script plugins with per-plugin Lua states and a curated `zostd` API. That is valid, but it needs manifest, loader, lifecycle, and security work.
 - A native `.so` plugin embedding Lua is the smallest build proof-of-concept and is supported by the FAQ's "write a plugin" stance, but it is not the built-in ZLua.
 - Do not expose `ffi`, `io`, `os`, `package`, or `debug` to untrusted scripts; do not call engine interfaces from the manager child; do not derive the Lua API from vtable dumps.

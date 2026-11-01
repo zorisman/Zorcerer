@@ -89,6 +89,7 @@ const abi = root.abi;
 const fork = @import("ForkProcess.zig");
 const JsonRpc = @import("JsonRpc.zig");
 const GameQueries = @import("GameQueries.zig");
+const EngineCommands = @import("EngineCommands.zig");
 const EngineFilesystem = @import("EngineFilesystem.zig");
 const Vsp = @import("Vsp.zig");
 
@@ -140,6 +141,17 @@ var engine_filesystem = EngineFilesystem.Binding.init(std.heap.page_allocator);
 const engine_file_handler = JsonRpc.FileHandler{
     .context = &engine_filesystem,
     .handle = EngineFilesystem.Binding.handle,
+};
+
+/// Engine-side command executor. Bound in `load()` and cleared in `unload()`;
+/// the plugin-manager child reaches it only over IPC.
+var engine_commands = EngineCommands.Binding{};
+
+/// Callback table `JsonRpc.jsonListener` uses to execute child command
+/// requests.
+const engine_command_handler = JsonRpc.CommandHandler{
+    .context = &engine_commands,
+    .handle = EngineCommands.Binding.handle,
 };
 
 /// Plugin manager singleton. The forked child (`pluginManagerChild`) uses it to
@@ -297,10 +309,12 @@ fn load(
 
     Log.logLine("[Zorcerer] Load() reached, engine version confirmed: {s}\n", .{engine_version});
 
-    // Game queries run here, in the engine process. Resolve the cvar interface
-    // now, while the engine's factory is still available; the pointer itself
-    // stays valid for the whole process lifetime.
+    // Game queries and command execution run here, in the engine process.
+    // Resolve the cvar interface now, while the engine's factory is still
+    // available; the pointer itself stays valid for the whole process
+    // lifetime.
     game_queries.setEngine(engine);
+    engine_commands.bind(engine orelse return false);
     var cvar_version_buffer: [32]u8 = undefined;
     const cvar_version = std.fmt.bufPrintZ(
         &cvar_version_buffer,
@@ -336,6 +350,7 @@ fn load(
         null,
         game_query_handler,
         engine_file_handler,
+        engine_command_handler,
     ) catch |err| {
         if (err != error.PluginLoadFailed) {
             Log.logLine("[Zorcerer] plugin manager startup failed: {s}\n", .{@errorName(err)});
@@ -374,6 +389,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
             Ipc.shutdown_request_id,
             game_query_handler,
             engine_file_handler,
+            engine_command_handler,
         ) catch |err| {
             Log.logLine(
                 "[Zorcerer] plugin manager shutdown exchange failed: {s}\n",
@@ -392,6 +408,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
     // state lived in its own copy of the manager and is already gone.
     plugin_manager.deinit();
     game_queries.clear();
+    engine_commands.clear();
     engine = null;
     // The Log module keeps the captured sink: the engine interface stays
     // resident for the whole process lifetime, so it remains valid, and
@@ -432,6 +449,7 @@ fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
         Ipc.event_request_id,
         game_query_handler,
         engine_file_handler,
+        engine_command_handler,
     ) catch |err| {
         Log.logLine(
             "[Zorcerer] handling the plugin manager's reply to {s} failed: {s}\n",

@@ -7,6 +7,7 @@ const fork = root.core.ForkProcess;
 const Ipc = root.Ipc;
 const JsonRpc = root.core.JsonRpc;
 const Manager = root.core.PluginManager;
+const EngineCommands = root.core.EngineCommands;
 const FileService = root.core.FileService;
 const LuaHost = root.core.LuaHost;
 const zlua = @import("zlua");
@@ -388,6 +389,7 @@ test "parent listener answers a child query while waiting for readiness" {
         null,
         .{ .context = null, .handle = testQueryHandler },
         null,
+        null,
     );
 }
 
@@ -421,6 +423,7 @@ test "parent listener answers a child file request while waiting for readiness" 
         null,
         null,
         .{ .context = null, .handle = testFileHandler },
+        null,
     );
 }
 
@@ -458,6 +461,142 @@ test "file schema rejects non-file methods" {
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"pause\",\"id\":1}",
         ),
+    );
+}
+
+/// Records the command passed to a fake `IVEngineServer::ServerCommand`.
+const CommandSink = struct {
+    /// Last command text received, including the added line terminator but
+    /// without the NUL byte.
+    buffer: [Ipc.max_command_len + 1]u8 = undefined,
+    /// Number of valid bytes in `buffer`.
+    len: usize = 0,
+
+    /// Copies and records one command. The signature matches
+    /// `EngineCommands.EngineOps.server_command`.
+    fn execute(engine: *anyopaque, command: [*:0]const u8) callconv(.c) void {
+        const self: *CommandSink = @ptrCast(@alignCast(engine));
+        const text = std.mem.span(command);
+        @memcpy(self.buffer[0..text.len], text);
+        self.len = text.len;
+    }
+};
+
+test "engine command binding validates and forwards one command" {
+    var sink = CommandSink{};
+    var binding = EngineCommands.Binding{
+        .engine = &sink,
+        .ops = .{ .server_command = CommandSink.execute },
+    };
+
+    const text = try EngineCommands.Binding.handle(
+        &binding,
+        std.testing.allocator,
+        .{ .command = "say hello", .plugin_id = "demo" },
+    );
+    defer std.testing.allocator.free(text);
+
+    var parsed = try std.json.parseFromSlice(
+        Ipc.ServerCommandResult,
+        std.testing.allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.accepted);
+    try std.testing.expectEqualStrings("say hello\n", sink.buffer[0..sink.len]);
+}
+
+test "engine command binding rejects invalid text before the engine call" {
+    var sink = CommandSink{};
+    var binding = EngineCommands.Binding{
+        .engine = &sink,
+        .ops = .{ .server_command = CommandSink.execute },
+    };
+
+    try std.testing.expectError(
+        error.EmptyCommand,
+        EngineCommands.Binding.handle(&binding, std.testing.allocator, .{ .command = " \t" }),
+    );
+    try std.testing.expectError(
+        error.EmbeddedNul,
+        EngineCommands.Binding.handle(
+            &binding,
+            std.testing.allocator,
+            .{ .command = "say\x00hello" },
+        ),
+    );
+    try std.testing.expectError(
+        error.MultilineCommand,
+        EngineCommands.Binding.handle(
+            &binding,
+            std.testing.allocator,
+            .{ .command = "say hello\nquit" },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+}
+
+test "command request round-trips through the IPC schema" {
+    var buffer: [Ipc.max_payload_len]u8 = undefined;
+    const text = try Ipc.encodeServerCommand(&buffer, .{
+        .command = "say hello",
+        .plugin_id = "demo",
+    });
+
+    const parsed = try Ipc.parseServerCommand(std.testing.allocator, text);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("say hello", parsed.value.command);
+    try std.testing.expectEqualStrings("demo", parsed.value.plugin_id);
+    try std.testing.expect(parsed.id().eql(Ipc.server_command_request_id));
+}
+
+test "command validation rejects unsafe text" {
+    const too_long = [_]u8{'a'} ** (Ipc.max_command_len + 1);
+
+    try std.testing.expectError(error.EmptyCommand, Ipc.validateCommand(" \t"));
+    try std.testing.expectError(error.CommandTooLong, Ipc.validateCommand(&too_long));
+    try std.testing.expectError(error.EmbeddedNul, Ipc.validateCommand("say\x00hello"));
+    try std.testing.expectError(error.MultilineCommand, Ipc.validateCommand("say hello\nquit"));
+    try std.testing.expectError(error.MultilineCommand, Ipc.validateCommand("say hello\rquit"));
+    try std.testing.expectError(error.ControlCharacter, Ipc.validateCommand("say\x01hello"));
+    try Ipc.validateCommand("say hello\tagain");
+}
+
+/// Answers one command request and reports readiness.
+fn testCommandHandler(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    request: Ipc.ServerCommandRequest,
+) anyerror![]u8 {
+    if (!std.mem.eql(u8, request.command, "say hello")) return error.UnexpectedCommand;
+    if (!std.mem.eql(u8, request.plugin_id, "demo")) return error.UnexpectedPluginId;
+    return allocator.dupe(u8, "{\"accepted\":true}");
+}
+
+/// Child that sends one command request before reporting readiness.
+fn testCommandChild(fd: std.os.linux.fd_t) void {
+    Ipc.sendServerCommand(fd, .{
+        .command = "say hello",
+        .plugin_id = "demo",
+    }) catch return;
+    const result = Ipc.receiveServerCommandResult(fd, std.heap.page_allocator) catch return;
+    if (!result.accepted) return;
+    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+}
+
+test "parent listener answers a child command while waiting for readiness" {
+    var child = try fork.forkChild(testCommandChild);
+    defer child.finish() catch {};
+
+    try JsonRpc.jsonListener(
+        child.socket,
+        null,
+        null,
+        null,
+        .{ .context = null, .handle = testCommandHandler },
     );
 }
 
@@ -587,6 +726,80 @@ test "Lua script queries the game through LuaHost" {
         .host = LuaHost.host(&host_context),
     });
     defer script.deinit();
+}
+
+test "Lua script sends a server command through LuaHost" {
+    var child = try fork.forkChild(testLuaServerCommandResponder);
+    defer child.finish() catch {};
+
+    var manager = Manager.Manager.init();
+    manager.ipc_fd = child.socket;
+    defer manager.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var plugin_dir = try tmp.dir.createDirPathOpen(std.testing.io, "demo", .{});
+    plugin_dir.close(std.testing.io);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "demo/main.lua",
+        .data =
+        \\assert(zostd.plugin_id() == "demo")
+        \\local ok = assert(zostd.server_command("say hello"))
+        \\assert(ok == true)
+        \\
+        \\local bad, bad_error = zostd.server_command(
+        \\    "say hello" .. string.char(10) .. "quit")
+        \\assert(bad == nil)
+        \\assert(string.find(bad_error, "MultilineCommand", 1, true) ~= nil)
+        ,
+    });
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const plugins_root = path_buffer[0..root_len];
+
+    var service = try FileService.Service.init(
+        std.testing.allocator,
+        std.testing.io,
+        child.socket,
+        plugins_root,
+    );
+    defer service.deinit();
+
+    const files = try service.createPluginFiles("demo");
+    defer service.destroyPluginFiles(files);
+
+    var host_context = LuaHost.Context{
+        .manager = &manager,
+        .files = files,
+        .plugin_id = "demo",
+    };
+    var script = try zlua.Script.load(std.testing.allocator, std.testing.io, .{
+        .plugins_directory = plugins_root,
+        .directory_name = "demo",
+        .host = LuaHost.host(&host_context),
+    });
+    defer script.deinit();
+}
+
+/// Answers one `engine.serverCommand` request and returns an acceptance
+/// document.
+fn testLuaServerCommandResponder(fd: std.os.linux.fd_t) void {
+    const frame = Ipc.readFrame(fd) catch return;
+    if (!frame.framed or !frame.received) return;
+
+    const parsed = Ipc.parseServerCommand(std.heap.page_allocator, frame.text()) catch return;
+    defer parsed.deinit();
+
+    if (!std.mem.eql(u8, parsed.value.command, "say hello")) return;
+    if (!std.mem.eql(u8, parsed.value.plugin_id, "demo")) return;
+    Ipc.sendResultResponse(
+        fd,
+        parsed.id(),
+        "\"{\\\"accepted\\\":true}\"",
+    ) catch return;
 }
 
 /// Answers every game-query request with a fixed document matching the query

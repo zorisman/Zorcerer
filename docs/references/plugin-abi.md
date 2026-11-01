@@ -144,7 +144,7 @@ during event delivery (the parent is waiting for the event response).
 | Client callbacks | **no** | **no** |
 | Plugin id / manifest data | id, name, version, author, library path | id and root only |
 | Read-only game queries | `ctx.game`: server info, player info, entity existence, server/client cvar reads | `zostd.game.*` |
-| Engine commands / write access / game FS | **no** | `server_command` exists but is not wired by the manager |
+| Engine commands / write access / game FS | **no native command call**; Lua uses `zostd.server_command` over `engine.serverCommand` IPC | `server_command` is wired for Lua; native `GameApi` still has no command entry |
 | IPC/event payloads | JSON text for `levelInit`/`serverActivate` | same payload string |
 
 `Manager.dispatchEvent()` delivers each engine event to Lua scripts first and

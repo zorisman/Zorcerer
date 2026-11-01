@@ -86,6 +86,9 @@ const LuaScriptEntry = struct {
     files: *FileService.PluginFiles,
     /// Host callback context borrowed by the script runtime.
     host: *LuaHost.Context,
+    /// Owned copy of the script's directory name, used as its plugin id.
+    /// Freed in `unloadAll()` after the script shuts down.
+    plugin_id: []u8,
 };
 
 /// One lifecycle event emitted by the manager while loading plugins.
@@ -901,6 +904,7 @@ pub const Manager = struct {
             entry.script.deinit();
             if (self.file_service) |service| service.destroyPluginFiles(entry.files);
             self.allocator.destroy(entry.host);
+            self.allocator.free(entry.plugin_id);
         }
 
         self.lua_scripts.clearRetainingCapacity();
@@ -940,7 +944,24 @@ pub const Manager = struct {
         };
         var host_alive = true;
         defer if (host_alive) self.allocator.destroy(host_context);
-        host_context.* = .{ .manager = self, .files = files };
+
+        // The iterator reuses its name buffer on the next entry, so the id the
+        // script keeps for audit logging must be copied.
+        const plugin_id = self.allocator.dupe(u8, dir_name) catch |err| {
+            Log.logLine(
+                "[zlua] {s}/{s}/main.lua: could not store plugin id ({s}), script skipped\n",
+                .{ plugins_directory, dir_name, @errorName(err) },
+            );
+            return;
+        };
+        var plugin_id_alive = true;
+        defer if (plugin_id_alive) self.allocator.free(plugin_id);
+
+        host_context.* = .{
+            .manager = self,
+            .files = files,
+            .plugin_id = plugin_id,
+        };
 
         var script = zlua.Script.load(
             self.allocator,
@@ -958,6 +979,7 @@ pub const Manager = struct {
             .script = script,
             .files = files,
             .host = host_context,
+            .plugin_id = plugin_id,
         }) catch |err| {
             Log.logLine(
                 "[zlua] {s}: could not retain script ({s}), script skipped\n",
@@ -969,6 +991,7 @@ pub const Manager = struct {
         script_alive = false;
         files_alive = false;
         host_alive = false;
+        plugin_id_alive = false;
     }
 
     /// Delivers one engine event to every loaded Lua script and every
@@ -1014,6 +1037,32 @@ pub const Manager = struct {
         const fd = self.ipc_fd orelse return error.QueryUnavailable;
         try Ipc.sendQuery(fd, request);
         return Ipc.receiveQueryResult(fd, self.allocator);
+    }
+
+    /// Sends one command to the engine process and waits for its acceptance.
+    ///
+    /// `plugin_id` is advisory attribution for the Entrypoint's audit log. The
+    /// command is validated locally first, then validated again by the
+    /// Entrypoint, which is the actual trust boundary.
+    ///
+    /// Errors: `Ipc.CommandError` when the text is empty, too long, contains a
+    /// NUL byte, or spans multiple lines; `error.CommandUnavailable` when no
+    /// IPC channel is configured; `error.CommandRejected` when the parent did
+    /// not accept the command; plus the framing, JSON, and response errors of
+    /// `Ipc.sendServerCommand` and `Ipc.receiveServerCommandResult`.
+    pub fn executeServerCommand(
+        self: *@This(),
+        plugin_id: []const u8,
+        command: []const u8,
+    ) !void {
+        try Ipc.validateCommand(command);
+        const fd = self.ipc_fd orelse return error.CommandUnavailable;
+        try Ipc.sendServerCommand(fd, .{
+            .command = command,
+            .plugin_id = plugin_id,
+        });
+        const result = try Ipc.receiveServerCommandResult(fd, self.allocator);
+        if (!result.accepted) return error.CommandRejected;
     }
 
     /// Translates a query failure into an ABI status.

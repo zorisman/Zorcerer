@@ -1,10 +1,19 @@
 # JSON-RPC IPC Implementation Report
 
 Practical notes for the Zorcerer VSP (engine process) ↔ plugin-manager
-(forked child) channel, plus the Source engine console-command registration
-that makes `zorcerer ping` work over RCON.
+(forked child) channel. Earlier revisions also covered the Source engine
+console-command registration for `zorcerer ping`; that path has been removed and
+is retained below only as history.
 
 Date of writing: 2026-10-28.
+
+**Current-source note (2026-11-01):** the `ServerCommand` detour and the
+parent-to-child `serverCommand` test exchange described in this report are not
+present in the current source. Lua now sends `engine.serverCommand` from the
+child to the parent (request ID `102`); the Entrypoint validates it in
+`src/core/EngineCommands.zig` and queues it through a typed
+`IVEngineServer::ServerCommand` binding. Sections that describe the detour
+remain as historical failure-mode notes, not as implementation instructions.
 
 Audience: coding agents continuing this work. This document records the
 non-obvious failure modes, the ABI facts that were checked against the vendored
@@ -18,11 +27,10 @@ SDK, and the parts that are still hypotheses.
   `extern/source/source-sdk-2013/src/public/tier1/convar.h`,
   `extern/source/source-sdk-2013/src/public/icvar.h`, and
   `extern/source/source-sdk-2013/src/tier1/tier1.cpp`.
-- **Not verified:** the working tree as reviewed here has not been built or
-  exercised in this environment, and the console-command registration has
-  never run against a live TF2 dedicated server. Registration and dispatch at
-  runtime remain hypotheses. Existing tests are described below, but their
-  current results were not observed.
+- **Not verified:** the current tree builds and its test suite passes in this
+  environment, but no engine path has been exercised against a live TF2
+  dedicated server. Runtime behavior remains hypotheses. The console-command
+  registration described below no longer exists in the source.
 - **Not shipped by the SDK:** the actual `CCvar::RegisterConCommand`
   implementation lives in vstdlib, whose source is not in the SDK checkout
   (`src/vstdlib/` only contains an exclude `.vpc`). Its exact behavior is
@@ -39,8 +47,8 @@ SDK, and the parts that are still hypotheses.
 
 | Piece | Process | Responsibility |
 |---|---|---|
-| `src/Entrypoint.zig` | TF2 dedicated server | VSP callbacks, engine interface probing, `ServerCommand` detour, ConCommand registration, parent end of the IPC socket |
-| `src/PluginManager.zig` | forked child | Loads plugins, serves events, decides the test `serverCommand` reply |
+| `src/Entrypoint.zig` | TF2 dedicated server | VSP callbacks, engine interface probing, game queries, engine commands, parent end of the IPC socket |
+| `src/PluginManager.zig` | forked child | Loads plugins, serves events, forwards Lua game queries and commands |
 | `src/Ipc.zig` | both | Framing, JSON-RPC parsing/composition, shared schemas |
 | `src/io/Log.zig` | both | Engine `LogPrint` in the parent; IPC `stderr` notifications in the child |
 | `src/codegen_generated/engine_indexes.zig` | build-generated | Interface versions and vtable slot indices; never hand-write these |
@@ -102,28 +110,28 @@ Facts enforced by `src/Ipc.zig`:
 | child → parent | `ready` | notification | none | `{"message":"Hello from fork"}` |
 | child → parent | `stderr` | notification | none | `{"message":"..."}` |
 | parent → child | `pause`, `unpause`, `levelInit`, `serverActivate`, `levelShutdown` | request | `1` | result string `"Event is X"` |
-| parent → child | `serverCommand` | request | `2` | result object `{"command":"echo \"Pong!\""}` |
+| child → parent | `query.serverInfo`, `query.playerInfo`, `query.entityExists`, `query.serverCvar`, `query.clientCvar` | request | `100` | typed JSON result document |
+| child → parent | `file.*` | request | `101` | typed JSON file result |
+| child → parent | `engine.serverCommand` | request | `102` | JSON string `{"accepted":true}` |
+| parent → child | `shutdown` | request | `200` | result string `"OK"` |
 
-Example event request:
-
-```json
-{"jsonrpc": "2.0", "method": "pause", "id": 1}
-```
-
-Example test round trip:
+Example engine command round trip:
 
 ```json
-{"jsonrpc":"2.0","method":"serverCommand","params":{"command":"zorcerer ping"},"id":2}
+{"jsonrpc":"2.0","method":"engine.serverCommand","params":{"command":"say hello","plugin_id":"demo"},"id":102}
 ```
 
 ```json
-{"jsonrpc":"2.0","result":{"command":"echo \"Pong!\""},"id":2}
+{"jsonrpc":"2.0","result":"{\"accepted\":true}","id":102}
 ```
 
 The IDs are separate on purpose:
 
 - `event_request_id = 1` (`src/Ipc.zig`).
-- `server_command_request_id = 2`.
+- `query_request_id = 100`.
+- `file_request_id = 101`.
+- `server_command_request_id = 102`.
+- `shutdown_request_id = 200`.
 - Log/readiness traffic is sent as JSON-RPC notifications (`RpcId.ofNone()`),
   so it never consumes a request ID.
 
@@ -137,7 +145,7 @@ Entries stated as **Symptom class** are failure modes the implementation now
 guards against; they are included because a future change can reintroduce
 them.
 
-### 3.1 `Unknown command "zorcerer"` on RCON
+### 3.1 `Unknown command "zorcerer"` on RCON (historical)
 
 **Symptom:** the server replied `Unknown command "zorcerer"` to
 `zorcerer ping`.
@@ -296,7 +304,7 @@ allocate unbounded memory.
 **Guard:** `readFrame`'s documented error set and the `Frame` flags
 (`framed`, `received`).
 
-### 3.9 Re-entrant ping exchange deadlock
+### 3.9 Re-entrant ping exchange deadlock (historical)
 
 **Symptom class:** the manager's reply is executed through the original
 `ServerCommand`. Executing that line can re-enter engine command handling; if
@@ -315,7 +323,7 @@ re-enters the detour.
 commands serially; do not replace it with a per-request flag if callbacks ever
 become concurrent.
 
-### 3.10 Losing the original `ServerCommand` pointer
+### 3.10 Losing the original `ServerCommand` pointer (historical)
 
 **Symptom class:** after installing the detour there is no way to execute the
 manager's reply, because the vtable slot now points at the detour.
@@ -330,6 +338,10 @@ capture context, so module-level storage is required.
 hook's lifetime; `unload()` removes the hook after unregistering the command.
 
 ## 4. How to implement Source engine console commands
+
+**Current-source note:** the `zorcerer ping` ConCommand and its `ServerCommand`
+detour are not present in the current source. This section remains as a
+reference for a future console entry point; no ConCommand is registered today.
 
 ### 4.1 Three different things called "command"
 
@@ -348,9 +360,10 @@ Do not conflate them:
 
 ### 4.2 Registration recipe
 
-The working implementation is in `src/Entrypoint.zig`:
-`registerTestPingCommand`, `unregisterTestPingCommand`, `ConCommandObject`,
-`concommand_vtable`, and `conCommandDispatch`.
+The recipe below summarizes the removed `zorcerer ping` implementation
+(`registerTestPingCommand`, `unregisterTestPingCommand`, `ConCommandObject`,
+`concommand_vtable`, and `conCommandDispatch`). It is documentation of a
+previous approach, not a description of the current engine-command path.
 
 1. **Get `ICvar` from the engine factory.** `load()` receives the engine's
    `CreateInterfaceFn`. Fetch `"VEngineCvar004"` exactly as
@@ -640,31 +653,26 @@ Before trusting the command on a new TF2 build:
 
 ### 5.9 Current limitations / next steps
 
-- The manager's `serverCommand` handler is hard-coded: `testServerCommandReply`
-  returns `echo "Pong!"` only for `zorcerer ping`. There is no plugin dispatch
-  yet. Do not build a plugin-facing API on top of this handler without
-  designing the method allowlist and trust boundary described in
-  `docs/references/json_ipc.md`.
-- Only one console command (`zorcerer`) exists. It registers at load and
-  unregisters at unload; there is no generic registration table yet.
-- The reply path depends on `IVEngineServer::ServerCommand` and its captured
-  original pointer. If the hook cannot be installed, `load()` refuses to
-  continue; there is no alternative reply path.
-- The ConCommand ABI is source-derived and has not been exercised on a live
-  TF2 server in this work. Treat registration/dispatch as unverified until the
-  checklist above passes.
+- The console entry point (`zorcerer ping` and its `ConCommand`) is gone. There
+  is currently no way for a server console or RCON line to reach the manager;
+  the only command path is Lua → `engine.serverCommand` → Entrypoint.
+- Lua commands are accepted, not confirmed. `IVEngineServer::ServerCommand`
+  returns no status, so the caller cannot tell whether the engine recognized or
+  executed a command.
+- Lua scripts are trusted server-side code. There is no per-plugin command
+  allowlist or capability policy; `plugin_id` is audit data only.
 - The JSON-RPC channel is synchronous by design. If future work needs
   concurrent calls (for example, asynchronous plugin requests), add a request
-  ID allocator plus a pending-response map, and revisit the fixed IDs 1/2 and
-  the single-threaded assumption.
+  ID allocator plus a pending-response map, and revisit the fixed IDs and the
+  single-threaded assumption.
 
 ## 6. Useful references
 
 | Topic | File |
 |---|---|
 | Wire framing, schemas, ZigJR usage | `src/Ipc.zig` |
-| Fork, listener, `ServerCommand` detour, ConCommand | `src/Entrypoint.zig` |
-| Child listener and hard-coded test handler | `src/PluginManager.zig` |
+| Fork, listener, engine commands | `src/Entrypoint.zig`, `src/core/EngineCommands.zig` |
+| Child listener and Lua host | `src/PluginManager.zig`, `src/core/LuaHost.zig` |
 | Engine/IPC logging | `src/io/Log.zig` |
 | Interface versions and vtable indices | `src/codegen_generated/engine_indexes.zig` |
 | `ICvar` declaration and slots | `extern/source/source-sdk-2013/src/public/icvar.h` |

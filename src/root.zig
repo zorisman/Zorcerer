@@ -30,6 +30,7 @@ pub const codegen = struct {
 /// Core modules re-exported so files in this module can use `zroot` instead of
 /// parent-relative import paths.
 pub const core = struct {
+    pub const EngineCommands = @import("core/EngineCommands.zig");
     pub const EngineFilesystem = @import("core/EngineFilesystem.zig");
     pub const Entrypoint = @import("core/Entrypoint.zig");
     pub const FileService = @import("core/FileService.zig");
