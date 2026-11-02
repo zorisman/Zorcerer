@@ -1,7 +1,8 @@
 const std = @import("std");
 
-/// ABI contract between the plugin manager (src/PluginManager.zig) and
-/// every plugin it loads (see src/core/PluginContext.zig and
+/// ABI contract between the plugin manager
+/// (src/core/plugin/PluginManager.zig) and every plugin it loads
+/// (see src/core/plugin/PluginContext.zig and
 /// example-plugins/hello/hello_plugin.zig). Both sides import the same
 /// `plugin-context` build module so their declarations stay identical.
 pub const abi = @import("plugin-context");
@@ -40,7 +41,7 @@ pub const core = struct {
     pub const JsonRpc = @import("core/JsonRpc.zig");
     pub const LuaHost = @import("core/LuaHost.zig");
     pub const NetworkService = @import("core/NetworkService.zig");
-    pub const PluginManager = @import("core/PluginManager.zig");
+    pub const PluginManager = @import("core/plugin/PluginManager.zig");
     pub const Vsp = @import("core/Vsp.zig");
 };
 

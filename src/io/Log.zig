@@ -1,9 +1,10 @@
-//! Minimal logging front-end for the plugin manager (src/PluginManager.zig).
+//! Minimal logging front-end for the plugin manager
+//! (src/core/plugin/PluginManager.zig).
 //!
 //! Outside the forked plugin-manager process, logLine() formats one message
 //! and sends it to the Source SDK logging system: the engine's
 //! IVEngineServer::LogPrint, expressed as the context/print pair of abi.Logger
-//! (src/PluginContext.zig).
+//! (src/core/plugin/PluginContext.zig).
 //!
 //! The hook into the engine stays with the entrypoint: it resolves the
 //! IVEngineServer pointer and its LogPrint vtable slot, then hands them

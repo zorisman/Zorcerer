@@ -1005,7 +1005,7 @@ filesystem wrappers into the same change.
 
 ### 9.2 `PluginContext` is at ABI version 2 and exposes identity plus a logger
 
-**[checkout]** `src/core/PluginContext.zig` defines `abi_version = 2` and a
+**[checkout]** `src/core/plugin/PluginContext.zig` defines `abi_version = 2` and a
 `PluginContext` whose leading fields are `abi_version` and `struct_size`,
 followed by an optional `logger` and embedded `PluginInfo` (`id`, `name`,
 `version`, `author`, `library_path`). A plugin compiled against a different

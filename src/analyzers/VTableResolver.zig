@@ -54,7 +54,7 @@
 //!
 //! I/O shape of 0.16: reading /proc/self/maps (see `readProcSelfMaps`)
 //! needs an explicit `std.Io` handle, exactly like the rest of the
-//! project's runtime file I/O (src/PluginManager.zig threads one through
+//! project's runtime file I/O (src/core/plugin/PluginManager.zig threads one through
 //! as `threaded_io`). Pass the caller's instance in rather than creating
 //! another one.
 

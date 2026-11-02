@@ -208,22 +208,32 @@ pub fn build(b: *std.Build) !void {
     zlua.addImport("luajit", luajit);
     zlua.addImport("zostd", zostd);
 
+    // Version requirement grammar shared by plugin manifests and the
+    // dependency resolver (src/core/VersionRequirement.zig).
+    const version_requirement = b.addModule("version-requirement", .{
+        .root_source_file = b.path("src/core/VersionRequirement.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
     // Configuration of a single plugin's TOML manifest
-    // (src/PluginConfiguration.zig), later shared between the manager and
+    // (src/core/plugin/PluginConfiguration.zig), later shared between the manager and
     // the file access API in src/io/file_system.zig.
     const plugin_configuration = b.addModule("plugin-configuration", .{
-        .root_source_file = b.path("src/core/PluginConfiguration.zig"),
+        .root_source_file = b.path("src/core/plugin/PluginConfiguration.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
     plugin_configuration.addImport("toml", toml);
+    plugin_configuration.addImport("version-requirement", version_requirement);
 
     // Dependency graph calculation for validated plugin manifests
-    // (src/core/PluginDependency.zig). Kept as its own module so the
+    // (src/core/plugin/PluginDependency.zig). Kept as its own module so the
     // resolver can be tested without the manager or the filesystem.
     const plugin_dependency = b.addModule("plugin-dependency", .{
-        .root_source_file = b.path("src/core/PluginDependency.zig"),
+        .root_source_file = b.path("src/core/plugin/PluginDependency.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -231,24 +241,25 @@ pub fn build(b: *std.Build) !void {
     plugin_dependency.addImport("plugin-configuration", plugin_configuration);
 
     // ABI contract between the plugin manager and plugin modules
-    // (src/core/PluginContext.zig). The manager imports it through
+    // (src/core/plugin/PluginContext.zig). The manager imports it through
     // src/root.zig (`abi`); plugin compilations import it as this module, so
     // every side compiles the same declarations. Example plugins live
     // outside src/ in example-plugins/ and cannot reach it by file path
     // (imports may not escape a module's root directory), hence the module
     // indirection.
     const plugin_context = b.addModule("plugin-context", .{
-        .root_source_file = b.path("src/core/PluginContext.zig"),
+        .root_source_file = b.path("src/core/plugin/PluginContext.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
 
-    // Dynamic-library loader for native plugins (src/core/PluginLibrary.zig).
+    // Dynamic-library loader for native plugins
+    // (src/core/plugin/PluginLibrary.zig).
     // Kept separate from the manager so the structured dlopen()/dlsym()
     // behavior can be tested with small fixture libraries.
     const plugin_library = b.addModule("plugin-library", .{
-        .root_source_file = b.path("src/core/PluginLibrary.zig"),
+        .root_source_file = b.path("src/core/plugin/PluginLibrary.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -309,7 +320,7 @@ pub fn build(b: *std.Build) !void {
     hello_plugin.root_module.addImport("plugin-context", plugin_context);
     hello_plugin.out_filename = "hello_plugin.so";
 
-    // Dynamic libraries used by src/core/PluginLibrary.zig's tests. They are
+    // Dynamic libraries used by src/core/plugin/PluginLibrary.zig's tests. They are
     // never installed: the test executable receives only their emitted
     // paths through the build_options module below.
     const valid_fixture = b.addLibrary(.{
@@ -354,7 +365,7 @@ pub fn build(b: *std.Build) !void {
     // PluginLibrary is tested through its own module instance so the test
     // build options do not leak into the production module.
     const plugin_library_test_module = b.addModule("plugin-library-tests", .{
-        .root_source_file = b.path("src/core/PluginLibrary.zig"),
+        .root_source_file = b.path("src/core/plugin/PluginLibrary.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,

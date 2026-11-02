@@ -71,7 +71,7 @@ So, for **loading**: no additional VSP slots are required. For **useful event de
    unrelated plugins continue loading.
 8. Emits `runtime_entered` after the initialization pass.
 
-`PluginLibrary.open()` (`src/core/PluginLibrary.zig`) owns the dlopen handle
+`PluginLibrary.open()` (`src/core/plugin/PluginLibrary.zig`) owns the dlopen handle
 and reports structured rejections: `library_not_found`,
 `invalid_configuration`, or `missing_symbol`. A missing `onEvent` is not a
 rejection. The manager turns rejections into a `library_rejected` event.
@@ -80,7 +80,7 @@ rejection. The manager turns rejections into a `library_rejected` event.
 for initialized plugins, always closes the library, frees the context, and frees
 the path, then notifies and tears down Lua scripts.
 
-The ABI itself is in `src/core/PluginContext.zig` (version 2):
+The ABI itself is in `src/core/plugin/PluginContext.zig` (version 2):
 
 ```zig
 PluginContext {

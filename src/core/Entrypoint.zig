@@ -82,7 +82,7 @@ const Ipc = @import("Ipc.zig");
 const VTableHooks = @import("hooks").VTableHook;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
-const Manager = @import("PluginManager.zig");
+const Manager = @import("plugin/PluginManager.zig");
 const Log = root.io.Log;
 const abi = root.abi;
 const fork = @import("ForkProcess.zig");
@@ -171,7 +171,8 @@ const engine_client_print_handler = JsonRpc.ClientPrintHandler{
 /// each plugin's load() hook, and serve callback events through
 /// `Manager.listenForEvents`. The parent only wires the engine logger into its
 /// copy before forking and keeps the manifests from `readConfig()`; the child's
-/// own copy is released when it exits (see src/PluginManager.zig).
+/// own copy is released when it exits
+/// (see src/core/plugin/PluginManager.zig).
 var plugin_manager = Manager.Manager.init();
 
 /// The forked plugin-manager process, or null while none runs.

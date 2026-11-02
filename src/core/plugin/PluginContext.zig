@@ -1,4 +1,5 @@
-//! ABI contract between the Zorcerer plugin manager (src/core/PluginManager.zig)
+//! ABI contract between the Zorcerer plugin manager
+//! (src/core/plugin/PluginManager.zig)
 //! and every native plugin it loads.
 //!
 //! The file is shared by both sides of the dlopen() boundary: the manager

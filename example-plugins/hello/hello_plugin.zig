@@ -1,4 +1,4 @@
-//! Example plugin for the manager in src/PluginManager.zig.
+//! Example plugin for the manager in src/core/plugin/PluginManager.zig.
 //!
 //! This file is built into zig-out/lib/hello_plugin.so (see build.zig) and
 //! is placed into a plugin directory under tf/addons/zorcerer/plugins/,
@@ -7,7 +7,7 @@
 //!     tf/addons/zorcerer/plugins/hello/hello_plugin.so
 //!
 //! The plugin manager dlopen()s the .so, looks up the exported `load` and
-//! `unload` symbols (ABI contract in src/core/PluginContext.zig) and calls
+//! `unload` symbols (ABI contract in src/core/plugin/PluginContext.zig) and calls
 //! them with a *PluginContext. It also resolves the optional `onEvent`
 //! export, which this plugin implements to log runtime events.
 //!
