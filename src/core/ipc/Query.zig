@@ -1,13 +1,6 @@
 const std = @import("std");
 const zjr = @import("zjr");
 
-/// Request ID the plugin-manager child uses for game queries.
-///
-/// Queries are synchronous and strictly one at a time, and the parent is
-/// always blocked on the child's readiness or event response while a query is
-/// in flight, so a single fixed positive ID is sufficient.
-pub const query_request_id: i64 = 100;
-
 /// Read-only game-state queries a plugin may send to the engine process.
 pub const Query = enum {
     /// Server state snapshot: dedicated flag, pause, entity count, version,

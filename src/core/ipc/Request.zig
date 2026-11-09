@@ -8,15 +8,6 @@ message: []const u8,
 const std = @import("std");
 const zjr = @import("zjr");
 
-pub const RequestIdentifiers = enum(i64) {
-    unknown = 0,
-    /// Request ID used by `sendEvent`.
-    ///
-    /// The Entrypoint sends callback events synchronously, one at a time, so a
-    /// fixed positive ID is sufficient and lets the listener match the response.
-    event_request_id = 1,
-};
-
 /// Parses one JSON-RPC operation notification.
 ///
 /// Unknown methods, malformed requests, and missing or non-string `message`
