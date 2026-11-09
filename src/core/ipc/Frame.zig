@@ -17,6 +17,18 @@ payload: [max_payload_len]u8 = undefined,
 /// Number of valid bytes in `payload`; never exceeds `payload.len`.
 payload_len: usize = 0,
 
+/// First byte of every frame.
+///
+/// It distinguishes a frame from a truncated or desynchronized stream: without
+/// it the following length bytes cannot be interpreted.
+const marker: u8 = 0xA5;
+
+/// Largest payload, in bytes, one frame may carry.
+///
+/// The length is read before the payload, so the receiver can reject an
+/// oversized frame instead of blocking on a corrupt length.
+pub const max_payload_len: usize = 4096;
+
 /// Returns the received payload.
 ///
 /// The returned slice borrows this frame and remains valid for as long as

@@ -1,3 +1,6 @@
+const std = @import("std");
+const zjr = @import("zjr");
+
 /// Callbacks whose occurrence the Entrypoint reports to the plugin manager.
 pub const Event = enum {
     /// Entrypoint.pause() ran.
@@ -13,6 +16,16 @@ pub const Event = enum {
     /// Entrypoint.clientCommand() ran. The payload is the full client command
     /// line, for example `"zlua ping"`.
     clientCommand,
+
+    /// Returns the event named by a JSON-RPC method, or null.
+    pub fn fromMethod(method: []const u8) ?Event {
+        inline for (std.meta.fields(Event)) |field| {
+            if (std.mem.eql(u8, method, field.name)) {
+                return @as(Event, @enumFromInt(field.value));
+            }
+        }
+        return null;
+    }
 
     /// Parses one JSON-RPC event request.
     ///
@@ -32,7 +45,7 @@ pub const Event = enum {
         const request = rpc.request_msg.request;
         if (request.hasError()) return error.InvalidRpcRequest;
 
-        const event = eventFromMethod(request.method) orelse return error.UnknownMethod;
+        const event = Event.fromMethod(request.method) orelse return error.UnknownMethod;
 
         var payload: ?[]const u8 = null;
         if (request.objectParams()) |params| {
@@ -110,7 +123,7 @@ pub const Event = enum {
     pub fn responseText(self: *const @This(), buffer: []u8) ![]const u8 {
         return std.fmt.bufPrint(buffer, "Event is {s}", .{@tagName(self)});
     }
-    
+
     /// One event request payload.
     const EventMessage = struct {
         /// Callback that fired.
