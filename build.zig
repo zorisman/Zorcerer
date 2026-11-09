@@ -145,11 +145,7 @@ fn rawDataChanged(io: std.Io, toml_path: []const u8, indexes_path: []const u8) !
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{
-        .default_target = .{
-            .abi = .gnu,
-            .os_tag = .linux,
-            .cpu_arch = .x86_64
-        },
+        .default_target = .{ .abi = .gnu, .os_tag = .linux, .cpu_arch = .x86_64 },
     });
     const optimize = b.standardOptimizeOption(.{});
     const io = b.graph.io;
@@ -162,12 +158,7 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
     });
 
-    const toml = b.addModule("toml", .{
-        .root_source_file = b.path("extern/zig-toml/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .pic = true
-    });
+    const toml = b.addModule("toml", .{ .root_source_file = b.path("extern/zig-toml/src/root.zig"), .target = target, .optimize = optimize, .pic = true });
 
     const zjr = b.addModule("zjr", .{
         .root_source_file = b.path("extern/zigjr/src/zigjr.zig"),
