@@ -1,7 +1,7 @@
 //! Engine commands requested by the forked plugin-manager process.
 //!
 //! The child never dereferences an engine pointer. When a Lua script calls
-//! `zostd.server_command()`, the manager sends an `Ipc.ServerCommandRequest` to
+//! `zostd.server_command()`, the manager sends an `ServerCommand.ServerCommandRequest` to
 //! this process and blocks until the Entrypoint answers. `Binding.handle`
 //! validates the text again and queues it in the engine command buffer through
 //! the typed `IVEngineServer::ServerCommand` binding.
@@ -12,7 +12,7 @@
 //! request is revalidated here before the engine sees it.
 
 const std = @import("std");
-const Ipc = @import("Ipc.zig");
+const ServerCommand = @import("../ipc/ServerCommand.zig");
 const Vtable = @import("Vtable.zig");
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
@@ -93,12 +93,12 @@ pub const Binding = struct {
     ///
     /// Errors: `error.CommandUnavailable` when no engine binding is present,
     /// `error.CommandReentered` for a nested command request, the
-    /// `Ipc.CommandError` variants from `Ipc.validateCommand`, and
+    /// `ServerCommand.CommandError` variants from `ServerCommand.validate`, and
     /// `error.OutOfMemory` while building the result document.
     pub fn handle(
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.ServerCommandRequest,
+        request: ServerCommand.ServerCommandRequest,
     ) anyerror![]u8 {
         const raw_context = context orelse return error.CommandUnavailable;
         const self: *Binding = @ptrCast(@alignCast(raw_context));
@@ -106,12 +106,12 @@ pub const Binding = struct {
         const ops = self.ops orelse return error.CommandUnavailable;
 
         if (self.executing) return error.CommandReentered;
-        try Ipc.validateCommand(request.command);
+        try ServerCommand.validate(request.command);
 
         // `ServerCommand` appends to the engine's command buffer, so every
         // request must carry its own line terminator; otherwise two commands
         // could run together as one line.
-        var buffer: [Ipc.max_command_len + 2]u8 = undefined;
+        var buffer: [ServerCommand.max_command_len + 2]u8 = undefined;
         @memcpy(buffer[0..request.command.len], request.command);
         buffer[request.command.len] = '\n';
         buffer[request.command.len + 1] = 0;
@@ -127,7 +127,7 @@ pub const Binding = struct {
 
         return std.json.Stringify.valueAlloc(
             allocator,
-            Ipc.ServerCommandResult{ .accepted = true },
+            ServerCommand.ServerCommandResult{ .accepted = true },
             .{},
         );
     }

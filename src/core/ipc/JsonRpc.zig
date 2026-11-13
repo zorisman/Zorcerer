@@ -1,8 +1,19 @@
 const std = @import("std");
 const zjr = @import("zjr");
-const Ipc = @import("Ipc.zig");
 const Log = @import("zroot").io.Log;
 const fork = @import("ForkProcess.zig");
+
+const Frame = @import("Frame.zig");
+const Response = @import("Response.zig");
+const Sender = @import("Sender.zig");
+const Request = @import("Request.zig");
+const Operation = @import("Operation.zig").Operation;
+const Query = @import("Query.zig").Query;
+const ServerCommand = @import("ServerCommand.zig");
+const ClientPrint = @import("ClientPrint.zig");
+const FileRequest = @import("../../io/fs/FileRequest.zig");
+const FileResult = @import("../../io/fs/FileResult.zig");
+const Identifiers = @import("IdentifierRegistry.zig").Identifiers;
 
 /// Executes one JSON-RPC response received from the plugin manager.
 ///
@@ -48,7 +59,7 @@ pub const QueryHandler = struct {
     handle: *const fn (
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.QueryRequest,
+        request: Query.QueryRequest,
     ) anyerror![]u8,
 };
 
@@ -59,10 +70,10 @@ pub const QueryHandler = struct {
 /// (requests without an ID) are executed without a reply, as JSON-RPC requires.
 ///
 /// Errors are the allocation and framing errors from message composition and
-/// `Ipc.writeFrame`.
+/// `Frame.write`.
 fn handleQuery(
     socket: std.os.linux.fd_t,
-    request: Ipc.QueryRequest,
+    request: Query.QueryRequest,
     id: zjr.RpcId,
     handler: ?QueryHandler,
 ) !void {
@@ -70,14 +81,14 @@ fn handleQuery(
 
     const active_handler = handler orelse {
         if (!id.isNotification()) {
-            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Query is not available");
+            try Sender.sendErrorResponse(socket, id, .MethodNotFound, "Query is not available");
         }
         return;
     };
 
     const result_text = active_handler.handle(active_handler.context, allocator, request) catch |err| {
         if (!id.isNotification()) {
-            try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err));
+            try Sender.sendErrorResponse(socket, id, .InternalError, @errorName(err));
         }
         return;
     };
@@ -89,13 +100,13 @@ fn handleQuery(
     // string keeps every response result a string, like event responses.
     const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
     defer allocator.free(quoted);
-    try Ipc.sendResultResponse(socket, id, quoted);
+    try Sender.sendResultResponse(socket, id, quoted);
 }
 
 /// Answers filesystem requests sent by the plugin-manager child.
 ///
 /// `handle` runs in the engine process and returns the JSON document
-/// describing one `Ipc.FileResult`, allocated with the allocator it receives.
+/// describing one `FileResult`, allocated with the allocator it receives.
 /// The listener owns and frees that text after sending the response. An error
 /// means the request could not be processed; the child receives a JSON-RPC
 /// error and reports it as a transport failure.
@@ -106,7 +117,7 @@ pub const FileHandler = struct {
     handle: *const fn (
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.FileRequest,
+        request: FileRequest,
     ) anyerror![]u8,
 };
 
@@ -118,10 +129,10 @@ pub const FileHandler = struct {
 /// requires.
 ///
 /// Errors are the allocation and framing errors from message composition and
-/// `Ipc.writeFrame`.
+/// `Frame.write`.
 fn handleFile(
     socket: std.os.linux.fd_t,
-    request: Ipc.FileRequest,
+    request: FileRequest,
     id: zjr.RpcId,
     handler: ?FileHandler,
 ) !void {
@@ -129,14 +140,14 @@ fn handleFile(
 
     const active_handler = handler orelse {
         if (!id.isNotification()) {
-            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Filesystem is not available");
+            try Sender.sendErrorResponse(socket, id, .MethodNotFound, "Filesystem is not available");
         }
         return;
     };
 
     const result_text = active_handler.handle(active_handler.context, allocator, request) catch |err| {
         if (!id.isNotification()) {
-            try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err));
+            try Sender.sendErrorResponse(socket, id, .InternalError, @errorName(err));
         }
         return;
     };
@@ -149,7 +160,7 @@ fn handleFile(
     // responses.
     const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
     defer allocator.free(quoted);
-    try Ipc.sendResultResponse(socket, id, quoted);
+    try Sender.sendResultResponse(socket, id, quoted);
 }
 
 /// Answers engine command requests sent by the plugin-manager child.
@@ -165,7 +176,7 @@ pub const CommandHandler = struct {
     handle: *const fn (
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.ServerCommandRequest,
+        request: ServerCommand.ServerCommandRequest,
     ) anyerror![]u8,
 };
 
@@ -183,7 +194,7 @@ pub const ClientPrintHandler = struct {
     handle: *const fn (
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.ClientPrintRequest,
+        request: ClientPrint.ClientPrintRequest,
     ) anyerror![]u8,
 };
 
@@ -195,10 +206,10 @@ pub const ClientPrintHandler = struct {
 /// an ID) are executed without a reply, as JSON-RPC requires.
 ///
 /// Errors are the allocation and framing errors from message composition and
-/// `Ipc.writeFrame`.
+/// `Frame.write`.
 fn handleCommand(
     socket: std.os.linux.fd_t,
-    request: Ipc.ServerCommandRequest,
+    request: ServerCommand.ServerCommandRequest,
     id: zjr.RpcId,
     handler: ?CommandHandler,
 ) !void {
@@ -206,7 +217,7 @@ fn handleCommand(
 
     const active_handler = handler orelse {
         if (!id.isNotification()) {
-            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Commands are not available");
+            try Sender.sendErrorResponse(socket, id, .MethodNotFound, "Commands are not available");
         }
         return;
     };
@@ -219,8 +230,8 @@ fn handleCommand(
                 error.EmbeddedNul,
                 error.MultilineCommand,
                 error.ControlCharacter,
-                => try Ipc.sendErrorResponse(socket, id, .InvalidParams, @errorName(err)),
-                else => try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err)),
+                => try Sender.sendErrorResponse(socket, id, .InvalidParams, @errorName(err)),
+                else => try Sender.sendErrorResponse(socket, id, .InternalError, @errorName(err)),
             }
         }
         return;
@@ -234,7 +245,7 @@ fn handleCommand(
     // responses.
     const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
     defer allocator.free(quoted);
-    try Ipc.sendResultResponse(socket, id, quoted);
+    try Sender.sendResultResponse(socket, id, quoted);
 }
 
 /// Executes one client-print request and sends its JSON-RPC response.
@@ -245,10 +256,10 @@ fn handleCommand(
 /// an ID) are executed without a reply, as JSON-RPC requires.
 ///
 /// Errors are the allocation and framing errors from message composition and
-/// `Ipc.writeFrame`.
+/// `Frame.write`.
 fn handleClientPrint(
     socket: std.os.linux.fd_t,
-    request: Ipc.ClientPrintRequest,
+    request: ClientPrint.ClientPrintRequest,
     id: zjr.RpcId,
     handler: ?ClientPrintHandler,
 ) !void {
@@ -256,7 +267,7 @@ fn handleClientPrint(
 
     const active_handler = handler orelse {
         if (!id.isNotification()) {
-            try Ipc.sendErrorResponse(socket, id, .MethodNotFound, "Client prints are not available");
+            try Sender.sendErrorResponse(socket, id, .MethodNotFound, "Client prints are not available");
         }
         return;
     };
@@ -269,8 +280,8 @@ fn handleClientPrint(
                 error.EmbeddedNul,
                 error.MultilineClientPrint,
                 error.ControlCharacter,
-                => try Ipc.sendErrorResponse(socket, id, .InvalidParams, @errorName(err)),
-                else => try Ipc.sendErrorResponse(socket, id, .InternalError, @errorName(err)),
+                => try Sender.sendErrorResponse(socket, id, .InvalidParams, @errorName(err)),
+                else => try Sender.sendErrorResponse(socket, id, .InternalError, @errorName(err)),
             }
         }
         return;
@@ -284,7 +295,7 @@ fn handleClientPrint(
     // responses.
     const quoted = try std.json.Stringify.valueAlloc(allocator, result_text, .{});
     defer allocator.free(quoted);
-    try Ipc.sendResultResponse(socket, id, quoted);
+    try Sender.sendResultResponse(socket, id, quoted);
 }
 
 /// Listener for the manager's messages: reads framed JSON-RPC messages from
@@ -301,16 +312,16 @@ fn handleClientPrint(
 /// `expected_response_id` is null while waiting for readiness: the listener
 /// returns after a successful `.ready` and fails with `error.PluginLoadFailed`
 /// on a failed readiness text. For event exchanges it is
-/// `Ipc.event_request_id`; for the shutdown handshake it is
-/// `Ipc.shutdown_request_id`. The listener returns after handling that
+/// `Identifiers.event_request_id`; for the shutdown handshake it is
+/// `Identifiers.shutdown_request_id`. The listener returns after handling that
 /// response.
 ///
 /// Errors: `error.InvalidFrame` when the frame marker is missing,
 /// `error.EmptyMessage` for a zero-length payload, `error.UnexpectedResponseId`
 /// for a response that does not match a pending event, the framing errors of
-/// `Ipc.readFrame`, the JSON errors of `Ipc.parseQuery`,
-/// `Ipc.parseFileRequest`, `Ipc.parseServerCommand`, `Ipc.parseClientPrint`,
-/// `Ipc.parseRequest`/`Ipc.parseResponse`, and the response-shape errors of
+/// `Frame.read`, the JSON errors of `Query.parseQuery`,
+/// `FileRequest.parse`, `ServerCommand.parse`, `ClientPrint.parse`,
+/// `Request.parse`/`Response.parseResponse`, and the response-shape errors of
 /// `handleResponse`.
 pub fn jsonListener(
     socket: std.os.linux.fd_t,
@@ -323,11 +334,11 @@ pub fn jsonListener(
     const allocator = std.heap.page_allocator;
 
     while (true) {
-        const frame = try Ipc.readFrame(socket);
+        const frame = try Frame.read(socket);
         if (!frame.framed) return error.InvalidFrame;
         if (!frame.received) return error.EmptyMessage;
 
-        if (Ipc.parseQuery(allocator, frame.text())) |query| {
+        if (Query.parseQuery(allocator, frame.text())) |query| {
             defer query.deinit();
             try handleQuery(socket, query.value, query.id(), query_handler);
             continue;
@@ -337,7 +348,7 @@ pub fn jsonListener(
             else => return err,
         }
 
-        if (Ipc.parseFileRequest(allocator, frame.text())) |file| {
+        if (FileRequest.parse(allocator, frame.text())) |file| {
             defer file.deinit();
             try handleFile(socket, file.value, file.id(), file_handler);
             continue;
@@ -347,7 +358,7 @@ pub fn jsonListener(
             else => return err,
         }
 
-        if (Ipc.parseServerCommand(allocator, frame.text())) |command| {
+        if (ServerCommand.parse(allocator, frame.text())) |command| {
             defer command.deinit();
             try handleCommand(socket, command.value, command.id(), command_handler);
             continue;
@@ -358,7 +369,7 @@ pub fn jsonListener(
             else => return err,
         }
 
-        if (Ipc.parseClientPrint(allocator, frame.text())) |client_print| {
+        if (ClientPrint.parse(allocator, frame.text())) |client_print| {
             defer client_print.deinit();
             try handleClientPrint(
                 socket,
@@ -374,9 +385,9 @@ pub fn jsonListener(
             else => return err,
         }
 
-        const request = Ipc.parseRequest(allocator, frame.text()) catch |err| switch (err) {
+        const request = Request.parse(allocator, frame.text()) catch |err| switch (err) {
             error.NotRpcRequest => {
-                var response = Ipc.parseResponse(allocator, frame.text());
+                var response = Response.parseResponse(allocator, frame.text());
                 defer response.deinit();
                 const rpc_response = try response.value();
                 try validateResponseId(rpc_response.id, expected_response_id);
@@ -391,7 +402,7 @@ pub fn jsonListener(
         const outcome = try handleRequest(request.value);
 
         if (!request_id.isNotification()) {
-            try Ipc.sendResultResponse(socket, request_id, "\"OK\"");
+            try Sender.sendResultResponse(socket, request_id, "\"OK\"");
         }
 
         if (outcome == .ready and expected_response_id == null) return;
@@ -412,7 +423,7 @@ pub const RequestOutcome = enum {
 /// `manager_ready_message` reports success. Any other readiness text means the
 /// child could not load its plugins: it is logged as a startup failure and
 /// returned as `error.PluginLoadFailed`, so `load()` refuses the plugin set.
-pub fn handleRequest(request: Ipc.Request) !RequestOutcome {
+pub fn handleRequest(request: Request) !RequestOutcome {
     switch (request.operation) {
         .stderr => {
             Log.logLine("{s}", .{request.message});

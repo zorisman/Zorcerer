@@ -1,5 +1,13 @@
 const std = @import("std");
-const Ipc = @import("../Ipc.zig");
+const ipc = @import("zroot").ipc;
+const Frame = ipc.Frame;
+const Event = ipc.Event.Event;
+const Query = ipc.Query.Query;
+const QueryResult = ipc.QueryResult;
+const ServerCommand = ipc.ServerCommand;
+const ClientPrint = ipc.ClientPrint;
+const Shutdown = ipc.Shutdown;
+const Sender = ipc.Sender;
 const root = @import("zroot");
 const abi = root.abi;
 const Log = root.io.Log;
@@ -1088,7 +1096,7 @@ pub const Manager = struct {
     /// Delivers one engine event to every loaded Lua script and every
     /// initialized native plugin.
     ///
-    /// `event` is the `Ipc.Event` method name, for example `"pause"`.
+    /// `event` is the `Event` method name, for example `"pause"`.
     /// `payload` is optional JSON text; Lua receives it as the callback's
     /// second argument and native plugins receive it in `abi.Event`.
     ///
@@ -1122,12 +1130,12 @@ pub const Manager = struct {
     /// is already waiting for readiness or an event response.
     ///
     /// Errors: `error.QueryUnavailable` when no IPC channel is configured,
-    /// plus the framing, JSON, and response errors of `Ipc.sendQuery` and
-    /// `Ipc.receiveQueryResult`.
-    fn fetchQuery(self: *@This(), request: Ipc.QueryRequest) ![]u8 {
+    /// plus the framing, JSON, and response errors of `Query.sendQuery` and
+    /// `Query.receiveQueryResult`.
+    fn fetchQuery(self: *@This(), request: Query.QueryRequest) ![]u8 {
         const fd = self.ipc_fd orelse return error.QueryUnavailable;
-        try Ipc.sendQuery(fd, request);
-        return Ipc.receiveQueryResult(fd, self.allocator);
+        try Query.sendQuery(fd, request);
+        return Query.receiveQueryResult(fd, self.allocator);
     }
 
     /// Sends one command to the engine process and waits for its acceptance.
@@ -1136,23 +1144,23 @@ pub const Manager = struct {
     /// command is validated locally first, then validated again by the
     /// Entrypoint, which is the actual trust boundary.
     ///
-    /// Errors: `Ipc.CommandError` when the text is empty, too long, contains a
+    /// Errors: `ServerCommand.CommandError` when the text is empty, too long, contains a
     /// NUL byte, or spans multiple lines; `error.CommandUnavailable` when no
     /// IPC channel is configured; `error.CommandRejected` when the parent did
     /// not accept the command; plus the framing, JSON, and response errors of
-    /// `Ipc.sendServerCommand` and `Ipc.receiveServerCommandResult`.
+    /// `ServerCommand.send` and `ServerCommand.receiveResult`.
     pub fn executeServerCommand(
         self: *@This(),
         plugin_id: []const u8,
         command: []const u8,
     ) !void {
-        try Ipc.validateCommand(command);
+        try ServerCommand.validate(command);
         const fd = self.ipc_fd orelse return error.CommandUnavailable;
-        try Ipc.sendServerCommand(fd, .{
+        try ServerCommand.send(fd, .{
             .command = command,
             .plugin_id = plugin_id,
         });
-        const result = try Ipc.receiveServerCommandResult(fd, self.allocator);
+        const result = try ServerCommand.receiveResult(fd, self.allocator);
         if (!result.accepted) return error.CommandRejected;
     }
 
@@ -1181,25 +1189,25 @@ pub const Manager = struct {
     /// Entrypoint, which is the actual trust boundary.
     ///
     /// Errors: `error.NoActiveClientCommand` when called outside a
-    /// `clientCommand` event; `Ipc.ClientPrintError` when the text is empty,
+    /// `clientCommand` event; `ClientPrint.ClientPrintError` when the text is empty,
     /// too long, contains a NUL byte, or spans multiple lines;
     /// `error.ClientPrintUnavailable` when no IPC channel is configured;
     /// `error.ClientPrintRejected` when the parent did not print the message;
-    /// plus the framing, JSON, and response errors of `Ipc.sendClientPrint`
-    /// and `Ipc.receiveClientPrintResult`.
+    /// plus the framing, JSON, and response errors of `ClientPrint.send`
+    /// and `ClientPrint.receiveResult`.
     pub fn executeClientPrint(
         self: *@This(),
         plugin_id: []const u8,
         message: []const u8,
     ) !void {
         if (!self.client_command_active) return error.NoActiveClientCommand;
-        try Ipc.validateClientPrint(message);
+        try ClientPrint.validate(message);
         const fd = self.ipc_fd orelse return error.ClientPrintUnavailable;
-        try Ipc.sendClientPrint(fd, .{
+        try ClientPrint.send(fd, .{
             .message = message,
             .plugin_id = plugin_id,
         });
-        const result = try Ipc.receiveClientPrintResult(fd, self.allocator);
+        const result = try ClientPrint.receiveResult(fd, self.allocator);
         if (!result.printed) return error.ClientPrintRejected;
     }
 
@@ -1220,7 +1228,7 @@ pub const Manager = struct {
         defer self.allocator.free(text);
 
         var parsed = std.json.parseFromSlice(
-            Ipc.ServerInfo,
+            QueryResult.ServerInfo,
             self.allocator,
             text,
             .{},
@@ -1254,7 +1262,7 @@ pub const Manager = struct {
         defer self.allocator.free(text);
 
         var parsed = std.json.parseFromSlice(
-            Ipc.PlayerInfo,
+            QueryResult.PlayerInfo,
             self.allocator,
             text,
             .{},
@@ -1295,7 +1303,7 @@ pub const Manager = struct {
         defer self.allocator.free(text);
 
         var parsed = std.json.parseFromSlice(
-            Ipc.EntityInfo,
+            QueryResult.EntityInfo,
             self.allocator,
             text,
             .{},
@@ -1315,7 +1323,7 @@ pub const Manager = struct {
         defer self.allocator.free(text);
 
         var parsed = std.json.parseFromSlice(
-            Ipc.CvarValue,
+            QueryResult.CvarValue,
             self.allocator,
             text,
             .{},
@@ -1340,7 +1348,7 @@ pub const Manager = struct {
         defer self.allocator.free(text);
 
         var parsed = std.json.parseFromSlice(
-            Ipc.CvarValue,
+            QueryResult.CvarValue,
             self.allocator,
             text,
             .{},
@@ -1362,7 +1370,7 @@ fn storeText(destination: []u8, source: []const u8) struct { len: usize, truncat
 }
 
 /// Fills an ABI cvar result from its JSON form.
-fn fillCvarValue(value: Ipc.CvarValue, out: *abi.CvarValue) c_int {
+fn fillCvarValue(value: QueryResult.CvarValue, out: *abi.CvarValue) c_int {
     out.* = std.mem.zeroes(abi.CvarValue);
     out.struct_size = @sizeOf(abi.CvarValue);
     out.found = @intFromBool(value.found);
@@ -1471,7 +1479,7 @@ var event_manager: ?*Manager = null;
 /// Entrypoint holds the other end.
 ///
 /// Each received frame must carry a JSON-RPC request whose method is one of
-/// `Ipc.Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
+/// `Event`'s callbacks, for example `{"jsonrpc":"2.0","method":"pause",
 /// "id":1}`. Every valid event is delivered to the loaded Lua scripts and
 /// initialized native plugins before any response is sent. Every request
 /// carrying an ID is answered with exactly one JSON-RPC result or error
@@ -1481,7 +1489,7 @@ var event_manager: ?*Manager = null;
 /// as JSON-RPC requires. A message that cannot be decoded is answered with a
 /// JSON-RPC error and the message "Event is invalid".
 ///
-/// The `shutdown` method (`Ipc.shutdown_method`) unloads every plugin before
+/// The `shutdown` method (`Shutdown.shutdown_method`) unloads every plugin before
 /// the reply is sent, so plugin `unload()` hooks keep access to the
 /// filesystem service and to the engine process over the still-open channel.
 /// The listener returns after that reply.
@@ -1494,7 +1502,7 @@ var event_manager: ?*Manager = null;
 /// for the fork. This runs in the forked child, not in the engine process.
 pub fn listenForEvents(fd: std.os.linux.fd_t) void {
     while (true) {
-        const frame = Ipc.readFrame(fd) catch |err| {
+        const frame = Frame.read(fd) catch |err| {
             if (err != error.PeerClosed) {
                 Log.logLine(
                     "[zorcerer] event listener stopped: {s}\n",
@@ -1515,14 +1523,14 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
             continue;
         }
 
-        if (Ipc.parseShutdown(std.heap.page_allocator, frame.text())) |shutdown| {
+        if (Shutdown.parse(std.heap.page_allocator, frame.text())) |shutdown| {
             defer shutdown.deinit();
             const request_id = shutdown.id();
 
             if (event_manager) |manager| manager.unloadAll();
 
             if (!request_id.isNotification()) {
-                Ipc.sendResultResponse(fd, request_id, "\"OK\"") catch |err| {
+                Sender.sendResultResponse(fd, request_id, "\"OK\"") catch |err| {
                     Log.logLine(
                         "[zorcerer] event listener: replying to shutdown failed: {s}\n",
                         .{@errorName(err)},
@@ -1543,7 +1551,7 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
             },
         }
 
-        const parsed = Ipc.parseEvent(std.heap.page_allocator, frame.text()) catch |err| {
+        const parsed = Event.parse(std.heap.page_allocator, frame.text()) catch |err| {
             Log.logLine(
                 "[zorcerer] event listener: invalid event ({s})\n",
                 .{@errorName(err)},
@@ -1563,7 +1571,7 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
         const request_id = parsed.id();
         if (request_id.isNotification()) continue;
 
-        Ipc.sendEventResponse(fd, parsed.value.event, request_id) catch |err| {
+        Sender.sendEventResponse(fd, parsed.value.event, request_id) catch |err| {
             Log.logLine(
                 "[zorcerer] event listener: replying to {s} failed: {s}\n",
                 .{ @tagName(parsed.value.event), @errorName(err) },
@@ -1584,7 +1592,7 @@ pub fn listenForEvents(fd: std.os.linux.fd_t) void {
 /// Returns true when the reply was sent. Returns false when the write failed,
 /// which means the channel is gone and the listener should stop.
 fn respondInvalidEvent(fd: std.os.linux.fd_t, request_json: []const u8) bool {
-    Ipc.sendInvalidEventResponse(fd, request_json) catch |err| {
+    Sender.sendInvalidEventResponse(fd, request_json) catch |err| {
         Log.logLine(
             "[zorcerer] event listener: sending the invalid-event reply failed: {s}\n",
             .{@errorName(err)},

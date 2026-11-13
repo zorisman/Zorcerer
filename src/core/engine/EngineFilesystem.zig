@@ -15,7 +15,8 @@
 //! enumeration goes through `IFileSystem`'s find session.
 
 const std = @import("std");
-const Ipc = @import("Ipc.zig");
+const FileRequest = @import("../../io/fs/FileRequest.zig");
+const FileResult = @import("../../io/fs/FileResult.zig");
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 const abi = @import("plugin-context");
@@ -205,14 +206,14 @@ pub const Binding = struct {
 
     /// Executes one `game://` filesystem request from the plugin manager.
     ///
-    /// Returns a JSON document describing an `Ipc.FileResult`, allocated with
+    /// Returns a JSON document describing an `FileResult`, allocated with
     /// `allocator` and owned by the caller. The result status distinguishes
     /// permission errors, missing handles, open failures, and transport-level
     /// failures without terminating the listener.
     pub fn handle(
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.FileRequest,
+        request: FileRequest,
     ) anyerror![]u8 {
         const self: *@This() = @ptrCast(@alignCast(context orelse return error.MissingContext));
 
@@ -262,10 +263,10 @@ pub const Binding = struct {
                 const entry = self.handles.get(request.handle) orelse
                     return result(allocator, .{ .status = abi.file_invalid_handle });
 
-                const wanted = @min(request.length, Ipc.file_chunk_len);
+                const wanted = @min(request.length, FileRequest.file_chunk_len);
                 if (wanted == 0) return result(allocator, .{ .status = abi.file_ok });
 
-                var buffer: [Ipc.file_chunk_len]u8 = undefined;
+                var buffer: [FileRequest.file_chunk_len]u8 = undefined;
                 const bytes_read = ops.read(
                     self.base.?,
                     &buffer,
@@ -433,7 +434,7 @@ pub const Binding = struct {
 /// The returned slice is owned by the caller and freed with `allocator`.
 ///
 /// Errors: `error.OutOfMemory` when serialization cannot allocate.
-fn result(allocator: std.mem.Allocator, value: Ipc.FileResult) ![]u8 {
+fn result(allocator: std.mem.Allocator, value: FileResult) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 

@@ -2,7 +2,7 @@
 //!
 //! The child never dereferences an engine pointer. When a Lua script calls
 //! `zostd.client_print()` while handling a `clientCommand` event, the manager
-//! sends an `Ipc.ClientPrintRequest` to this process and blocks until the
+//! sends an `ClientPrint.ClientPrintRequest` to this process and blocks until the
 //! Entrypoint answers. `Binding.handle` validates the text again and prints it
 //! through the typed `IVEngineServer::ClientPrintf` binding.
 //!
@@ -13,7 +13,7 @@
 //! process.
 
 const std = @import("std");
-const Ipc = @import("Ipc.zig");
+const ClientPrint = @import("../ipc/ClientPrint.zig");
 const Vtable = @import("Vtable.zig");
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
@@ -130,13 +130,13 @@ pub const Binding = struct {
     /// Errors: `error.ClientPrintUnavailable` when no engine binding is
     /// present, `error.ClientPrintNoActiveClient` when no `ClientCommand`
     /// exchange is active, `error.ClientPrintReentered` for a nested print
-    /// request, the `Ipc.ClientPrintError` variants from
-    /// `Ipc.validateClientPrint`, and `error.OutOfMemory` while building the
+    /// request, the `ClientPrint.ClientPrintError` variants from
+    /// `ClientPrint.validate`, and `error.OutOfMemory` while building the
     /// result document.
     pub fn handle(
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.ClientPrintRequest,
+        request: ClientPrint.ClientPrintRequest,
     ) anyerror![]u8 {
         const raw_context = context orelse return error.ClientPrintUnavailable;
         const self: *Binding = @ptrCast(@alignCast(raw_context));
@@ -145,10 +145,10 @@ pub const Binding = struct {
         const entity = self.active_edict orelse return error.ClientPrintNoActiveClient;
 
         if (self.printing) return error.ClientPrintReentered;
-        try Ipc.validateClientPrint(request.message);
+        try ClientPrint.validate(request.message);
 
         // `ClientPrintf` takes a C string, so the message must be terminated.
-        var buffer: [Ipc.max_client_print_len + 1]u8 = undefined;
+        var buffer: [ClientPrint.max_client_print_len + 1]u8 = undefined;
         @memcpy(buffer[0..request.message.len], request.message);
         buffer[request.message.len] = 0;
 
@@ -164,7 +164,7 @@ pub const Binding = struct {
 
         return std.json.Stringify.valueAlloc(
             allocator,
-            Ipc.ClientPrintResult{ .printed = true },
+            ClientPrint.ClientPrintResult{ .printed = true },
             .{},
         );
     }
@@ -187,7 +187,7 @@ test "client print binding forwards one message to the active client" {
     defer std.testing.allocator.free(text);
 
     var parsed = try std.json.parseFromSlice(
-        Ipc.ClientPrintResult,
+        ClientPrint.ClientPrintResult,
         std.testing.allocator,
         text,
         .{},
@@ -241,7 +241,7 @@ const PrintSink = struct {
     /// Edict pointer passed by the binding.
     edict: ?*anyopaque = null,
     /// Message bytes without the terminating NUL.
-    buffer: [Ipc.max_client_print_len]u8 = undefined,
+    buffer: [ClientPrint.max_client_print_len]u8 = undefined,
     /// Number of valid bytes in `buffer`.
     len: usize = 0,
 

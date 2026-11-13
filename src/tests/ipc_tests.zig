@@ -1,6 +1,6 @@
 const std = @import("std");
 const zjr = @import("zjr");
-const ipc = @import("zroot").Ipc;
+const ipc = @import("zroot").ipc;
 
 /// In-process JSON-RPC listener used by tests.
 ///
@@ -16,7 +16,7 @@ pub const MockListener = struct {
     /// valid for the lifetime of the listener.
     pipeline: *zjr.RequestPipeline,
     /// Stable copy of the most recent response.
-    response_buffer: [ipc.max_payload_len]u8 = undefined,
+    response_buffer: [ipc.Frame.max_payload_len]u8 = undefined,
     /// Number of valid bytes in `response_buffer`.
     response_len: usize = 0,
 

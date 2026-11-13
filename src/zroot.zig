@@ -18,8 +18,8 @@ const zorcerer = @import("zorcerer");
 /// Plugin ABI declarations (src/core/plugin/PluginContext.zig).
 pub const abi = zorcerer.abi;
 
-/// IPC request/result schemas and transport helpers.
-pub const Ipc = zorcerer.Ipc;
+/// IPC transport and message-schema modules (see `zorcerer.ipc`).
+pub const ipc = zorcerer.ipc;
 
 /// Logging and filesystem facilities.
 pub const io = zorcerer.io;

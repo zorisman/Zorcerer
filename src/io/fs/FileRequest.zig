@@ -17,6 +17,9 @@ const Identifiers = @import("zroot").ipc.IdentifierRegistry.Identifiers;
 const FileOperations = @import("FileOperation.zig").FileOperations;
 const FileResult = @import("FileResult.zig");
 
+/// This module as the request type: its fields carry the request.
+const FileRequest = @import("FileRequest.zig");
+
 /// Largest raw file-data chunk one filesystem message carries.
 ///
 /// Base64 expands three input bytes to four characters, so a chunk this size

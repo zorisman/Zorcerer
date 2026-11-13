@@ -20,7 +20,7 @@
 const std = @import("std");
 const root = @import("zroot");
 const abi = @import("plugin-context");
-const Ipc = root.Ipc;
+const Request = root.ipc.Request;
 
 /// The captured Source SDK logging sink: the engine context paired with
 /// its LogPrint entry, exactly as Logger describes it. Null until setup() or
@@ -66,7 +66,8 @@ pub fn logLine(comptime fmt: []const u8, args: anytype) void {
         too_long_message;
 
     if (ipc_fd) |fd| {
-        Ipc.sendRequest(fd, .{ .operation = .stderr, .message = line }) catch {};
+        var request = Request{ .operation = .stderr, .message = line };
+        request.send(fd) catch {};
         return;
     }
 
@@ -85,7 +86,8 @@ pub fn pluginPrint(context: *anyopaque, message: [*:0]const u8) callconv(.c) voi
     _ = context;
 
     if (ipc_fd) |fd| {
-        Ipc.sendRequest(fd, .{ .operation = .stderr, .message = std.mem.span(message) }) catch {};
+        var request = Request{ .operation = .stderr, .message = std.mem.span(message) };
+        request.send(fd) catch {};
         return;
     }
 

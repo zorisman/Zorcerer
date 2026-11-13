@@ -3,9 +3,24 @@ const zjr = @import("zjr");
 const root = @import("zroot");
 const Entrypoint = root.core.Entrypoint;
 const Vsp = root.core.Vsp;
-const fork = root.core.ForkProcess;
-const Ipc = root.Ipc;
-const JsonRpc = root.core.JsonRpc;
+const fork = ipc.ForkProcess;
+const ipc = root.ipc;
+const Frame = ipc.Frame;
+const Response = ipc.Response;
+const Sender = ipc.Sender;
+const Request = ipc.Request;
+const Operation = ipc.Operation.Operation;
+const Event = ipc.Event.Event;
+const Query = ipc.Query.Query;
+const QueryResult = ipc.QueryResult;
+const ServerCommand = ipc.ServerCommand;
+const ClientPrint = ipc.ClientPrint;
+const Shutdown = ipc.Shutdown;
+const FileRequest = root.io.fs.FileRequest;
+const FileResult = root.io.fs.FileResult;
+const FileOp = root.io.fs.FileOperation.FileOperations;
+const Identifiers = ipc.IdentifierRegistry.Identifiers;
+const JsonRpc = ipc.JsonRpc;
 const Manager = root.core.PluginManager;
 const EngineCommands = root.core.EngineCommands;
 const FileService = root.core.FileService;
@@ -32,7 +47,7 @@ test {
 /// Child used by the IPC tests: sends the same readiness message the
 /// plugin-manager child sends once it is ready.
 fn testReportChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+    Request.ready(fd, fork.manager_ready_message) catch {};
 }
 
 /// Child used by the logging test: forwards a plugin print over IPC.
@@ -79,11 +94,11 @@ test "child logging is sent over IPC" {
     var child = try fork.forkChild(testLogChild);
     defer child.finish() catch {};
 
-    const frame = try Ipc.readFrame(child.socket);
-    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
+    const frame = try Frame.read(child.socket);
+    const request = try Request.parse(std.testing.allocator, frame.text());
     defer request.deinit();
 
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqual(Operation.stderr, request.value.operation);
     try std.testing.expectEqualStrings("plugin log line\n", request.value.message);
     try std.testing.expect(request.id().isNone());
 }
@@ -92,7 +107,7 @@ test "forked child reports that it initialized" {
     var child = try fork.forkChild(testReportChild);
     defer child.finish() catch {};
 
-    const frame = try Ipc.readFrame(child.socket);
+    const frame = try Frame.read(child.socket);
     try std.testing.expect(frame.framed);
 }
 
@@ -100,12 +115,12 @@ test "parent receives a JSON message from the child" {
     var child = try fork.forkChild(testReportChild);
     defer child.finish() catch {};
 
-    const frame = try Ipc.readFrame(child.socket);
+    const frame = try Frame.read(child.socket);
     try std.testing.expect(frame.received);
 
-    const request = try Ipc.parseRequest(std.testing.allocator, frame.text());
+    const request = try Request.parse(std.testing.allocator, frame.text());
     defer request.deinit();
-    try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
+    try std.testing.expectEqual(Operation.ready, request.value.operation);
     try std.testing.expectEqualStrings(fork.manager_ready_message, request.value.message);
     try std.testing.expect(request.id().isNone());
 }
@@ -114,31 +129,31 @@ test "child payload matches the serialized request" {
     var child = try fork.forkChild(testReportChild);
     defer child.finish() catch {};
 
-    const frame = try Ipc.readFrame(child.socket);
+    const frame = try Frame.read(child.socket);
     try std.testing.expect(frame.matches(
         "{\"jsonrpc\": \"2.0\", \"method\": \"ready\", \"params\": {\"message\":\"Hello from fork\"}}",
     ));
 }
 
 test "listener schema decodes the ready operation" {
-    const request = try Ipc.parseRequest(
+    const request = try Request.parse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"method\":\"ready\",\"params\":{\"message\":\"Hello from fork\"}}",
     );
     defer request.deinit();
 
-    try std.testing.expectEqual(Ipc.Operation.ready, request.value.operation);
+    try std.testing.expectEqual(Operation.ready, request.value.operation);
     try std.testing.expectEqualStrings("Hello from fork", request.value.message);
 }
 
 test "listener schema decodes the stderr operation" {
-    const request = try Ipc.parseRequest(
+    const request = try Request.parse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"a log line\"}}",
     );
     defer request.deinit();
 
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqual(Operation.stderr, request.value.operation);
     try std.testing.expectEqualStrings("a log line", request.value.message);
 }
 
@@ -162,19 +177,19 @@ test "failed readiness is rejected" {
 test "unexpected response IDs are rejected" {
     try std.testing.expectError(
         error.UnexpectedResponseId,
-        JsonRpc.validateResponseId(zjr.RpcId.of(2), Ipc.event_request_id),
+        JsonRpc.validateResponseId(zjr.RpcId.of(2), @intFromEnum(Identifiers.event_request_id)),
     );
     try std.testing.expectError(
         error.UnexpectedResponseId,
-        JsonRpc.validateResponseId(zjr.RpcId.of(Ipc.event_request_id), null),
+        JsonRpc.validateResponseId(zjr.RpcId.of(@intFromEnum(Identifiers.event_request_id)), null),
     );
-    try JsonRpc.validateResponseId(zjr.RpcId.of(Ipc.event_request_id), Ipc.event_request_id);
+    try JsonRpc.validateResponseId(zjr.RpcId.of(@intFromEnum(Identifiers.event_request_id)), @intFromEnum(Identifiers.event_request_id));
 }
 
 test "listener schema rejects an unknown operation" {
     try std.testing.expectError(
         error.UnknownMethod,
-        Ipc.parseRequest(
+        Request.parse(
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"stdout\",\"params\":{\"message\":\"x\"}}",
         ),
@@ -182,18 +197,18 @@ test "listener schema rejects an unknown operation" {
 }
 
 test "listener schema ignores unknown JSON-RPC fields" {
-    const request = try Ipc.parseRequest(
+    const request = try Request.parse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"x\"},\"unexpected\":1}",
     );
     defer request.deinit();
 
-    try std.testing.expectEqual(Ipc.Operation.stderr, request.value.operation);
+    try std.testing.expectEqual(Operation.stderr, request.value.operation);
     try std.testing.expectEqualStrings("x", request.value.message);
 }
 
 test "event JSON matches the schema" {
-    const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
+    const cases = [_]struct { event: Event, name: []const u8 }{
         .{ .event = .pause, .name = "pause" },
         .{ .event = .unpause, .name = "unpause" },
         .{ .event = .levelInit, .name = "levelInit" },
@@ -203,37 +218,37 @@ test "event JSON matches the schema" {
 
     var buffer: [128]u8 = undefined;
     for (cases) |case| {
-        const text = try Ipc.encodeEvent(&buffer, case.event, null);
+        const text = try case.event.encode(&buffer, null);
 
         var expected_buffer: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(
             &expected_buffer,
             "{{\"jsonrpc\": \"2.0\", \"method\": \"{s}\", \"id\": {d}}}",
-            .{ case.name, Ipc.event_request_id },
+            .{ case.name, @intFromEnum(Identifiers.event_request_id) },
         );
         try std.testing.expectEqualStrings(expected, text);
 
-        const parsed = try Ipc.parseEvent(std.testing.allocator, text);
+        const parsed = try Event.parse(std.testing.allocator, text);
         defer parsed.deinit();
         try std.testing.expectEqual(case.event, parsed.value.event);
-        try std.testing.expect(parsed.id().eql(Ipc.event_request_id));
+        try std.testing.expect(parsed.id().eql(@intFromEnum(Identifiers.event_request_id)));
     }
 }
 
 test "event payload round-trips as JSON text" {
     var buffer: [256]u8 = undefined;
-    const text = try Ipc.encodeEvent(&buffer, .levelInit, "{\"map\":\"de_dust2\"}");
+    const text = try Event.levelInit.encode(&buffer, "{\"map\":\"de_dust2\"}");
 
-    const parsed = try Ipc.parseEvent(std.testing.allocator, text);
+    const parsed = try Event.parse(std.testing.allocator, text);
     defer parsed.deinit();
-    try std.testing.expectEqual(Ipc.Event.levelInit, parsed.value.event);
+    try std.testing.expectEqual(Event.levelInit, parsed.value.event);
     try std.testing.expectEqualStrings("{\"map\":\"de_dust2\"}", parsed.value.payload.?);
 }
 
 test "event schema rejects a non-string payload" {
     try std.testing.expectError(
         error.InvalidParams,
-        Ipc.parseEvent(
+        Event.parse(
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"levelInit\",\"params\":{\"payload\":1},\"id\":1}",
         ),
@@ -243,7 +258,7 @@ test "event schema rejects a non-string payload" {
 test "event schema rejects an unknown callback" {
     try std.testing.expectError(
         error.UnknownMethod,
-        Ipc.parseEvent(
+        Event.parse(
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":1}",
         ),
@@ -254,7 +269,7 @@ test "manager answers every Entrypoint event with a JSON-RPC result" {
     var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
-    const cases = [_]struct { event: Ipc.Event, name: []const u8 }{
+    const cases = [_]struct { event: Event, name: []const u8 }{
         .{ .event = .pause, .name = "pause" },
         .{ .event = .unpause, .name = "unpause" },
         .{ .event = .levelInit, .name = "levelInit" },
@@ -263,16 +278,16 @@ test "manager answers every Entrypoint event with a JSON-RPC result" {
     };
 
     for (cases) |case| {
-        try Ipc.sendEvent(child.socket, case.event, null);
+        try case.event.send(child.socket, null);
 
-        const frame = try Ipc.readFrame(child.socket);
+        const frame = try Frame.read(child.socket);
         try std.testing.expect(frame.received);
 
-        var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+        var response = Response.parseResponse(std.testing.allocator, frame.text());
         defer response.deinit();
         const rpc_response = try response.value();
         try std.testing.expect(!rpc_response.hasErr());
-        try std.testing.expect(rpc_response.id.eql(Ipc.event_request_id));
+        try std.testing.expect(rpc_response.id.eql(@intFromEnum(Identifiers.event_request_id)));
 
         var expected_buffer: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(
@@ -290,18 +305,18 @@ test "manager ignores event notifications" {
 
     // Neither a valid event notification nor an invalid one may produce a
     // reply; only the following request is answered.
-    try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}");
-    try Ipc.writeFrame(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}");
-    try Ipc.sendEvent(child.socket, .unpause, null);
+    try Frame.write(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}");
+    try Frame.write(child.socket, "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}");
+    try Event.unpause.send(child.socket, null);
 
-    const frame = try Ipc.readFrame(child.socket);
+    const frame = try Frame.read(child.socket);
     try std.testing.expect(frame.received);
 
-    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+    var response = Response.parseResponse(std.testing.allocator, frame.text());
     defer response.deinit();
     const rpc_response = try response.value();
     try std.testing.expect(!rpc_response.hasErr());
-    try std.testing.expect(rpc_response.id.eql(Ipc.event_request_id));
+    try std.testing.expect(rpc_response.id.eql(@intFromEnum(Identifiers.event_request_id)));
     try std.testing.expectEqualStrings("Event is unpause", rpc_response.result.string);
 }
 
@@ -309,13 +324,13 @@ test "manager answers an unknown event instead of stalling" {
     var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
-    try Ipc.writeFrame(
+    try Frame.write(
         child.socket,
         "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\",\"id\":3}",
     );
 
-    const frame = try Ipc.readFrame(child.socket);
-    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+    const frame = try Frame.read(child.socket);
+    var response = Response.parseResponse(std.testing.allocator, frame.text());
     defer response.deinit();
     const rpc_response = try response.value();
 
@@ -330,32 +345,32 @@ test "manager answers an unknown event instead of stalling" {
 
 test "query request round-trips through the IPC schema" {
     var buffer: [256]u8 = undefined;
-    const text = try Ipc.encodeQuery(&buffer, .{
+    const text = try Query.encodeQuery(&buffer, .{
         .query = .player_info,
         .index = 3,
         .name = "cl_name",
     });
 
-    const parsed = try Ipc.parseQuery(std.testing.allocator, text);
+    const parsed = try Query.parseQuery(std.testing.allocator, text);
     defer parsed.deinit();
 
-    try std.testing.expectEqual(Ipc.Query.player_info, parsed.value.query);
+    try std.testing.expectEqual(Query.player_info, parsed.value.query);
     try std.testing.expectEqual(@as(c_int, 3), parsed.value.index);
     try std.testing.expectEqualStrings("cl_name", parsed.value.name);
-    try std.testing.expect(parsed.id().eql(Ipc.query_request_id));
+    try std.testing.expect(parsed.id().eql(@intFromEnum(Identifiers.query_request_id)));
 }
 
 test "query schema rejects non-query methods and bad parameters" {
     try std.testing.expectError(
         error.UnknownMethod,
-        Ipc.parseQuery(
+        Query.parseQuery(
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"stderr\",\"params\":{\"message\":\"x\"}}",
         ),
     );
     try std.testing.expectError(
         error.InvalidParams,
-        Ipc.parseQuery(
+        Query.parseQuery(
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"query.playerInfo\",\"params\":{\"index\":\"x\"},\"id\":100}",
         ),
@@ -366,7 +381,7 @@ test "query schema rejects non-query methods and bad parameters" {
 fn testQueryHandler(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
-    request: Ipc.QueryRequest,
+    request: Query.QueryRequest,
 ) anyerror![]u8 {
     if (request.query != .server_info) return error.UnexpectedQuery;
     return allocator.dupe(u8, "{\"dedicated\":true}");
@@ -374,12 +389,12 @@ fn testQueryHandler(
 
 /// Child that asks one question before reporting readiness.
 fn testQueryChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendQuery(fd, .{ .query = .server_info }) catch return;
-    const text = Ipc.receiveQueryResult(fd, std.heap.page_allocator) catch return;
+    Query.sendQuery(fd, .{ .query = .server_info }) catch return;
+    const text = Query.receiveQueryResult(fd, std.heap.page_allocator) catch return;
     defer std.heap.page_allocator.free(text);
 
     if (!std.mem.eql(u8, text, "{\"dedicated\":true}")) return;
-    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+    Request.ready(fd, fork.manager_ready_message) catch {};
 }
 
 test "parent listener answers a child query while waiting for readiness" {
@@ -400,7 +415,7 @@ test "parent listener answers a child query while waiting for readiness" {
 fn testFileHandler(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
-    request: Ipc.FileRequest,
+    request: FileRequest,
 ) anyerror![]u8 {
     if (request.op != .open) return error.UnexpectedRequest;
     if (!std.mem.eql(u8, request.path, "game://materials")) return error.UnexpectedPath;
@@ -409,12 +424,13 @@ fn testFileHandler(
 
 /// Child that asks one filesystem question before reporting readiness.
 fn testFileChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendFileRequest(fd, .{ .op = .open, .path = "game://materials" }) catch return;
-    const result = Ipc.receiveFileResult(fd, std.heap.page_allocator) catch return;
+    var request = FileRequest{ .op = .open, .path = "game://materials" };
+    request.send(fd) catch return;
+    const result = FileRequest.fromResponse(fd, std.heap.page_allocator) catch return;
     defer result.deinit();
 
     if (result.value.status != 0 or result.value.handle != 5) return;
-    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+    Request.ready(fd, fork.manager_ready_message) catch {};
 }
 
 test "parent listener answers a child file request while waiting for readiness" {
@@ -432,8 +448,8 @@ test "parent listener answers a child file request while waiting for readiness" 
 }
 
 test "file request round-trips through the IPC schema" {
-    var buffer: [Ipc.max_payload_len]u8 = undefined;
-    const text = try Ipc.encodeFileRequest(&buffer, .{
+    var buffer: [Frame.max_payload_len]u8 = undefined;
+    const request = FileRequest{
         .op = .write,
         .path = "plugin://note.txt",
         .mode = 1,
@@ -442,12 +458,13 @@ test "file request round-trips through the IPC schema" {
         .origin = 2,
         .length = 64,
         .data = "aGVsbG8=",
-    });
+    };
+    const text = try request.encode(&buffer);
 
-    const parsed = try Ipc.parseFileRequest(std.testing.allocator, text);
+    const parsed = try FileRequest.parse(std.testing.allocator, text);
     defer parsed.deinit();
 
-    try std.testing.expectEqual(Ipc.FileOp.write, parsed.value.op);
+    try std.testing.expectEqual(FileOp.write, parsed.value.op);
     try std.testing.expectEqualStrings("plugin://note.txt", parsed.value.path);
     try std.testing.expectEqual(@as(c_int, 1), parsed.value.mode);
     try std.testing.expectEqual(@as(u64, 9), parsed.value.handle);
@@ -455,13 +472,13 @@ test "file request round-trips through the IPC schema" {
     try std.testing.expectEqual(@as(c_int, 2), parsed.value.origin);
     try std.testing.expectEqual(@as(usize, 64), parsed.value.length);
     try std.testing.expectEqualStrings("aGVsbG8=", parsed.value.data);
-    try std.testing.expect(parsed.id().eql(Ipc.file_request_id));
+    try std.testing.expect(parsed.id().eql(@intFromEnum(Identifiers.file_request_id)));
 }
 
 test "file schema rejects non-file methods" {
     try std.testing.expectError(
         error.UnknownMethod,
-        Ipc.parseFileRequest(
+        FileRequest.parse(
             std.testing.allocator,
             "{\"jsonrpc\":\"2.0\",\"method\":\"pause\",\"id\":1}",
         ),
@@ -472,7 +489,7 @@ test "file schema rejects non-file methods" {
 const CommandSink = struct {
     /// Last command text received, including the added line terminator but
     /// without the NUL byte.
-    buffer: [Ipc.max_command_len + 1]u8 = undefined,
+    buffer: [ServerCommand.max_command_len + 1]u8 = undefined,
     /// Number of valid bytes in `buffer`.
     len: usize = 0,
 
@@ -501,7 +518,7 @@ test "engine command binding validates and forwards one command" {
     defer std.testing.allocator.free(text);
 
     var parsed = try std.json.parseFromSlice(
-        Ipc.ServerCommandResult,
+        ServerCommand.ServerCommandResult,
         std.testing.allocator,
         text,
         .{},
@@ -543,37 +560,37 @@ test "engine command binding rejects invalid text before the engine call" {
 }
 
 test "command request round-trips through the IPC schema" {
-    var buffer: [Ipc.max_payload_len]u8 = undefined;
-    const text = try Ipc.encodeServerCommand(&buffer, .{
+    var buffer: [Frame.max_payload_len]u8 = undefined;
+    const text = try ServerCommand.encode(&buffer, .{
         .command = "say hello",
         .plugin_id = "demo",
     });
 
-    const parsed = try Ipc.parseServerCommand(std.testing.allocator, text);
+    const parsed = try ServerCommand.parse(std.testing.allocator, text);
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("say hello", parsed.value.command);
     try std.testing.expectEqualStrings("demo", parsed.value.plugin_id);
-    try std.testing.expect(parsed.id().eql(Ipc.server_command_request_id));
+    try std.testing.expect(parsed.id().eql(@intFromEnum(Identifiers.server_command_request_id)));
 }
 
 test "command validation rejects unsafe text" {
-    const too_long = [_]u8{'a'} ** (Ipc.max_command_len + 1);
+    const too_long = [_]u8{'a'} ** (ServerCommand.max_command_len + 1);
 
-    try std.testing.expectError(error.EmptyCommand, Ipc.validateCommand(" \t"));
-    try std.testing.expectError(error.CommandTooLong, Ipc.validateCommand(&too_long));
-    try std.testing.expectError(error.EmbeddedNul, Ipc.validateCommand("say\x00hello"));
-    try std.testing.expectError(error.MultilineCommand, Ipc.validateCommand("say hello\nquit"));
-    try std.testing.expectError(error.MultilineCommand, Ipc.validateCommand("say hello\rquit"));
-    try std.testing.expectError(error.ControlCharacter, Ipc.validateCommand("say\x01hello"));
-    try Ipc.validateCommand("say hello\tagain");
+    try std.testing.expectError(error.EmptyCommand, ServerCommand.validate(" \t"));
+    try std.testing.expectError(error.CommandTooLong, ServerCommand.validate(&too_long));
+    try std.testing.expectError(error.EmbeddedNul, ServerCommand.validate("say\x00hello"));
+    try std.testing.expectError(error.MultilineCommand, ServerCommand.validate("say hello\nquit"));
+    try std.testing.expectError(error.MultilineCommand, ServerCommand.validate("say hello\rquit"));
+    try std.testing.expectError(error.ControlCharacter, ServerCommand.validate("say\x01hello"));
+    try ServerCommand.validate("say hello\tagain");
 }
 
 /// Answers one command request and reports readiness.
 fn testCommandHandler(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
-    request: Ipc.ServerCommandRequest,
+    request: ServerCommand.ServerCommandRequest,
 ) anyerror![]u8 {
     if (!std.mem.eql(u8, request.command, "say hello")) return error.UnexpectedCommand;
     if (!std.mem.eql(u8, request.plugin_id, "demo")) return error.UnexpectedPluginId;
@@ -582,13 +599,13 @@ fn testCommandHandler(
 
 /// Child that sends one command request before reporting readiness.
 fn testCommandChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendServerCommand(fd, .{
+    ServerCommand.send(fd, .{
         .command = "say hello",
         .plugin_id = "demo",
     }) catch return;
-    const result = Ipc.receiveServerCommandResult(fd, std.heap.page_allocator) catch return;
+    const result = ServerCommand.receiveResult(fd, std.heap.page_allocator) catch return;
     if (!result.accepted) return;
-    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+    Request.ready(fd, fork.manager_ready_message) catch {};
 }
 
 test "parent listener answers a child command while waiting for readiness" {
@@ -609,7 +626,7 @@ test "parent listener answers a child command while waiting for readiness" {
 fn testClientPrintHandler(
     _: ?*anyopaque,
     allocator: std.mem.Allocator,
-    request: Ipc.ClientPrintRequest,
+    request: ClientPrint.ClientPrintRequest,
 ) anyerror![]u8 {
     if (!std.mem.eql(u8, request.message, "Pong!")) return error.UnexpectedMessage;
     if (!std.mem.eql(u8, request.plugin_id, "demo")) return error.UnexpectedPluginId;
@@ -618,13 +635,13 @@ fn testClientPrintHandler(
 
 /// Child that sends one client-print request before reporting readiness.
 fn testClientPrintChild(fd: std.os.linux.fd_t) void {
-    Ipc.sendClientPrint(fd, .{
+    ClientPrint.send(fd, .{
         .message = "Pong!",
         .plugin_id = "demo",
     }) catch return;
-    const result = Ipc.receiveClientPrintResult(fd, std.heap.page_allocator) catch return;
+    const result = ClientPrint.receiveResult(fd, std.heap.page_allocator) catch return;
     if (!result.printed) return;
-    Ipc.sendReady(fd, fork.manager_ready_message) catch {};
+    Request.ready(fd, fork.manager_ready_message) catch {};
 }
 
 test "parent listener answers a child client print while waiting for readiness" {
@@ -642,43 +659,43 @@ test "parent listener answers a child client print while waiting for readiness" 
 }
 
 test "client print request round-trips through the IPC schema" {
-    var buffer: [Ipc.max_payload_len]u8 = undefined;
-    const text = try Ipc.encodeClientPrint(
+    var buffer: [Frame.max_payload_len]u8 = undefined;
+    const text = try ClientPrint.encode(
         &buffer,
         .{ .message = "Pong!", .plugin_id = "demo" },
     );
 
-    const parsed = try Ipc.parseClientPrint(std.testing.allocator, text);
+    const parsed = try ClientPrint.parse(std.testing.allocator, text);
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("Pong!", parsed.value.message);
     try std.testing.expectEqualStrings("demo", parsed.value.plugin_id);
-    try std.testing.expect(parsed.id().eql(Ipc.client_print_request_id));
+    try std.testing.expect(parsed.id().eql(@intFromEnum(Identifiers.client_print_request_id)));
 }
 
 test "shutdown request round-trips through the IPC schema" {
-    const parsed = try Ipc.parseShutdown(
+    const parsed = try Shutdown.parse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"method\":\"shutdown\",\"id\":200}",
     );
     defer parsed.deinit();
-    try std.testing.expect(parsed.id().eql(Ipc.shutdown_request_id));
+    try std.testing.expect(parsed.id().eql(@intFromEnum(Identifiers.shutdown_request_id)));
 }
 
 test "manager acknowledges shutdown and stops listening" {
     var child = try fork.forkChild(Manager.listenForEvents);
     defer child.finish() catch {};
 
-    try Ipc.sendShutdown(child.socket);
+    try Shutdown.send(child.socket);
 
-    const frame = try Ipc.readFrame(child.socket);
+    const frame = try Frame.read(child.socket);
     try std.testing.expect(frame.received);
 
-    var response = Ipc.parseResponse(std.testing.allocator, frame.text());
+    var response = Response.parseResponse(std.testing.allocator, frame.text());
     defer response.deinit();
     const rpc_response = try response.value();
     try std.testing.expect(!rpc_response.hasErr());
-    try std.testing.expect(rpc_response.id.eql(Ipc.shutdown_request_id));
+    try std.testing.expect(rpc_response.id.eql(@intFromEnum(Identifiers.shutdown_request_id)));
     try std.testing.expectEqualStrings("OK", rpc_response.result.string);
 }
 
@@ -686,26 +703,26 @@ test "query client receives a result from a responder" {
     var child = try fork.forkChild(testQueryResponder);
     defer child.finish() catch {};
 
-    try Ipc.sendQuery(child.socket, .{
+    try Query.sendQuery(child.socket, .{
         .query = .entity_exists,
         .index = 4,
     });
-    const text = try Ipc.receiveQueryResult(child.socket, std.testing.allocator);
+    const text = try Query.receiveQueryResult(child.socket, std.testing.allocator);
     defer std.testing.allocator.free(text);
 
-    var parsed = try std.json.parseFromSlice(Ipc.EntityInfo, std.testing.allocator, text, .{});
+    var parsed = try std.json.parseFromSlice(QueryResult.EntityInfo, std.testing.allocator, text, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.exists);
 }
 
 /// Answers one query request with a fixed entity document.
 fn testQueryResponder(fd: std.os.linux.fd_t) void {
-    const frame = Ipc.readFrame(fd) catch return;
-    const parsed = Ipc.parseQuery(std.heap.page_allocator, frame.text()) catch return;
+    const frame = Frame.read(fd) catch return;
+    const parsed = Query.parseQuery(std.heap.page_allocator, frame.text()) catch return;
     defer parsed.deinit();
 
     if (parsed.value.query != .entity_exists or parsed.value.index != 4) return;
-    Ipc.sendResultResponse(fd, parsed.id(), "\"{\\\"exists\\\":true}\"") catch {};
+    Sender.sendResultResponse(fd, parsed.id(), "\"{\\\"exists\\\":true}\"") catch {};
 }
 
 test "Lua script queries the game through LuaHost" {
@@ -860,15 +877,15 @@ test "Lua script sends a server command through LuaHost" {
 /// Answers one `engine.serverCommand` request and returns an acceptance
 /// document.
 fn testLuaServerCommandResponder(fd: std.os.linux.fd_t) void {
-    const frame = Ipc.readFrame(fd) catch return;
+    const frame = Frame.read(fd) catch return;
     if (!frame.framed or !frame.received) return;
 
-    const parsed = Ipc.parseServerCommand(std.heap.page_allocator, frame.text()) catch return;
+    const parsed = ServerCommand.parse(std.heap.page_allocator, frame.text()) catch return;
     defer parsed.deinit();
 
     if (!std.mem.eql(u8, parsed.value.command, "say hello")) return;
     if (!std.mem.eql(u8, parsed.value.plugin_id, "demo")) return;
-    Ipc.sendResultResponse(
+    Sender.sendResultResponse(
         fd,
         parsed.id(),
         "\"{\\\"accepted\\\":true}\"",
@@ -878,7 +895,7 @@ fn testLuaServerCommandResponder(fd: std.os.linux.fd_t) void {
 /// Answers every game-query request with a fixed document matching the query
 /// and its parameters, until the parent closes the socket.
 ///
-/// Results are serialized as JSON strings because `Ipc.receiveQueryResult`
+/// Results are serialized as JSON strings because `Query.receiveQueryResult`
 /// expects the result of a query response to be a string containing the result
 /// document.
 fn testLuaGameQueryResponder(fd: std.os.linux.fd_t) void {
@@ -910,10 +927,10 @@ fn testLuaGameQueryResponder(fd: std.os.linux.fd_t) void {
     ;
 
     while (true) {
-        const frame = Ipc.readFrame(fd) catch return;
+        const frame = Frame.read(fd) catch return;
         if (!frame.framed or !frame.received) return;
 
-        const parsed = Ipc.parseQuery(allocator, frame.text()) catch return;
+        const parsed = Query.parseQuery(allocator, frame.text()) catch return;
         defer parsed.deinit();
 
         const result_text: []const u8 = switch (parsed.value.query) {
@@ -939,7 +956,7 @@ fn testLuaGameQueryResponder(fd: std.os.linux.fd_t) void {
 
         const quoted = std.json.Stringify.valueAlloc(allocator, result_text, .{}) catch return;
         defer allocator.free(quoted);
-        Ipc.sendResultResponse(fd, parsed.id(), quoted) catch return;
+        Sender.sendResultResponse(fd, parsed.id(), quoted) catch return;
     }
 }
 

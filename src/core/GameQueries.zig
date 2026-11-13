@@ -2,7 +2,7 @@
 //!
 //! The plugin-manager child never dereferences an engine pointer. When a
 //! native plugin or Lua script asks for game state, the child sends an
-//! `Ipc.QueryRequest` to this process, and `Queries.handle` answers through
+//! `Query.QueryRequest` to this process, and `Queries.handle` answers through
 //! the typed `IVEngineServer` and `ICvar` bindings below. All access is
 //! synchronous and read-only.
 //!
@@ -12,7 +12,10 @@
 //! into engine memory that outlives one query.
 
 const std = @import("std");
-const Ipc = @import("Ipc.zig");
+const ipc = @import("zroot").ipc;
+const Query = ipc.Query.Query;
+const QueryResult = ipc.QueryResult;
+const Sender = ipc.Sender;
 const Indexes = @import("zroot").codegen.indexes;
 
 /// Longest text value returned by a query. Matches `MAX_PATH`, the bound the
@@ -346,7 +349,7 @@ pub const Queries = struct {
     pub fn handle(
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
-        request: Ipc.QueryRequest,
+        request: Query.QueryRequest,
     ) anyerror![]u8 {
         const self: *Queries = @ptrCast(@alignCast(context orelse return QueryError.EngineUnavailable));
         return switch (request.query) {
@@ -368,7 +371,7 @@ pub const Queries = struct {
         abi.get_game_dir(engine, &game_dir, game_dir.len);
         const game_dir_len = std.mem.indexOfScalar(u8, &game_dir, 0) orelse game_dir.len;
 
-        return std.json.Stringify.valueAlloc(allocator, Ipc.ServerInfo{
+        return std.json.Stringify.valueAlloc(allocator, QueryResult.ServerInfo{
             .dedicated = abi.is_dedicated_server(engine),
             .paused = abi.is_paused(engine),
             .entity_count = abi.get_entity_count(engine),
@@ -387,7 +390,7 @@ pub const Queries = struct {
         var info: PlayerInfo = std.mem.zeroes(PlayerInfo);
         const present = abi.get_player_info(engine, index, &info);
         if (!present) {
-            return std.json.Stringify.valueAlloc(allocator, Ipc.PlayerInfo{
+            return std.json.Stringify.valueAlloc(allocator, QueryResult.PlayerInfo{
                 .present = false,
                 .index = index,
                 .user_id = 0,
@@ -400,7 +403,7 @@ pub const Queries = struct {
             }, .{});
         }
 
-        return std.json.Stringify.valueAlloc(allocator, Ipc.PlayerInfo{
+        return std.json.Stringify.valueAlloc(allocator, QueryResult.PlayerInfo{
             .present = true,
             .index = index,
             .user_id = info.user_id,
@@ -417,7 +420,7 @@ pub const Queries = struct {
     fn entityExists(self: *Queries, allocator: std.mem.Allocator, index: c_int) ![]u8 {
         const engine = self.engine orelse return QueryError.EngineUnavailable;
         const abi = EngineAbi.bind(engine);
-        return std.json.Stringify.valueAlloc(allocator, Ipc.EntityInfo{
+        return std.json.Stringify.valueAlloc(allocator, QueryResult.EntityInfo{
             .exists = abi.p_entity_of_ent_index(engine, index) != null,
         }, .{});
     }
@@ -431,7 +434,7 @@ pub const Queries = struct {
         defer allocator.free(name_z);
 
         const found = abi.find_var(cvar, name_z) orelse {
-            return std.json.Stringify.valueAlloc(allocator, Ipc.CvarValue{
+            return std.json.Stringify.valueAlloc(allocator, QueryResult.CvarValue{
                 .found = false,
                 .int_value = 0,
                 .float_value = 0,
@@ -456,7 +459,7 @@ pub const Queries = struct {
         defer allocator.free(name_z);
 
         const value = abi.get_client_con_var_value(engine, index, name_z) orelse {
-            return std.json.Stringify.valueAlloc(allocator, Ipc.CvarValue{
+            return std.json.Stringify.valueAlloc(allocator, QueryResult.CvarValue{
                 .found = false,
                 .int_value = 0,
                 .float_value = 0,
@@ -464,7 +467,7 @@ pub const Queries = struct {
             }, .{});
         };
 
-        return std.json.Stringify.valueAlloc(allocator, Ipc.CvarValue{
+        return std.json.Stringify.valueAlloc(allocator, QueryResult.CvarValue{
             .found = true,
             .int_value = 0,
             .float_value = 0,
@@ -485,7 +488,7 @@ fn textField(field: []const u8) []const u8 {
 ///
 /// The C++ accessors read the root declaration through `m_pParent`; this
 /// mirrors that behavior, including the `FCVAR_NEVER_AS_STRING` check.
-fn cvarValue(found: *const ConVar) Ipc.CvarValue {
+fn cvarValue(found: *const ConVar) QueryResult.CvarValue {
     const root = found.parent orelse found;
 
     const text = if ((found.base.flags & cvar_never_as_string) != 0)
@@ -638,7 +641,7 @@ test "server info query binds the engine vtable and reports values" {
     const text = try Queries.handle(&queries, std.testing.allocator, .{ .query = .server_info });
     defer std.testing.allocator.free(text);
 
-    var parsed = try std.json.parseFromSlice(Ipc.ServerInfo, std.testing.allocator, text, .{});
+    var parsed = try std.json.parseFromSlice(QueryResult.ServerInfo, std.testing.allocator, text, .{});
     defer parsed.deinit();
 
     try std.testing.expect(parsed.value.dedicated);
@@ -660,7 +663,7 @@ test "map name is empty outside a level" {
     const text = try Queries.handle(&queries, std.testing.allocator, .{ .query = .server_info });
     defer std.testing.allocator.free(text);
 
-    var parsed = try std.json.parseFromSlice(Ipc.ServerInfo, std.testing.allocator, text, .{});
+    var parsed = try std.json.parseFromSlice(QueryResult.ServerInfo, std.testing.allocator, text, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("", parsed.value.map_name);
 }
@@ -677,7 +680,7 @@ test "player info query reports an empty slot and a filled slot" {
     );
     defer std.testing.allocator.free(empty_text);
 
-    var empty = try std.json.parseFromSlice(Ipc.PlayerInfo, std.testing.allocator, empty_text, .{});
+    var empty = try std.json.parseFromSlice(QueryResult.PlayerInfo, std.testing.allocator, empty_text, .{});
     defer empty.deinit();
     try std.testing.expect(!empty.value.present);
 
@@ -688,7 +691,7 @@ test "player info query reports an empty slot and a filled slot" {
     );
     defer std.testing.allocator.free(filled_text);
 
-    var filled = try std.json.parseFromSlice(Ipc.PlayerInfo, std.testing.allocator, filled_text, .{});
+    var filled = try std.json.parseFromSlice(QueryResult.PlayerInfo, std.testing.allocator, filled_text, .{});
     defer filled.deinit();
     try std.testing.expect(filled.value.present);
     try std.testing.expectEqual(@as(c_int, 7), filled.value.user_id);
@@ -709,7 +712,7 @@ test "entity query reports present and missing indexes" {
         .{ .query = .entity_exists, .index = 1 },
     );
     defer std.testing.allocator.free(present_text);
-    var present = try std.json.parseFromSlice(Ipc.EntityInfo, std.testing.allocator, present_text, .{});
+    var present = try std.json.parseFromSlice(QueryResult.EntityInfo, std.testing.allocator, present_text, .{});
     defer present.deinit();
     try std.testing.expect(present.value.exists);
 
@@ -719,7 +722,7 @@ test "entity query reports present and missing indexes" {
         .{ .query = .entity_exists, .index = 2 },
     );
     defer std.testing.allocator.free(missing_text);
-    var missing = try std.json.parseFromSlice(Ipc.EntityInfo, std.testing.allocator, missing_text, .{});
+    var missing = try std.json.parseFromSlice(QueryResult.EntityInfo, std.testing.allocator, missing_text, .{});
     defer missing.deinit();
     try std.testing.expect(!missing.value.exists);
 }
@@ -735,7 +738,7 @@ test "server cvar query reads the mirrored ConVar layout" {
         .{ .query = .server_cvar, .name = "sv_cheats" },
     );
     defer std.testing.allocator.free(found_text);
-    var found = try std.json.parseFromSlice(Ipc.CvarValue, std.testing.allocator, found_text, .{});
+    var found = try std.json.parseFromSlice(QueryResult.CvarValue, std.testing.allocator, found_text, .{});
     defer found.deinit();
     try std.testing.expect(found.value.found);
     try std.testing.expectEqual(@as(c_int, 1), found.value.int_value);
@@ -748,7 +751,7 @@ test "server cvar query reads the mirrored ConVar layout" {
         .{ .query = .server_cvar, .name = "missing" },
     );
     defer std.testing.allocator.free(missing_text);
-    var missing = try std.json.parseFromSlice(Ipc.CvarValue, std.testing.allocator, missing_text, .{});
+    var missing = try std.json.parseFromSlice(QueryResult.CvarValue, std.testing.allocator, missing_text, .{});
     defer missing.deinit();
     try std.testing.expect(!missing.value.found);
 }
@@ -764,7 +767,7 @@ test "client cvar query reads the engine value" {
         .{ .query = .client_cvar, .index = 1, .name = "cl_name" },
     );
     defer std.testing.allocator.free(text);
-    var parsed = try std.json.parseFromSlice(Ipc.CvarValue, std.testing.allocator, text, .{});
+    var parsed = try std.json.parseFromSlice(QueryResult.CvarValue, std.testing.allocator, text, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.found);
     try std.testing.expectEqualStrings("client-value", parsed.value.text);
