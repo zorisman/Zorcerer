@@ -4,6 +4,24 @@
 //! manager-side ID for handle operations. `data` is standard base64; `length`
 //! is the requested raw byte count. Only the fields relevant to `op` are
 //! meaningful.
+//!
+//! The request is transported as one IPC frame (see `core/ipc/Frame.zig`)
+//! with the JSON-RPC ID `Identifiers.file_request_id`; `fromResponse` reads
+//! the matching engine answer.
+
+const std = @import("std");
+const zjr = @import("zjr");
+const Frame = @import("zroot").ipc.Frame;
+const Response = @import("zroot").ipc.Response;
+const Identifiers = @import("zroot").ipc.IdentifierRegistry.Identifiers;
+const FileOperations = @import("FileOperation.zig").FileOperations;
+const FileResult = @import("FileResult.zig");
+
+/// Largest raw file-data chunk one filesystem message carries.
+///
+/// Base64 expands three input bytes to four characters, so a chunk this size
+/// fits `Frame.max_payload_len` together with its JSON envelope.
+pub const file_chunk_len: usize = 2048;
 
 /// Operation to execute.
 op: FileOperations,
@@ -42,7 +60,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ParsedFileRequest 
     const request = rpc.request_msg.request;
     if (request.hasError()) return error.InvalidRpcRequest;
 
-    const op = fileOpFromMethod(request.method) orelse return error.UnknownMethod;
+    const op = FileOperations.fromMethod(request.method) orelse return error.UnknownMethod;
     var value = FileRequest{ .op = op };
 
     if (request.objectParams()) |params| {
@@ -68,10 +86,29 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ParsedFileRequest 
     return .{ .rpc = rpc, .value = value };
 }
 
+/// Reads one integer parameter when it is present and fits `T`.
+///
+/// Returns null when the parameter is absent.
+///
+/// Errors: `error.InvalidParams` when the value is not a JSON integer or does
+/// not fit `T`.
+fn optionalInt(
+    params: std.json.ObjectMap,
+    name: []const u8,
+    comptime T: type,
+) error{InvalidParams}!?T {
+    const value = params.get(name) orelse return null;
+    const raw = switch (value) {
+        .integer => |number| number,
+        else => return error.InvalidParams,
+    };
+    return std.math.cast(T, raw) orelse error.InvalidParams;
+}
+
 /// Serializes `request` as a JSON-RPC request into `buffer`.
 ///
-/// Uses `file_request_id` so the waiter can match the response. The returned
-/// slice borrows `buffer`.
+/// Uses `Identifiers.file_request_id` so the waiter can match the response.
+/// The returned slice borrows `buffer`.
 ///
 /// Errors: `error.OutOfMemory` while encoding the parameters,
 /// `error.WriteFailed` when the request does not fit `buffer`, and writer
@@ -96,13 +133,31 @@ pub fn encode(request: *const @This(), buffer: []u8) ![]const u8 {
     defer allocator.free(params_json);
 
     try zjr.composer.writeRequestJson(
-        fileMethod(request.op),
+        request.op.method(),
         params_json,
-        zjr.RpcId.of(file_request_id),
+        Identifiers.file_request_id.rpcId(),
         &writer,
     );
     return writer.buffered();
 }
+
+/// Parameters serialized into a `file.*` request.
+const FileParams = struct {
+    /// See `FileRequest.path`.
+    path: []const u8,
+    /// See `FileRequest.mode`.
+    mode: c_int,
+    /// See `FileRequest.handle`.
+    handle: u64,
+    /// See `FileRequest.offset`.
+    offset: i64,
+    /// See `FileRequest.origin`.
+    origin: c_int,
+    /// See `FileRequest.length`.
+    length: usize,
+    /// See `FileRequest.data`.
+    data: []const u8,
+};
 
 /// Serializes `request` as a JSON-RPC request and sends it as one frame.
 ///
@@ -111,11 +166,11 @@ pub fn encode(request: *const @This(), buffer: []u8) ![]const u8 {
 ///
 /// Errors: `error.WriteFailed` when the request does not fit the stack buffer
 /// or the write fails, `error.OutOfMemory` while encoding the parameters, and
-/// `error.PayloadTooLarge` from `writeFrame`.
+/// `error.PayloadTooLarge` from `Frame.write`.
 pub fn send(request: *const @This(), fd: std.os.linux.fd_t) !void {
-    var buffer: [max_payload_len]u8 = undefined;
-    const payload_json = try encodeFileRequest(&buffer, request);
-    try writeFrame(fd, payload_json);
+    var buffer: [Frame.max_payload_len]u8 = undefined;
+    const payload_json = try request.encode(&buffer);
+    try Frame.write(fd, payload_json);
 }
 
 /// Reads the parent's response to the in-flight filesystem request.
@@ -123,26 +178,27 @@ pub fn send(request: *const @This(), fd: std.os.linux.fd_t) !void {
 /// Returns the parsed result, whose string fields borrow its storage. The
 /// caller owns the result and releases it with `deinit()`.
 ///
-/// Errors: framing errors from `readFrame`; `error.InvalidFrame` when the
+/// Errors: framing errors from `Frame.read`; `error.InvalidFrame` when the
 /// marker is missing; `error.EmptyMessage` for an empty payload;
 /// `error.UnexpectedFileResponse` when the payload is not a single JSON-RPC
 /// response; `error.UnexpectedResponseId` when the response does not answer
-/// `file_request_id`; `error.FileFailed` when the parent returned a JSON-RPC
-/// error; `error.UnexpectedResultType` when the result is not a JSON string;
-/// and `error.OutOfMemory` or `error.SyntaxError` while parsing the result.
+/// `Identifiers.file_request_id`; `error.FileFailed` when the parent returned
+/// a JSON-RPC error; `error.UnexpectedResultType` when the result is not a
+/// JSON string; and `error.OutOfMemory` or `error.SyntaxError` while parsing
+/// the result.
 pub fn fromResponse(
     fd: std.os.linux.fd_t,
     allocator: std.mem.Allocator,
-) !std.json.Parsed(@This()) {
-    const frame = try readFrame(fd);
+) !std.json.Parsed(FileResult) {
+    const frame = try Frame.read(fd);
     if (!frame.framed) return error.InvalidFrame;
     if (!frame.received) return error.EmptyMessage;
 
-    var response = parseResponse(allocator, frame.text());
+    var response = Response.parseResponse(allocator, frame.text());
     defer response.deinit();
     const rpc_response = response.value() catch return error.UnexpectedFileResponse;
 
-    if (!rpc_response.id.eql(file_request_id)) return error.UnexpectedResponseId;
+    if (!rpc_response.id.eql(Identifiers.file_request_id.rpcId())) return error.UnexpectedResponseId;
     if (rpc_response.hasErr()) return error.FileFailed;
 
     const text = switch (rpc_response.result) {

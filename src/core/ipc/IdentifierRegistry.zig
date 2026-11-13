@@ -41,6 +41,15 @@ pub const Identifiers = enum(i64) {
     /// answer.
     server_command_request_id = 102,
 
+    /// Request ID the plugin-manager child uses for client-print requests.
+    ///
+    /// Client prints are synchronous and strictly one at a time: the child blocks
+    /// until the engine process has delivered the message, and the parent is
+    /// already listening while it waits for readiness, an event response, or the
+    /// shutdown answer. Keeping the ID distinct from `server_command_request_id`
+    /// prevents a reply from satisfying the wrong exchange.
+    client_print_request_id = 103,
+
     /// Request ID the engine process uses to ask the plugin-manager child to
     /// unload its plugins and stop serving the channel.
     shutdown_request_id = 200,
