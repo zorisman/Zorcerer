@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const toml = @import("toml");
-const VersionRequirement = @import("VersionRequirement.zig").VersionRequirement;
+const VersionRequirement = @import("version-requirement").VersionRequirement;
 
 /// A single plugin's configuration, parsed from its manifest TOML file.
 ///

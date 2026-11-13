@@ -48,7 +48,7 @@ SDK, and the parts that are still hypotheses.
 | Piece | Process | Responsibility |
 |---|---|---|
 | `src/Entrypoint.zig` | TF2 dedicated server | VSP callbacks, engine interface probing, game queries, engine commands, parent end of the IPC socket |
-| `src/PluginManager.zig` | forked child | Loads plugins, serves events, forwards Lua game queries and commands |
+| `src/core/plugin/PluginManager.zig` | forked child | Loads plugins, serves events, forwards Lua game queries and commands |
 | `src/Ipc.zig` | both | Framing, JSON-RPC parsing/composition, shared schemas |
 | `src/io/Log.zig` | both | Engine `LogPrint` in the parent; IPC `stderr` notifications in the child |
 | `src/codegen_generated/engine_indexes.zig` | build-generated | Interface versions and vtable slot indices; never hand-write these |
@@ -675,7 +675,7 @@ Before trusting the command on a new TF2 build:
 |---|---|
 | Wire framing, schemas, ZigJR usage | `src/Ipc.zig` |
 | Fork, listener, engine commands | `src/Entrypoint.zig`, `src/core/EngineCommands.zig` |
-| Child listener and Lua host | `src/PluginManager.zig`, `src/core/LuaHost.zig` |
+| Child listener and Lua host | `src/core/plugin/PluginManager.zig`, `src/core/LuaHost.zig` |
 | Engine/IPC logging | `src/io/Log.zig` |
 | Interface versions and vtable indices | `src/codegen_generated/engine_indexes.zig` |
 | `ICvar` declaration and slots | `extern/source/source-sdk-2013/src/public/icvar.h` |

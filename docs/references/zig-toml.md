@@ -68,7 +68,7 @@ table. No dangling-slice path was found.
 
 A `std.Io` handle is required even though parsing itself is pure string work.
 In Zorcerer, the established fallback is a single-threaded `std.Io.Threaded`
-adapter when no `init.io` is available (`src/PluginManager.zig:24-25, 88`).
+adapter when no `init.io` is available (`src/core/plugin/PluginManager.zig:24-25, 88`).
 
 ## 4. Type conversion and struct mapping
 
@@ -129,7 +129,7 @@ Source: `extern/zig-toml/src/root.zig`, `parser.zig`, `table.zig`, `value.zig`.
   everything in one call.
 - Never `free` any data inside `result.value` manually.
 - Strings from `result.value` are **not stable** across `result.deinit()`;
-  dupe whatever must outlive the parse. Zorcerer's `src/PluginManager.zig:56-79, 120`
+  dupe whatever must outlive the parse. Zorcerer's `src/core/plugin/PluginManager.zig:56-79, 120`
   demonstrates the correct pattern.
 - `Parser` itself owns only the transient file buffer (caller allocator,
   freed inside `parseFile`) and `error_info` (caller allocator, freed in
@@ -143,7 +143,7 @@ Zorcerer side (`build.zig`):
 
 - `toml` module registered at `build.zig:26-31` with `pic = true`,
   target `x86_64-linux-gnu`; imported by the `zorcerer` module (`build.zig:45`)
-  and used by `src/PluginManager.zig` and `build/analyzers/AnalyzerDataAdapter.zig`
+  and used by `src/core/plugin/PluginManager.zig` and `build/analyzers/AnalyzerDataAdapter.zig`
   (`toml.Parser(AnalyzerConfig)` at line 158).
 - `toml-tests` compile target exists (`build.zig:56-59`), but its run step is
   commented out of the `tests` step (`build.zig:84-85`).
@@ -164,7 +164,7 @@ actually uses; informational only, since integration here is via the submodule.
   `[]const Address` array-of-tables, `toml.DateTime`, and an optional
   `description`. Uses `pub fn main(init: std.process.Init)`, `init.gpa`,
   `init.io` — consistent with `README.md:53-85`.
-- Zorcerer's real-world usage: `src/PluginManager.zig:85-129` — walk the manifest
+- Zorcerer's real-world usage: `src/core/plugin/PluginManager.zig:85-129` — walk the manifest
   directory, `toml.Parser(Manifest).init(self.allocator)`, `parseFile(io, full_path)`,
   dupe strings out of the arena, retain owned results.
 - Writer pattern for `serialize`: `std.Io.Writer.fixed(&buf)`, results read via

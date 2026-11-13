@@ -25,7 +25,7 @@
 //! `jsonListener`. The child then serves VSP callback events through the
 //! manager's own listener (`PluginManager.listenForEvents`).
 //!
-//! Messages are framed JSON-RPC 2.0 messages (see src/Ipc.zig). The manager's
+//! Messages are framed JSON-RPC 2.0 messages (see src/core/ipc). The manager's
 //! readiness report is a `ready` notification whose `params.message` is the
 //! child's readiness text. The callbacks send a request named after the event
 //! and receive a JSON-RPC result `"Event is X"` (or an error response).
@@ -78,20 +78,24 @@
 
 const std = @import("std");
 const zjr = @import("zjr");
-const Ipc = @import("Ipc.zig");
+const ipc = @import("zroot").ipc;
+const Request = ipc.Request;
+const Shutdown = ipc.Shutdown;
+const Event = ipc.Event.Event;
+const Identifiers = ipc.IdentifierRegistry.Identifiers;
 const VTableHooks = @import("hooks").VTableHook;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
-const Manager = @import("PluginManager.zig");
+const Manager = @import("plugin/PluginManager.zig");
 const Log = root.io.Log;
 const abi = root.abi;
-const fork = @import("ForkProcess.zig");
-const JsonRpc = @import("JsonRpc.zig");
+const fork = root.ipc.ForkProcess;
+const JsonRpc = root.ipc.JsonRpc;
 const GameQueries = @import("GameQueries.zig");
-const EngineCommands = @import("EngineCommands.zig");
-const EngineClients = @import("EngineClients.zig");
-const EngineFilesystem = @import("EngineFilesystem.zig");
-const Vsp = @import("Vsp.zig");
+const EngineCommands = root.core.EngineCommands;
+const EngineClients = root.core.EngineClients;
+const EngineFilesystem = root.core.EngineFilesystem;
+const Vsp = @import("engine/Vsp.zig");
 
 /// An IServerPluginCallbacks instance is just a vptr as far as the engine
 /// is concerned - no RTTI header to worry about, since nothing does
@@ -171,7 +175,8 @@ const engine_client_print_handler = JsonRpc.ClientPrintHandler{
 /// each plugin's load() hook, and serve callback events through
 /// `Manager.listenForEvents`. The parent only wires the engine logger into its
 /// copy before forking and keeps the manifests from `readConfig()`; the child's
-/// own copy is released when it exits (see src/PluginManager.zig).
+/// own copy is released when it exits
+/// (see src/core/plugin/PluginManager.zig).
 var plugin_manager = Manager.Manager.init();
 
 /// The forked plugin-manager process, or null while none runs.
@@ -206,13 +211,13 @@ fn pluginManagerChild(fd: std.os.linux.fd_t) void {
             "plugin load failed: {s}",
             .{@errorName(err)},
         ) catch "plugin load failed";
-        Ipc.sendReady(fd, message) catch return;
+        Request.ready(fd, message) catch return;
         Manager.listenForEvents(fd);
         plugin_manager.unloadAll();
         return;
     };
 
-    Ipc.sendReady(fd, fork.manager_ready_message) catch return;
+    Request.ready(fd, fork.manager_ready_message) catch return;
     Manager.listenForEvents(fd);
     plugin_manager.unloadAll();
 }
@@ -392,7 +397,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
         // The shutdown request lets the child run unload() while the channel
         // and the engine filesystem are still usable. If it cannot be sent,
         // finish() still closes the socket, which makes the child exit.
-        Ipc.sendShutdown(child.socket) catch |err| {
+        Shutdown.send(child.socket) catch |err| {
             Log.logLine(
                 "[Zorcerer] sending shutdown to the plugin manager failed: {s}\n",
                 .{@errorName(err)},
@@ -400,7 +405,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
         };
         JsonRpc.jsonListener(
             child.socket,
-            Ipc.shutdown_request_id,
+            @intFromEnum(Identifiers.shutdown_request_id),
             game_query_handler,
             engine_file_handler,
             engine_command_handler,
@@ -449,10 +454,10 @@ fn unload(this: *anyopaque) callconv(.c) void {
 ///
 /// Errors are logged rather than propagated: the engine callbacks have no way
 /// to report failure, and `unload` owns the manager's lifetime.
-fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
+fn sendManagerEvent(event: Event, payload: ?[]const u8) void {
     const child = if (manager_child) |*running| running else return;
 
-    Ipc.sendEvent(child.socket, event, payload) catch |err| {
+    event.send(child.socket, payload) catch |err| {
         Log.logLine(
             "[Zorcerer] sending the {s} event to the plugin manager failed: {s}\n",
             .{ @tagName(event), @errorName(err) },
@@ -462,7 +467,7 @@ fn sendManagerEvent(event: Ipc.Event, payload: ?[]const u8) void {
 
     JsonRpc.jsonListener(
         child.socket,
-        Ipc.event_request_id,
+        @intFromEnum(Identifiers.event_request_id),
         game_query_handler,
         engine_file_handler,
         engine_command_handler,

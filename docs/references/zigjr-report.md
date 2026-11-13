@@ -10,7 +10,7 @@ Current IPC contract (HEAD `2d727d5`):
 | `src/Ipc.zig:71-162` | Transport framing: `0xA5 + u32 length + JSON payload`, `max_payload_len = 4096` |
 | `src/Entrypoint.zig:295-352` | Parent handles every frame as a `Request`; child sends a `stderr` request as its readiness report |
 | `src/Entrypoint.zig:603-655` | Parent sends `{"event":"X"}`, then blocks reading exactly one reply |
-| `src/PluginManager.zig:365-421` | Child listens for events, answers every frame with `{"operation":"stderr","message":"Event is X"}` |
+| `src/core/plugin/PluginManager.zig:365-421` | Child listens for events, answers every frame with `{"operation":"stderr","message":"Event is X"}` |
 | `build.zig:98-103,160` | `zjr` module is already declared and imported into the `zorcerer` module |
 | `src/Ipc.zig:15` | `@import("zjr")` exists only as an **uncommitted** working-tree change |
 
@@ -90,7 +90,7 @@ Keep the existing `0xA5` framing and `max_payload_len`; JSON-RPC 2.0 has no fram
 - `sendManagerEvent`: allocate a monotonic event `id`, call `Ipc.sendEvent(fd, id, event)`, then `jsonListener` to consume the response. Verify the response ID with `RpcId.eql`.
 - Update the module header (`src/Entrypoint.zig:24-31`) which currently documents the old schema.
 
-### 5. Rewrite `src/PluginManager.zig:365-421`
+### 5. Rewrite `src/core/plugin/PluginManager.zig:365-421`
 
 - Parse incoming messages as requests.
 - Check `req.hasError()` and answer with `composer.writeErrorResponseJson(req.err().req_id, req.err().code, req.err().err_msg)`.
@@ -98,7 +98,7 @@ Keep the existing `0xA5` framing and `max_payload_len`; JSON-RPC 2.0 has no fram
 - Unknown method → `MethodNotFound`; bad params/unknown event → `InvalidParams`.
 - Notifications (no `id`) get no reply; numeric/string IDs get exactly one response.
 - Replace `respondInvalidEvent` with a general `respondError`.
-- Update the doc comment at `src/PluginManager.zig:348-362`.
+- Update the doc comment at `src/core/plugin/PluginManager.zig:348-362`.
 
 ### 6. Update tests
 

@@ -1,4 +1,4 @@
-//! Shared-library fixture for src/core/PluginLibrary.zig tests.
+//! Shared-library fixture for src/core/plugin/PluginLibrary.zig tests.
 //!
 //! Exports the required ABI surface plus the optional `onEvent` export, so
 //! the loader test can verify that a plugin subscribing to runtime events is

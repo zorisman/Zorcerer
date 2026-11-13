@@ -250,7 +250,7 @@ The exact split between "ZLua" and "plugin manager" is not fully specified in th
 
 ### 3.3 Plugin loading is `.so`-only
 
-`PluginManager.loadPlugins()` scans plugin directories and opens `.so` files (`src/PluginManager.zig:208-214`). The manifest schema currently allows only:
+`PluginManager.loadPlugins()` scans plugin directories and opens `.so` files (`src/core/plugin/PluginManager.zig:208-214`). The manifest schema currently allows only:
 
 - `plugin_id`
 - `name`
@@ -258,7 +258,7 @@ The exact split between "ZLua" and "plugin manager" is not fully specified in th
 - `author`
 - `lib_path`
 
-(`src/PluginConfiguration.zig:29-47`)
+(`src/core/plugin/PluginConfiguration.zig:29-47`)
 
 The parser rejects unknown top-level keys and enforces a 4 KiB manifest limit (`PluginConfiguration.zig:22`, `:59-61`, `:76-79`). There is no script entry point and no plugin type field.
 
@@ -420,7 +420,7 @@ registered `ConCommand`, plus a persistent console Lua state.
 
 - `src/Entrypoint.zig`: install and own the console entry detour or `ConCommand`.
 - `src/Ipc.zig`: add a manager request/response schema for the console text and its result.
-- `src/PluginManager.zig`: add a console Lua state and dispatch path.
+- `src/core/plugin/PluginManager.zig`: add a console Lua state and dispatch path.
 - Reuse the existing engine pointer and command binding rather than introducing a second command path.
 
 #### Risks and limits
@@ -460,7 +460,7 @@ registered `ConCommand`, plus a persistent console Lua state.
 4. `PluginManager.listenForEvents()` dispatches `pause`, `unpause`, `levelInit`, `serverActivate`, and `levelShutdown` to each script. Errors are logged per plugin and do not abort the other scripts.
 5. On unload, call the script's `on_unload`, unref callbacks, then `lua.deinit()`.
 
-This fits the current manager loop: `listenForEvents` already parses `Ipc.Event` and sends a response (`src/PluginManager.zig:386-437`). Today it only replies `"Event is X"`; the Lua dispatcher would run before the reply.
+This fits the current manager loop: `listenForEvents` already parses `Ipc.Event` and sends a response (`src/core/plugin/PluginManager.zig:386-437`). Today it only replies `"Event is X"`; the Lua dispatcher would run before the reply.
 
 #### Why it is valid against the docs/references
 
@@ -472,8 +472,8 @@ This fits the current manager loop: `listenForEvents` already parses `Ipc.Event`
 
 #### Required changes
 
-- `src/PluginConfiguration.zig`: add script fields, make `lib_path`/`script_path` mutually exclusive, keep the 4 KiB limit.
-- `src/PluginManager.zig`: plugin type branch, per-plugin Lua state table, load/unload lifecycle, event dispatch.
+- `src/core/plugin/PluginConfiguration.zig`: add script fields, make `lib_path`/`script_path` mutually exclusive, keep the 4 KiB limit.
+- `src/core/plugin/PluginManager.zig`: plugin type branch, per-plugin Lua state table, load/unload lifecycle, event dispatch.
 - `src/Ipc.zig`: no new event is strictly required for the five existing events. A `gameFrame` event would require a new engine callback and is not present today.
 - `src/ZLua.zig`: shared state creation, sandbox setup, script loading, callback registry, budgets.
 - `src/zostd/`: Lua-facing API and its Zig implementation.
@@ -507,7 +507,7 @@ A normal Zorcerer plugin:
 4. Registers plugin-specific Zig functions.
 5. Calls `lua.deinit()` in `unload()`.
 
-The plugin already has `PluginContext.logger` and can import the `zorcerer-filesystem` module for `plugin://`/`game://` access (`src/core/PluginContext.zig`, `build.zig`). No manifest or loader change is needed beyond making the `luajit` module available to plugin builds.
+The plugin already has `PluginContext.logger` and can import the `zorcerer-filesystem` module for `plugin://`/`game://` access (`src/core/plugin/PluginContext.zig`, `build.zig`). No manifest or loader change is needed beyond making the `luajit` module available to plugin builds.
 
 #### Why it is valid against the docs/references
 
@@ -690,7 +690,7 @@ Implement Scenario A:
 - `src/ZLua.zig`: state lifecycle, safe libraries, protected execution, logging.
 - `src/Ipc.zig`: `zlua` request/response or generalized `serverCommand`.
 - `src/Entrypoint.zig`: route `zlua`; allowlist returned commands; preserve re-entry guard.
-- `src/PluginManager.zig`: console state and dispatch.
+- `src/core/plugin/PluginManager.zig`: console state and dispatch.
 - Tests: sandbox globals, path policy, syntax/runtime errors, oversized payloads.
 
 No `game://` and no FFI in this phase.

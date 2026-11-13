@@ -14,7 +14,9 @@
 const std = @import("std");
 const abi = @import("plugin-context");
 const file_system = @import("zroot").io.filesystem;
-const Ipc = @import("Ipc.zig");
+const zroot = @import("zroot");
+const FileRequest = zroot.io.fs.FileRequest;
+const FileResult = zroot.io.fs.FileResult;
 
 /// Largest file `readAll()` loads into memory for the Lua bridge.
 ///
@@ -204,7 +206,7 @@ pub const PluginFiles = struct {
         var bytes: std.ArrayList(u8) = .empty;
         errdefer bytes.deinit(allocator);
 
-        var buffer: [Ipc.file_chunk_len]u8 = undefined;
+        var buffer: [FileRequest.file_chunk_len]u8 = undefined;
         while (true) {
             const count = try self.read(handle_id, &buffer);
             if (count == 0) break;
@@ -316,7 +318,7 @@ pub const PluginFiles = struct {
 
     /// Reads from an open file into `destination`.
     ///
-    /// Engine-backed reads are capped at `Ipc.file_chunk_len` and decoded from
+    /// Engine-backed reads are capped at `FileRequest.file_chunk_len` and decoded from
     /// base64. Returns the number of bytes read; zero means end of file.
     ///
     /// Errors: `error.InvalidHandle`, host read errors mapped by `hostStatus`,
@@ -326,7 +328,7 @@ pub const PluginFiles = struct {
         return switch (stored.*) {
             .host_file => |*file| file.read(destination) catch |err| hostStatus(err),
             .game_file => |remote| {
-                const wanted = @min(destination.len, Ipc.file_chunk_len);
+                const wanted = @min(destination.len, FileRequest.file_chunk_len);
                 if (wanted == 0) return 0;
 
                 var response = try self.remoteCall(.{
@@ -629,14 +631,14 @@ pub const PluginFiles = struct {
     ///
     /// Errors: `error.Unavailable` without an IPC channel,
     /// `error.Transport` for framing, JSON, and JSON-RPC failures.
-    fn remoteCall(self: *PluginFiles, request: Ipc.FileRequest) FileError!std.json.Parsed(Ipc.FileResult) {
+    fn remoteCall(self: *PluginFiles, request: FileRequest) FileError!std.json.Parsed(FileResult) {
         const fd = self.service.ipc_fd orelse return error.Unavailable;
-        Ipc.sendFileRequest(fd, request) catch return error.Transport;
-        return Ipc.receiveFileResult(fd, self.service.allocator) catch return error.Transport;
+        request.send(fd) catch return error.Transport;
+        return FileRequest.fromResponse(fd, self.service.allocator) catch return error.Transport;
     }
 
     /// Sends a close request and ignores the result.
-    fn closeRemote(self: *PluginFiles, request: Ipc.FileRequest) void {
+    fn closeRemote(self: *PluginFiles, request: FileRequest) void {
         var response = self.remoteCall(request) catch return;
         response.deinit();
     }
@@ -785,7 +787,7 @@ fn statusOf(err: FileError) c_int {
 }
 
 /// Fails with the status carried by an engine result unless it is `file_ok`.
-fn requireOk(value: Ipc.FileResult) FileError!void {
+fn requireOk(value: FileResult) FileError!void {
     if (value.status == abi.file_ok) return;
     return statusError(value.status);
 }

@@ -8,7 +8,7 @@
 > so only host-mediated engine access remains a P0 item. The review is kept
 > as historical context.
 
-The reviewed v1 file was `src/core/PluginContext.zig` (51 lines). It was a
+The reviewed v1 file was `src/core/plugin/PluginContext.zig` (51 lines). It was a
 very small ABI contract:
 
 - `abi_version`

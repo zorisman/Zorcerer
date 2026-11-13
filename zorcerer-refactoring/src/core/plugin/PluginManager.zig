@@ -1,14 +1,14 @@
 const std = @import("std");
-const Ipc = @import("Ipc.zig");
+const Ipc = @import("../Ipc.zig");
 const root = @import("zroot");
 const abi = root.abi;
 const Log = root.io.Log;
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 const PluginDependency = @import("PluginDependency.zig");
 const PluginLibrary = @import("plugin-library");
-const FileService = @import("FileService.zig");
-const NetworkService = @import("NetworkService.zig");
-const LuaHost = @import("LuaHost.zig");
+const FileService = @import("../FileService.zig");
+const NetworkService = @import("../NetworkService.zig");
+const LuaHost = @import("../LuaHost.zig");
 const zlua = @import("zlua");
 
 /// Plugin directory relative to the process working directory.
@@ -205,7 +205,8 @@ pub const ManagerListener = struct {
 /// accepted instance in dependency-first order, then initializes them by
 /// calling their load(). After the initialization pass it enters the runtime
 /// phase; unloadAll() reverses that for every initialized plugin, then
-/// releases the cache. Plugins only ever talk to the host through src/core/PluginContext.zig,
+/// releases the cache. Plugins only ever talk to the host through
+/// src/core/plugin/PluginContext.zig,
 /// so no plugin-defined code needs direct links into the process. A plugin is
 /// skipped (with a log line through the logger, or a ManagerListener event)
 /// when its directory cannot be opened, its manifest is missing or invalid,

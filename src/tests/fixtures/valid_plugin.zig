@@ -1,4 +1,4 @@
-//! Shared-library fixture for src/core/PluginLibrary.zig tests.
+//! Shared-library fixture for src/core/plugin/PluginLibrary.zig tests.
 //!
 //! Exports the minimum ABI surface the loader requires. The functions only
 //! return success; the tests exercise symbol resolution, not plugin logic.

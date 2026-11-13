@@ -1,4 +1,4 @@
-//! Shared-library fixture for src/core/PluginLibrary.zig tests.
+//! Shared-library fixture for src/core/plugin/PluginLibrary.zig tests.
 //!
 //! Exports only `load`, so the loader must reject it as missing `unload`.
 
