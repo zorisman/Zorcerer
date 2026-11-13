@@ -1,3 +1,10 @@
+//! Parsed JSON-RPC responses received over the IPC channel.
+//!
+//! Both endpoints use this module to decode the response side of a
+//! synchronous exchange.
+
+const zjr = @import("zjr");
+
 /// A JSON-RPC response parsed from one IPC payload.
 ///
 /// `rpc` owns the parsed JSON until `deinit()`.

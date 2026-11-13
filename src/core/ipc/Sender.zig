@@ -1,3 +1,14 @@
+//! Sends JSON-RPC responses over the IPC channel.
+//!
+//! The Entrypoint answers the plugin-manager child's requests with these
+//! helpers; the child answers event requests the same way. Every function
+//! sends exactly one frame.
+
+const std = @import("std");
+const zjr = @import("zjr");
+const Frame = @import("Frame.zig");
+const Event = @import("Event.zig").Event;
+
 /// Sends one successful JSON-RPC response.
 ///
 /// `id` is the ID of the request being answered. `result_json` is the
@@ -6,28 +17,28 @@
 ///
 /// Errors: `error.NoResponseForNotification` when `id` is not a valid request
 /// ID, plus allocation and framing errors from message composition and
-/// `writeFrame`.
+/// `Frame.write`.
 pub fn sendResultResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, result_json: []const u8) !void {
     const allocator = std.heap.page_allocator;
     const response_json = try zjr.composer.makeResponseJson(allocator, id, result_json);
     const payload = response_json orelse return error.NoResponseForNotification;
     defer allocator.free(payload);
-    try writeFrame(fd, payload);
+    try Frame.write(fd, payload);
 }
 
 /// Sends the successful JSON-RPC response for one event request.
 ///
 /// `id` is the ID of the request being answered. The result is the string
-/// returned by `eventResponseText`.
+/// returned by `Event.responseText`.
 ///
 /// Errors: `error.NoSpaceLeft` when the stack buffer is too small,
 /// `error.NoResponseForNotification` when `id` is not a valid request ID,
 /// plus allocation and framing errors from message composition and
-/// `writeFrame`.
+/// `Frame.write`.
 pub fn sendEventResponse(fd: std.os.linux.fd_t, event: Event, id: zjr.RpcId) !void {
     const allocator = std.heap.page_allocator;
     var buffer: [64]u8 = undefined;
-    const message = try eventResponseText(&buffer, event);
+    const message = try event.responseText(&buffer);
 
     const result_json = try std.json.Stringify.valueAlloc(allocator, message, .{});
     defer allocator.free(result_json);
@@ -40,12 +51,12 @@ pub fn sendEventResponse(fd: std.os.linux.fd_t, event: Event, id: zjr.RpcId) !vo
 /// `id` is the request ID being answered, or `.ofNull()` when it could not be
 /// determined. `code` selects the JSON-RPC error code; `message` is the error
 /// text. Errors are the allocation and framing errors from message composition
-/// and `writeFrame`.
+/// and `Frame.write`.
 pub fn sendErrorResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, code: zjr.ErrorCode, message: []const u8) !void {
     const allocator = std.heap.page_allocator;
     const payload = try zjr.composer.makeErrorResponseJson(allocator, id, code, message);
     defer allocator.free(payload);
-    try writeFrame(fd, payload);
+    try Frame.write(fd, payload);
 }
 
 /// Answers an event frame that could not be decoded.
@@ -57,7 +68,7 @@ pub fn sendErrorResponse(fd: std.os.linux.fd_t, id: zjr.RpcId, code: zjr.ErrorCo
 /// (requests without an ID) are not answered, matching JSON-RPC.
 ///
 /// Errors are the allocation and framing errors from message composition and
-/// `writeFrame`.
+/// `Frame.write`.
 pub fn sendInvalidEventResponse(fd: std.os.linux.fd_t, request_json: []const u8) !void {
     const allocator = std.heap.page_allocator;
     var rpc = zjr.parseRpcRequest(allocator, request_json);
@@ -71,7 +82,7 @@ pub fn sendInvalidEventResponse(fd: std.os.linux.fd_t, request_json: []const u8)
         if (id.isNotification()) return;
         if (request.hasError()) {
             code = request.err().code;
-        } else if (eventFromMethod(request.method) == null) {
+        } else if (Event.fromMethod(request.method) == null) {
             code = .MethodNotFound;
         } else {
             code = .InvalidParams;

@@ -48,7 +48,6 @@ pub const ForkedChild = struct {
     }
 };
 
-
 /// Waits for `pid` to exit and verifies a successful exit status.
 ///
 /// Retries interrupted waits. Returns `error.WaitFailed` when the wait itself

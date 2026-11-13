@@ -1,5 +1,8 @@
 const std = @import("std");
 const zjr = @import("zjr");
+const Frame = @import("Frame.zig");
+const Response = @import("Response.zig");
+const Identifiers = @import("IdentifierRegistry.zig").Identifiers;
 
 /// Read-only game-state queries a plugin may send to the engine process.
 pub const Query = enum {
@@ -48,6 +51,27 @@ pub const Query = enum {
         }
     };
 
+    /// Returns the JSON-RPC method name for `query`.
+    fn queryMethod(query: Query) [:0]const u8 {
+        return switch (query) {
+            .server_info => "query.serverInfo",
+            .player_info => "query.playerInfo",
+            .entity_exists => "query.entityExists",
+            .server_cvar => "query.serverCvar",
+            .client_cvar => "query.clientCvar",
+        };
+    }
+
+    /// Returns the query named by a JSON-RPC method, or null.
+    fn queryFromMethod(method: []const u8) ?Query {
+        if (std.mem.eql(u8, method, queryMethod(.server_info))) return .server_info;
+        if (std.mem.eql(u8, method, queryMethod(.player_info))) return .player_info;
+        if (std.mem.eql(u8, method, queryMethod(.entity_exists))) return .entity_exists;
+        if (std.mem.eql(u8, method, queryMethod(.server_cvar))) return .server_cvar;
+        if (std.mem.eql(u8, method, queryMethod(.client_cvar))) return .client_cvar;
+        return null;
+    }
+
     /// Parses one JSON-RPC game-query request.
     ///
     /// The method names are `query.serverInfo`, `query.playerInfo`,
@@ -90,8 +114,8 @@ pub const Query = enum {
 
     /// Serializes `request` as a JSON-RPC request into `buffer`.
     ///
-    /// Uses `query_request_id` so the waiter can match the response. The returned
-    /// slice borrows `buffer`.
+    /// Uses `Identifiers.query_request_id` so the waiter can match the
+    /// response. The returned slice borrows `buffer`.
     ///
     /// Errors: `error.OutOfMemory` while encoding the parameters,
     /// `error.WriteFailed` when the request does not fit `buffer`, and writer
@@ -110,7 +134,7 @@ pub const Query = enum {
         try zjr.composer.writeRequestJson(
             queryMethod(request.query),
             params_json,
-            zjr.RpcId.of(query_request_id),
+            Identifiers.query_request_id.rpcId(),
             &writer,
         );
         return writer.buffered();
@@ -123,11 +147,11 @@ pub const Query = enum {
     ///
     /// Errors: `error.WriteFailed` when the request does not fit the stack buffer
     /// or the write fails, `error.OutOfMemory` while encoding the parameters, and
-    /// `error.PayloadTooLarge` from `writeFrame`.
+    /// `error.PayloadTooLarge` from `Frame.write`.
     pub fn sendQuery(fd: std.os.linux.fd_t, request: QueryRequest) !void {
-        var buffer: [max_payload_len]u8 = undefined;
+        var buffer: [Frame.max_payload_len]u8 = undefined;
         const payload_json = try encodeQuery(&buffer, request);
-        try writeFrame(fd, payload_json);
+        try Frame.write(fd, payload_json);
     }
 
     /// Reads the parent's response to the in-flight query.
@@ -135,23 +159,23 @@ pub const Query = enum {
     /// Returns the result text, which is a JSON document describing the queried
     /// value. The caller owns the returned slice and frees it with `allocator`.
     ///
-    /// Errors: framing errors from `readFrame`; `error.InvalidFrame` when the
+    /// Errors: framing errors from `Frame.read`; `error.InvalidFrame` when the
     /// marker is missing; `error.EmptyMessage` for an empty payload;
     /// `error.UnexpectedQueryResponse` when the payload is not a single JSON-RPC
     /// response; `error.UnexpectedResponseId` when the response does not answer
-    /// `query_request_id`; `error.QueryFailed` when the parent returned a
-    /// JSON-RPC error; `error.UnexpectedResultType` when the result is not a JSON
-    /// string; and `error.OutOfMemory` when copying the text fails.
+    /// `Identifiers.query_request_id`; `error.QueryFailed` when the parent
+    /// returned a JSON-RPC error; `error.UnexpectedResultType` when the result is
+    /// not a JSON string; and `error.OutOfMemory` when copying the text fails.
     pub fn receiveQueryResult(fd: std.os.linux.fd_t, allocator: std.mem.Allocator) ![]u8 {
-        const frame = try readFrame(fd);
+        const frame = try Frame.read(fd);
         if (!frame.framed) return error.InvalidFrame;
         if (!frame.received) return error.EmptyMessage;
 
-        var response = parseResponse(allocator, frame.text());
+        var response = Response.parseResponse(allocator, frame.text());
         defer response.deinit();
         const rpc_response = response.value() catch return error.UnexpectedQueryResponse;
 
-        if (!rpc_response.id.eql(query_request_id)) return error.UnexpectedResponseId;
+        if (!rpc_response.id.eql(Identifiers.query_request_id.rpcId())) return error.UnexpectedResponseId;
         if (rpc_response.hasErr()) return error.QueryFailed;
 
         return switch (rpc_response.result) {

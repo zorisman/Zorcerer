@@ -1,9 +1,14 @@
-//! One frame read from the channel.
+//! One frame read from or written to the IPC channel.
+//!
+//! One message is one frame on the connected stream socket:
+//!
+//!     marker (1 byte, 0xA5) | length (u32, little-endian) | JSON payload
 //!
 //! The flags describe what arrived, not what was expected: a peer that sent a
 //! marker and then closed can yield `framed == true` with no payload.
 
 const std = @import("std");
+const DescriptorIo = @import("DescriptorIo.zig");
 
 /// True when the first byte was `frame_marker`.
 framed: bool = false,
@@ -21,7 +26,7 @@ payload_len: usize = 0,
 ///
 /// It distinguishes a frame from a truncated or desynchronized stream: without
 /// it the following length bytes cannot be interpreted.
-const marker: u8 = 0xA5;
+const frame_marker: u8 = 0xA5;
 
 /// Largest payload, in bytes, one frame may carry.
 ///
@@ -29,11 +34,11 @@ const marker: u8 = 0xA5;
 /// oversized frame instead of blocking on a corrupt length.
 pub const max_payload_len: usize = 4096;
 
-/// Returns the received payload.
+/// Returns the received payload as text.
 ///
 /// The returned slice borrows this frame and remains valid for as long as
 /// the frame does.
-pub fn asBytes(self: *const @This()) []const u8 {
+pub fn text(self: *const @This()) []const u8 {
     return self.payload[0..self.payload_len];
 }
 
@@ -54,19 +59,19 @@ pub fn matches(self: *const @This(), expected: []const u8) bool {
 /// when the announced length exceeds `max_payload_len`, and `error.ReadFailed`
 /// for a non-`EINTR` read failure.
 pub fn read(fd: std.os.linux.fd_t) !@This() {
-    var frame = Frame{};
+    var frame = @This(){};
 
     var marker: [1]u8 = undefined;
-    try readExact(fd, &marker);
+    try DescriptorIo.readExact(fd, &marker);
     frame.framed = marker[0] == frame_marker;
     if (!frame.framed) return frame;
 
     var length_bytes: [4]u8 = undefined;
-    try readExact(fd, &length_bytes);
+    try DescriptorIo.readExact(fd, &length_bytes);
     const payload_len: usize = std.mem.readInt(u32, &length_bytes, .little);
     if (payload_len > max_payload_len) return error.PayloadTooLarge;
 
-    try readExact(fd, frame.payload[0..payload_len]);
+    try DescriptorIo.readExact(fd, frame.payload[0..payload_len]);
     frame.payload_len = payload_len;
     frame.received = payload_len > 0;
     return frame;
@@ -85,6 +90,6 @@ pub fn write(fd: std.os.linux.fd_t, payload: []const u8) !void {
     header[0] = frame_marker;
     std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
 
-    try writeAll(fd, &header);
-    try writeAll(fd, payload);
+    try DescriptorIo.writeAll(fd, &header);
+    try DescriptorIo.writeAll(fd, payload);
 }

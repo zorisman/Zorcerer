@@ -1,5 +1,7 @@
 const std = @import("std");
 const zjr = @import("zjr");
+const Frame = @import("Frame.zig");
+const Identifiers = @import("IdentifierRegistry.zig").Identifiers;
 
 /// Callbacks whose occurrence the Entrypoint reports to the plugin manager.
 pub const Event = enum {
@@ -65,9 +67,9 @@ pub const Event = enum {
 
     /// Serializes `event` as a JSON-RPC request into `buffer`.
     ///
-    /// Uses `event_request_id` so the listener can answer with a matching ID.
-    /// `payload` is optional JSON text that is transmitted as a string inside an
-    /// object `params`. The returned slice borrows `buffer`.
+    /// Uses `Identifiers.event_request_id` so the listener can answer with a
+    /// matching ID. `payload` is optional JSON text that is transmitted as a
+    /// string inside an object `params`. The returned slice borrows `buffer`.
     ///
     /// Errors: `error.OutOfMemory` while encoding the parameters,
     /// `error.WriteFailed` when the event does not fit `buffer`, and writer
@@ -85,16 +87,16 @@ pub const Event = enum {
             defer allocator.free(params_json);
 
             try zjr.composer.writeRequestJson(
-                @tagName(self),
+                @tagName(self.*),
                 params_json,
-                zjr.RpcId.of(event_request_id),
+                Identifiers.event_request_id.rpcId(),
                 &writer,
             );
         } else {
             try zjr.composer.writeRequestJson(
-                @tagName(self),
+                @tagName(self.*),
                 null,
-                zjr.RpcId.of(event_request_id),
+                Identifiers.event_request_id.rpcId(),
                 &writer,
             );
         }
@@ -104,15 +106,15 @@ pub const Event = enum {
 
     /// Serializes `event` as a JSON-RPC request and sends it as one frame.
     ///
-    /// Uses `event_request_id` so the listener can answer with a matching ID.
-    /// `payload` is optional JSON text; see `encodeEvent`.
+    /// Uses `Identifiers.event_request_id` so the listener can answer with a
+    /// matching ID. `payload` is optional JSON text; see `encode`.
     /// Errors: `error.WriteFailed` when the event does not fit the stack buffer or
     /// the write fails, `error.OutOfMemory` while encoding the parameters, and
-    /// `error.PayloadTooLarge` from `writeFrame`.
+    /// `error.PayloadTooLarge` from `Frame.write`.
     pub fn send(self: *const @This(), fd: std.os.linux.fd_t, payload: ?[]const u8) !void {
-        var buffer: [max_payload_len]u8 = undefined;
-        const payload_json = try encodeEvent(&buffer, self, payload);
-        try writeFrame(fd, payload_json);
+        var buffer: [Frame.max_payload_len]u8 = undefined;
+        const payload_json = try self.encode(&buffer, payload);
+        try Frame.write(fd, payload_json);
     }
 
     /// Formats the result text the manager answers `event` with: `"Event is X"`.

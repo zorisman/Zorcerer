@@ -1,12 +1,22 @@
-//! Parameters of one operation notification.
+//! One operation notification sent by the plugin-manager child.
+//!
+//! The child reports log lines (`.stderr`) and its readiness (`.ready`) as
+//! JSON-RPC notifications; the Entrypoint's listener executes them without a
+//! reply.
+
+const std = @import("std");
+const zjr = @import("zjr");
+const Frame = @import("Frame.zig");
+const Operation = @import("Operation.zig").Operation;
+
+/// This module as the request type: its fields carry the notification.
+const Request = @import("Request.zig");
+
 /// What the receiver should do with `message`.
 operation: Operation,
 /// Payload for `operation`; for `.stderr` it is logged verbatim, for
 /// `.ready` it is the child's readiness text.
 message: []const u8,
-
-const std = @import("std");
-const zjr = @import("zjr");
 
 /// Parses one JSON-RPC operation notification.
 ///
@@ -26,7 +36,7 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ParsedRequest {
     const request = rpc.request_msg.request;
     if (request.hasError()) return error.InvalidRpcRequest;
 
-    const operation = operationFromMethod(request.method) orelse return error.UnknownMethod;
+    const operation = Operation.fromMethod(request.method) orelse return error.UnknownMethod;
     const params = request.objectParams() orelse return error.InvalidParams;
     const message_value = params.get("message") orelse return error.MissingMessage;
     const message = switch (message_value) {
@@ -40,11 +50,11 @@ pub fn parse(allocator: std.mem.Allocator, text: []const u8) !ParsedRequest {
     };
 }
 
-/// Serializes `request` as a JSON-RPC notification and sends it as one frame.
+/// Serializes `self` as a JSON-RPC notification and sends it as one frame.
 ///
 /// The notification has no `id`, as required for JSON-RPC notifications.
 /// Errors: `error.WriteFailed`/`error.OutOfMemory` from message composition,
-/// and `error.PayloadTooLarge`/`error.WriteFailed` from `writeFrame`.
+/// and `error.PayloadTooLarge`/`error.WriteFailed` from `Frame.write`.
 pub fn send(self: *const @This(), fd: std.os.linux.fd_t) !void {
     const allocator = std.heap.page_allocator;
     const payload = try zjr.composer.makeRequestJson(
@@ -54,16 +64,17 @@ pub fn send(self: *const @This(), fd: std.os.linux.fd_t) !void {
         zjr.RpcId.ofNone(),
     );
     defer allocator.free(payload);
-    try writeFrame(fd, payload);
+    try Frame.write(fd, payload);
 }
 
 /// Reports the child's readiness state with a `ready` notification.
 ///
 /// `message` is the child's readiness text. The Entrypoint treats its expected
 /// readiness text as success and any other text as a failed startup.
-/// Errors are those of `sendRequest`.
+/// Errors are those of `send`.
 pub fn ready(fd: std.os.linux.fd_t, message: []const u8) !void {
-    try sendRequest(fd, .{ .operation = .ready, .message = message });
+    var request = @This(){ .operation = .ready, .message = message };
+    try request.send(fd);
 }
 
 /// An operation notification parsed from a JSON-RPC request.
