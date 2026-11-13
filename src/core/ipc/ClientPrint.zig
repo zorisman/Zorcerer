@@ -231,7 +231,7 @@ pub fn receiveResult(
     defer response.deinit();
     const rpc_response = response.value() catch return error.UnexpectedClientPrintResponse;
 
-    if (!rpc_response.id.eql(Identifiers.client_print_request_id.rpcId())) {
+    if (!rpc_response.id.eql(@intFromEnum(Identifiers.client_print_request_id))) {
         return error.UnexpectedResponseId;
     }
     if (rpc_response.hasErr()) return error.ClientPrintFailed;

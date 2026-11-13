@@ -201,7 +201,7 @@ pub fn fromResponse(
     defer response.deinit();
     const rpc_response = response.value() catch return error.UnexpectedFileResponse;
 
-    if (!rpc_response.id.eql(Identifiers.file_request_id.rpcId())) return error.UnexpectedResponseId;
+    if (!rpc_response.id.eql(@intFromEnum(Identifiers.file_request_id))) return error.UnexpectedResponseId;
     if (rpc_response.hasErr()) return error.FileFailed;
 
     const text = switch (rpc_response.result) {

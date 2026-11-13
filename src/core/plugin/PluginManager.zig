@@ -14,9 +14,9 @@ const Log = root.io.Log;
 const PluginConfiguration = @import("plugin-configuration").PluginConfiguration;
 const PluginDependency = @import("PluginDependency.zig");
 const PluginLibrary = @import("plugin-library");
-const FileService = @import("../FileService.zig");
-const NetworkService = @import("../NetworkService.zig");
-const LuaHost = @import("../LuaHost.zig");
+const FileService = root.core.FileService;
+const NetworkService = root.core.NetworkService;
+const LuaHost = root.core.LuaHost;
 const zlua = @import("zlua");
 
 /// Plugin directory relative to the process working directory.

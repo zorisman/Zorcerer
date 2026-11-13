@@ -3,6 +3,7 @@
 //! Both endpoints use this module to decode the response side of a
 //! synchronous exchange.
 
+const std = @import("std");
 const zjr = @import("zjr");
 
 /// A JSON-RPC response parsed from one IPC payload.

@@ -12,8 +12,8 @@
 //! request is revalidated here before the engine sees it.
 
 const std = @import("std");
-const ServerCommand = @import("../ipc/ServerCommand.zig");
-const Vtable = @import("Vtable.zig");
+const ServerCommand = root.ipc.ServerCommand;
+const Vtable = root.core.Vtable;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 const Log = root.io.Log;

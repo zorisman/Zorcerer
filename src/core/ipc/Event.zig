@@ -123,7 +123,7 @@ pub const Event = enum {
     ///
     /// Errors: `error.NoSpaceLeft` when `buffer` is too small.
     pub fn responseText(self: *const @This(), buffer: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "Event is {s}", .{@tagName(self)});
+        return std.fmt.bufPrint(buffer, "Event is {s}", .{@tagName(self.*)});
     }
 
     /// One event request payload.

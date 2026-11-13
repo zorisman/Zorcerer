@@ -13,8 +13,8 @@
 //! process.
 
 const std = @import("std");
-const ClientPrint = @import("../ipc/ClientPrint.zig");
-const Vtable = @import("Vtable.zig");
+const ClientPrint = root.ipc.ClientPrint;
+const Vtable = root.core.Vtable;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 const Log = root.io.Log;

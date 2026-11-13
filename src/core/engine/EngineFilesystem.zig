@@ -15,8 +15,8 @@
 //! enumeration goes through `IFileSystem`'s find session.
 
 const std = @import("std");
-const FileRequest = @import("../../io/fs/FileRequest.zig");
-const FileResult = @import("../../io/fs/FileResult.zig");
+const FileRequest = root.io.fs.FileRequest;
+const FileResult = root.io.fs.FileResult;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 const abi = @import("plugin-context");

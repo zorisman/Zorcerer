@@ -89,12 +89,12 @@ const Indexes = root.codegen.indexes;
 const Manager = @import("plugin/PluginManager.zig");
 const Log = root.io.Log;
 const abi = root.abi;
-const fork = @import("ForkProcess.zig");
-const JsonRpc = @import("JsonRpc.zig");
+const fork = root.ipc.ForkProcess;
+const JsonRpc = root.ipc.JsonRpc;
 const GameQueries = @import("GameQueries.zig");
-const EngineCommands = @import("EngineCommands.zig");
-const EngineClients = @import("EngineClients.zig");
-const EngineFilesystem = @import("EngineFilesystem.zig");
+const EngineCommands = root.core.EngineCommands;
+const EngineClients = root.core.EngineClients;
+const EngineFilesystem = root.core.EngineFilesystem;
 const Vsp = @import("engine/Vsp.zig");
 
 /// An IServerPluginCallbacks instance is just a vptr as far as the engine

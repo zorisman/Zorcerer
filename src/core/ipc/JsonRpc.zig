@@ -11,8 +11,8 @@ const Operation = @import("Operation.zig").Operation;
 const Query = @import("Query.zig").Query;
 const ServerCommand = @import("ServerCommand.zig");
 const ClientPrint = @import("ClientPrint.zig");
-const FileRequest = @import("../../io/fs/FileRequest.zig");
-const FileResult = @import("../../io/fs/FileResult.zig");
+const FileRequest = @import("zroot").io.fs.FileRequest;
+const FileResult = @import("zroot").io.fs.FileResult;
 const Identifiers = @import("IdentifierRegistry.zig").Identifiers;
 
 /// Executes one JSON-RPC response received from the plugin manager.

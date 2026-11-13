@@ -79,6 +79,7 @@ pub const core = struct {
     pub const LuaHost = @import("core/LuaHost.zig");
     pub const NetworkService = @import("core/NetworkService.zig");
     pub const PluginManager = @import("core/plugin/PluginManager.zig");
+    pub const Vtable = @import("core/Vtable.zig");
     pub const Vsp = @import("core/engine/Vsp.zig");
 };
 
@@ -118,11 +119,11 @@ test "src/core/FileService.zig" {
 }
 
 test "src/core/EngineFilesystem.zig" {
-    std.testing.refAllDecls(@import("core/EngineFilesystem.zig"));
+    std.testing.refAllDecls(@import("core/engine/EngineFilesystem.zig"));
 }
 
 test "src/core/EngineClients.zig" {
-    std.testing.refAllDecls(@import("core/EngineClients.zig"));
+    std.testing.refAllDecls(@import("core/engine/EngineClients.zig"));
 }
 
 test "src/core/NetworkService.zig" {
