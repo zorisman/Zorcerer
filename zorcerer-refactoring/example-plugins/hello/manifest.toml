@@ -1,5 +1,0 @@
-id = "hello"
-name = "Hello Plugin"
-version = "0.1.0"
-author = "zorisman"
-path = "./hello_plugin.so"
