@@ -1,0 +1,329 @@
+#!/bin/sh
+# Zorcerer pre-push hook: test every pushed source change in a clean worktree.
+#
+# Reads the refs git feeds the hook on stdin ("<local ref> <local oid>
+# <remote ref> <remote oid>" per line) and runs `zig build tests` against
+# each unique pushed commit that changes a .zig, .cpp, or .hpp file, so
+# broken code can never reach the remote — even when pushing branches other
+# than the current one.
+#
+# Design notes:
+#   * P(x): a pushed ref is tested only when `git diff` reports a change to
+#     at least one .zig, .cpp, or .hpp file (the set F). Pushes that touch
+#     only other files skip the build entirely.
+#   * S*(x) = P(x) AND Q(x): when relevant files changed and every test
+#     passes, the push is allowed.
+#   * E*(x) = P(x) AND NOT Q(x): when relevant files changed and any test
+#     fails, the hook exits non-zero so git rejects the push.
+#   * When P(x) is false, neither S*(x) nor E*(x) applies; the push is
+#     allowed because no relevant source file changed.
+#   * Uncommitted changes are never tested: commits are checked out into a
+#     temporary worktree, mirroring exactly what will land on the remote.
+#   * Branch deletions (all-zero oids — works for both SHA-1 and SHA-256
+#     repositories) are skipped; several refs pointing at the same commit
+#     are tested once.
+#   * Local dependency storage is reused: every submodule recorded under
+#     `extern/` in the pushed commit is relinked (leaf-level symlink) into
+#     the test worktree after each checkout. The path components above the
+#     submodule leaves stay real directories, because git refuses any
+#     symlinked component that leads to a submodule ("expected '...' in
+#     submodule path '...' not to be a symbolic link"). A leaf whose target
+#     is missing from the main checkout is linked anyway; the test build
+#     then fails on the absent dependency sources instead of fetching them.
+#   * Submodules are never cloned, initialized, updated, or fetched inside
+#     the temporary worktree: a commit's submodule oids are compared against
+#     whatever the developer has checked out, never pulled.
+#   * The test build runs in the background with `wait`, so signal traps
+#     (HUP/INT/TERM) fire immediately and cleanup is never deferred until
+#     the build finishes.
+#   * The hook itself uses no positional parameters, so `set --` is safe.
+#   * Requires: git >= 2.5 (worktree), zig on PATH.
+
+set -eu
+
+stage=1
+total=0
+zig_pid=
+tmp_root=
+worktree=
+
+stageMsg() {
+    printf '[Zorcerer] Stage %s/%s: %s\n' "$stage" "$total" "$*"
+}
+
+ensureSuccess() {
+    if "$@"; then
+        stage=$((stage + 1))
+    else
+        status=$?
+        printf '[Zorcerer] Stage %s/%s failed (exit code %s).\n' \
+            "$stage" "$total" "$status" >&2
+        return "$status"
+    fi
+}
+
+clearGitEnv() {
+    for name in $(git -C "$repo_root" rev-parse --local-env-vars); do
+        unset "$name"
+    done
+}
+
+# Keep the developer's zig cache overrides from leaking into the clean test
+# run (they could silently reuse the main checkout's build cache).
+clearZigEnv() {
+    unset ZIG_GLOBAL_CACHE_DIR ZIG_LOCAL_CACHE_DIR ZIG_LIB_DIR \
+        ZIG_HOMEDIR_CACHE
+}
+
+cleanup() {
+    if [ -n "$zig_pid" ]; then
+        kill "$zig_pid" 2>/dev/null || true
+        wait "$zig_pid" 2>/dev/null || true
+    fi
+    if [ -n "$worktree" ]; then
+        # Removes the worktree's shared links (leaf symlinks) before removal.
+        # `rm -rf` unlinks symlinks without following them into the main
+        # checkout's dependency directories.
+        rm -rf "$worktree/extern"
+        git -C "$repo_root" worktree remove --force "$worktree" \
+            >/dev/null 2>&1 || true
+    fi
+    if [ -n "$tmp_root" ]; then
+        rm -rf "$tmp_root"
+    fi
+
+    git -C "$repo_root" worktree prune >/dev/null 2>&1 || true
+}
+
+prepare() {
+    if [ ! -d "$repo_root/extern" ]; then
+        printf '[Zorcerer] %s/extern not found.\n' "$repo_root" >&2
+        return 1
+    fi
+
+    git -C "$repo_root" worktree add \
+        --quiet --detach "$worktree" "$first_oid" || return $?
+}
+
+# List the files introduced or modified by one commit.
+#
+# Parameter:
+#   $1 - commit oid.
+#
+# Prints the `git diff` name list against the commit's first parent. A root
+# commit has no parent, so its full tree is listed instead. Returns git's
+# exit status; callers must treat a failure as unknown rather than empty.
+commitChangedFiles() {
+    local commit
+    commit=$1
+
+    if git -C "$repo_root" rev-parse --verify --quiet "$commit^" >/dev/null; then
+        git -C "$repo_root" diff --no-renames --name-only "$commit^" "$commit"
+    else
+        git -C "$repo_root" ls-tree -r --name-only "$commit"
+    fi
+}
+
+# Decide whether a pushed ref changes a file in F = {*.zig, *.cpp, *.hpp}.
+#
+# Parameters:
+#   $1 - local oid reported by git on stdin.
+#   $2 - remote oid reported by git on stdin; all zeros for a new ref.
+#
+# Returns:
+#   0 - at least one relevant file changed.
+#   1 - no relevant file changed.
+#   2 - the changed-file list could not be computed.
+#
+# A real remote oid is the preferred `git diff` base because one diff covers
+# the whole pushed range. For a new ref (or a remote oid that is not
+# available locally), the commits not reachable from any remote-tracking ref
+# are inspected one by one; this covers every commit that ref will publish,
+# not only its tip. If git cannot enumerate them, the check fails with 2 so
+# the push is blocked instead of silently skipping tests. --no-renames keeps
+# a rename to/from a source extension visible as a deletion plus an addition
+# instead of possibly hiding the removed path.
+hasRelevantChanges() {
+    local local_oid remote_oid commits commit changed
+    local_oid=$1
+    remote_oid=$2
+
+    if [ -n "$remote_oid" ]; then
+        case "$remote_oid" in
+            *[!0]*) ;;          # a real oid
+            *) remote_oid= ;;   # all zeros -> new ref
+        esac
+    fi
+
+    if [ -n "$remote_oid" ] &&
+       git -C "$repo_root" cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
+        changed=$(git -C "$repo_root" diff --no-renames --name-only \
+            "$remote_oid" "$local_oid") || return 2
+        printf '%s\n' "$changed" | grep -qE '\.(zig|cpp|hpp)$'
+        return $?
+    fi
+
+    commits=$(git -C "$repo_root" rev-list "$local_oid" \
+        --not --remotes 2>/dev/null) || return 2
+    if [ -z "$commits" ]; then
+        return 1
+    fi
+
+    for commit in $commits; do
+        changed=$(commitChangedFiles "$commit") || return 2
+        if printf '%s\n' "$changed" | grep -qE '\.(zig|cpp|hpp)$'; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Subdir of the gitlink path; dirname(1) is portable enough for paths like
+# extern/zig-toml, and the worktree checkout materializes all directories
+# above the submodule leaves anyway.
+linkSharedExtern() {
+    local name
+    git -C "$worktree" ls-tree -r -z HEAD |
+        tr '\0' '\n' |
+        awk -F '\t' '$1 ~ /^160000 commit / && $2 ~ /^extern\// {print $2}' |
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            mkdir -p "$worktree/$(dirname "$name")"
+            rm -rf "$worktree/$name"
+            ln -s "$repo_root/$name" "$worktree/$name"
+        done
+}
+
+testCommit() {
+    # $1 = pushed commit oid. --force discards build residue (.zig-cache,
+    # zig-out, ...) that could otherwise block the next checkout.
+    git -C "$worktree" checkout --detach --force --quiet "$1" || return $?
+
+    # Re-link the shared dependency sources: checkout materializes each
+    # recorded submodule path as an empty real directory (replacing the
+    # leaf symlink from the previous test), so the leaves are re-created
+    # against the new commit's submodule list. Path components above the
+    # leaves stay real directories, as git requires for submodule paths.
+    linkSharedExtern || return $?
+
+    # Run in background + wait so trapped signals are handled immediately;
+    # `exec` makes the subshell become zig itself, so $! is zig's pid.
+    #
+    # -Dskip-analyze=true: skips building the Clang/LLVM-based analyzer and
+    # its configure-time data regeneration. The hook must not require system
+    # Clang/LLVM development packages, and a clean worktree has no analyzer
+    # binary to regenerate with; the module tests still run.
+    (
+        cd "$worktree" &&
+        exec zig build tests -Dskip-analyze=true </dev/null
+    ) &
+    zig_pid=$!
+    wait "$zig_pid"
+    rc=$?
+    zig_pid=
+    return "$rc"
+}
+
+repo_root=$(git rev-parse --show-toplevel)
+
+if [ -t 0 ]; then
+    printf '[Zorcerer] This hook expects pre-push stdin; invoke it via git push.\n' >&2
+    exit 1
+fi
+
+clearGitEnv
+clearZigEnv
+
+# Collect every pushed ref. Skips deletions (all-zero oid) regardless of
+# hash algorithm. The remote oid is retained because it is the baseline for
+# the P(x) file check, and refs sharing an oid are deduplicated only after
+# that check: the same commit can have a different diff against each remote
+# ref, so an irrelevant push to one branch must not hide a relevant push to
+# another.
+pushed_list=
+while read -r local_ref oid _remote_ref remote_oid; do
+    case "$oid" in
+        *[!0]*) ;;        # a real oid
+        *) continue ;;    # all zeros -> ref deletion, nothing to test
+    esac
+    pushed_list="$pushed_list$oid $remote_oid $local_ref
+"
+done
+
+if [ -z "$pushed_list" ]; then
+    printf '[Zorcerer] Nothing to test (deletion-only or empty push).\n'
+    exit 0
+fi
+
+# Apply P(x): test a ref only when its pushed range changes a file in F.
+# Refs without relevant changes are skipped without touching the worktree.
+test_oids=
+test_list=
+while read -r oid remote_oid ref; do
+    [ -n "$oid" ] || continue
+    if hasRelevantChanges "$oid" "$remote_oid"; then
+        case "$test_oids" in
+            *" $oid "*) ;;    # already selected via another ref
+            *)
+                test_oids="$test_oids $oid "
+                test_list="$test_list$oid $ref
+"
+                ;;
+        esac
+    else
+        change_status=$?
+        if [ "$change_status" -eq 1 ]; then
+            case "$test_oids" in
+                *" $oid "*) ;;  # already scheduled via another ref
+                *)
+                    printf '[Zorcerer] Skip %s (%s): no .zig, .cpp, or .hpp changes.\n' \
+                        "$(git -C "$repo_root" rev-parse --short "$oid")" "$ref"
+                    ;;
+            esac
+        else
+            printf '[Zorcerer] Cannot determine changed files for %s (%s).\n' \
+                "$oid" "$ref" >&2
+            exit "$change_status"
+        fi
+    fi
+done <<EOF
+$pushed_list
+EOF
+
+if [ -z "$test_oids" ]; then
+    printf '[Zorcerer] No relevant source changes; skipping tests.\n'
+    exit 0
+fi
+
+set -- $test_oids
+first_oid=$1
+test_count=$#
+
+if ! command -v zig >/dev/null 2>&1; then
+    printf '[Zorcerer] zig not found in PATH; cannot run tests.\n' >&2
+    exit 1
+fi
+
+total=$((test_count + 1))
+
+tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/zorcerer-pre-push.XXXXXX")
+worktree="$tmp_root/worktree"
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+stageMsg "Preparation"
+ensureSuccess prepare
+
+while read -r oid ref; do
+    [ -n "$oid" ] || continue
+    stageMsg "Testing $(git -C "$repo_root" rev-parse --short "$oid") ($ref)"
+    ensureSuccess testCommit "$oid"
+done <<EOF
+$test_list
+EOF
+
+printf '[Zorcerer] All %s stages passed.\n' "$total"

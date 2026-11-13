@@ -1,0 +1,3 @@
+This is intentionally not a dynamic library.
+PluginLibrary tests pass this file to the system loader to verify that a
+present but unusable file is classified as invalid_configuration.

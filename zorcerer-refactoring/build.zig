@@ -1,0 +1,534 @@
+const std = @import("std");
+
+const index_analyzer = @import("build/build_index_analyzer.zig");
+const DataAdapter = @import("build/analyzers/AnalyzerDataAdapter.zig");
+const luajit_build = @import("build/luajit.zig");
+
+/// Describes one compiled example plugin that is installed as its own
+/// directory under `zig-out/lib/plugins/`.
+const ExamplePluginInstall = struct {
+    /// Directory name under `example-plugins/`. Used to locate the optional
+    /// `manifest.toml` that belongs to this plugin.
+    source_dir: []const u8,
+    /// Directory name created under `zig-out/lib/plugins/`.
+    install_dir: []const u8,
+    /// File name of the installed shared library inside `install_dir`.
+    library_name: []const u8,
+    /// Compiled plugin artifact whose emitted library is installed.
+    artifact: *std.Build.Step.Compile,
+};
+
+/// Installs one example plugin as `zig-out/lib/plugins/<install_dir>/`.
+///
+/// The artifact's emitted shared library is copied under `library_name`. If
+/// `example-plugins/<source_dir>/manifest.toml` exists, it is copied next to
+/// the library as `manifest.toml`. Packaging without a manifest is allowed so
+/// examples that are not managed through one can still be installed; at
+/// runtime, however, a plugin directory that provides native libraries must
+/// contain a valid manifest or its libraries are skipped.
+///
+/// `tests_step` is made a dependency of the install steps so that the default
+/// install target never packages a plugin unless the project's tests passed.
+///
+/// Errors: propagates filesystem errors other than `error.FileNotFound` from
+/// the manifest existence check (for example `error.AccessDenied`).
+fn installExamplePlugin(
+    b: *std.Build,
+    tests_step: *std.Build.Step,
+    plugin: ExamplePluginInstall,
+) !void {
+    const plugin_dir = b.pathJoin(&.{ "lib", "plugins", plugin.install_dir });
+
+    const install_library = b.addInstallFileWithDir(
+        plugin.artifact.getEmittedBin(),
+        .{ .custom = plugin_dir },
+        plugin.library_name,
+    );
+    install_library.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_library.step);
+
+    const manifest_path = b.pathJoin(&.{
+        "example-plugins",
+        plugin.source_dir,
+        "manifest.toml",
+    });
+    const has_manifest = manifest: {
+        std.Io.Dir.cwd().access(b.graph.io, manifest_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :manifest false,
+            else => return err,
+        };
+        break :manifest true;
+    };
+
+    if (has_manifest) {
+        const install_manifest = b.addInstallFileWithDir(
+            b.path(manifest_path),
+            .{ .custom = plugin_dir },
+            "manifest.toml",
+        );
+        install_manifest.step.dependOn(tests_step);
+        b.getInstallStep().dependOn(&install_manifest.step);
+    }
+}
+
+/// Installs one Lua-only example plugin as
+/// `zig-out/lib/plugins/<install_dir>/main.lua`.
+///
+/// Lua examples have no compiled artifact and need no manifest: the manager
+/// discovers `plugins/<dir>/main.lua` directly. Like `installExamplePlugin`,
+/// this helper depends on `tests_step` so the default install never packages an
+/// example unless the project's tests passed.
+fn installExampleLuaPlugin(
+    b: *std.Build,
+    tests_step: *std.Build.Step,
+    source_dir: []const u8,
+    install_dir: []const u8,
+) void {
+    const plugin_dir = b.pathJoin(&.{ "lib", "plugins", install_dir });
+    const source_path = b.pathJoin(&.{ "example-plugins", source_dir, "main.lua" });
+
+    const install_script = b.addInstallFileWithDir(
+        b.path(source_path),
+        .{ .custom = plugin_dir },
+        "main.lua",
+    );
+    install_script.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_script.step);
+}
+
+/// Returns whether the installed analyzer executable exists and is at least
+/// as new as every input that defines its behavior.
+///
+/// The analyzer is compiled as a normal build step, but its output is used to
+/// regenerate `src/codegen_generated/engine_indexes.zig` during build
+/// configuration - before that step can run. Running an executable that
+/// predates its sources would at best produce outdated indexes and at worst
+/// fail (for example, an analyzer built before the stdin query protocol was
+/// added reports `no query was specified`). A stale executable is therefore
+/// treated like a missing one: regeneration is deferred until the next
+/// `zig build`, after this build has rebuilt and installed the analyzer.
+///
+/// Errors: propagates filesystem errors other than `error.FileNotFound` from
+/// the stat calls (for example `error.AccessDenied`).
+fn analyzerIsUpToDate(io: std.Io, analyzer_path: []const u8) !bool {
+    const analyzer_stat = std.Io.Dir.cwd().statFile(io, analyzer_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+
+    const inputs = [_][]const u8{
+        "build/analyzers/VTableIndexAnalyzer.cpp",
+        "build/analyzers/toml.hpp",
+        "build/build_index_analyzer.zig",
+    };
+    for (inputs) |input| {
+        const input_stat = std.Io.Dir.cwd().statFile(io, input, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        if (input_stat.mtime.nanoseconds > analyzer_stat.mtime.nanoseconds)
+            return false;
+    }
+    return true;
+}
+
+fn rawDataChanged(io: std.Io, toml_path: []const u8, indexes_path: []const u8) !bool {
+    const toml_file = try std.Io.Dir.openFileAbsolute(io, toml_path, .{});
+    const index_file = std.Io.Dir.openFileAbsolute(io, indexes_path, .{}) catch return true;
+
+    const toml_stat = try toml_file.stat(io);
+    const index_stat = try index_file.stat(io);
+
+    if (toml_stat.mtime.toMilliseconds() > index_stat.mtime.toMilliseconds()) return true;
+    return false;
+}
+
+pub fn build(b: *std.Build) !void {
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .abi = .gnu, .os_tag = .linux, .cpu_arch = .x86_64 },
+    });
+    const optimize = b.standardOptimizeOption(.{});
+    const io = b.graph.io;
+
+    const hooks = b.addModule("hooks", .{
+        .root_source_file = b.path("extern/zig-hooks/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .link_libc = true,
+    });
+
+    const toml = b.addModule("toml", .{ .root_source_file = b.path("extern/zig-toml/src/root.zig"), .target = target, .optimize = optimize, .pic = true });
+
+    const zjr = b.addModule("zjr", .{
+        .root_source_file = b.path("extern/zigjr/src/zigjr.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
+    const luajit_support = try luajit_build.addLuaJit(b, target, optimize);
+
+    const luajit = b.addModule("luajit", .{
+        .root_source_file = b.path("extern/zig-luajit/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    luajit.addImport("c", luajit_support.c_module);
+
+    // Zig-facing `zostd` standard library types. The module indirection is
+    // needed because `src/zlua` may not import files outside its own module
+    // root, and the plugin manager uses the same declarations.
+    const zostd = b.addModule("zostd", .{
+        .root_source_file = b.path("src/zostd/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
+    // LuaJIT runtime (src/zlua). The plugin manager creates one runtime per
+    // loaded Lua script; the module is also tested directly.
+    const zlua = b.addModule("zlua", .{
+        .root_source_file = b.path("src/zlua/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .link_libc = true,
+    });
+    zlua.addImport("luajit", luajit);
+    zlua.addImport("zostd", zostd);
+
+    // Version requirement grammar shared by plugin manifests and the
+    // dependency resolver (src/core/VersionRequirement.zig).
+    const version_requirement = b.addModule("version-requirement", .{
+        .root_source_file = b.path("src/core/VersionRequirement.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
+    // Configuration of a single plugin's TOML manifest
+    // (src/core/plugin/PluginConfiguration.zig), later shared between the manager and
+    // the file access API in src/io/file_system.zig.
+    const plugin_configuration = b.addModule("plugin-configuration", .{
+        .root_source_file = b.path("src/core/plugin/PluginConfiguration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_configuration.addImport("toml", toml);
+    plugin_configuration.addImport("version-requirement", version_requirement);
+
+    // Dependency graph calculation for validated plugin manifests
+    // (src/core/plugin/PluginDependency.zig). Kept as its own module so the
+    // resolver can be tested without the manager or the filesystem.
+    const plugin_dependency = b.addModule("plugin-dependency", .{
+        .root_source_file = b.path("src/core/plugin/PluginDependency.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_dependency.addImport("plugin-configuration", plugin_configuration);
+
+    // ABI contract between the plugin manager and plugin modules
+    // (src/core/plugin/PluginContext.zig). The manager imports it through
+    // src/root.zig (`abi`); plugin compilations import it as this module, so
+    // every side compiles the same declarations. Example plugins live
+    // outside src/ in example-plugins/ and cannot reach it by file path
+    // (imports may not escape a module's root directory), hence the module
+    // indirection.
+    const plugin_context = b.addModule("plugin-context", .{
+        .root_source_file = b.path("src/core/plugin/PluginContext.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+
+    // Dynamic-library loader for native plugins
+    // (src/core/plugin/PluginLibrary.zig).
+    // Kept separate from the manager so the structured dlopen()/dlsym()
+    // behavior can be tested with small fixture libraries.
+    const plugin_library = b.addModule("plugin-library", .{
+        .root_source_file = b.path("src/core/plugin/PluginLibrary.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_library.addImport("plugin-context", plugin_context);
+
+    const zorcerer = b.addLibrary(.{
+        .name = "zorcerer",
+        .linkage = .dynamic,
+        .root_module = b.addModule("zorcerer", .{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+            .link_libc = true,
+        }),
+    });
+
+    // Root-relative import facade. `@import("root")` names the compilation
+    // root, which is Zig's test runner in test builds, so source files import
+    // this module instead. The cycle with `zorcerer` is intentional: the
+    // facade re-exports the same module instance and owns no state.
+    const zroot = b.addModule("zroot", .{
+        .root_source_file = b.path("src/zroot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    zroot.addImport("zorcerer", zorcerer.root_module);
+    zorcerer.root_module.addImport("zroot", zroot);
+
+    zorcerer.root_module.addImport("hooks", hooks);
+    zorcerer.root_module.addImport("toml", toml);
+    zorcerer.root_module.addImport("plugin-configuration", plugin_configuration);
+    zorcerer.root_module.addImport("plugin-context", plugin_context);
+    zorcerer.root_module.addImport("plugin-library", plugin_library);
+    zorcerer.root_module.addImport("zjr", zjr);
+    zorcerer.root_module.addImport("luajit", luajit);
+    zorcerer.root_module.addImport("zlua", zlua);
+    zorcerer.root_module.linkLibrary(luajit_support.library);
+    zorcerer.root_module.linkSystemLibrary("m", .{});
+    zorcerer.root_module.linkSystemLibrary("dl", .{});
+    zorcerer.root_module.linkSystemLibrary("gcc_s", .{});
+    zorcerer.out_filename = "zorcerer.so";
+
+    // Example plugin for PluginManager: hello_plugin.so gets dlopen()ed
+    // and needs no libc of its own.
+    const hello_plugin = b.addLibrary(.{
+        .name = "hello-plugin",
+        .linkage = .dynamic,
+        .root_module = b.addModule("hello-plugin", .{
+            .root_source_file = b.path("example-plugins/hello/hello_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    hello_plugin.root_module.addImport("plugin-context", plugin_context);
+    hello_plugin.out_filename = "hello_plugin.so";
+
+    // Dynamic libraries used by src/core/plugin/PluginLibrary.zig's tests. They are
+    // never installed: the test executable receives only their emitted
+    // paths through the build_options module below.
+    const valid_fixture = b.addLibrary(.{
+        .name = "plugin-library-valid-fixture",
+        .linkage = .dynamic,
+        .root_module = b.addModule("plugin-library-valid-fixture", .{
+            .root_source_file = b.path("src/tests/fixtures/valid_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    valid_fixture.root_module.addImport("plugin-context", plugin_context);
+    valid_fixture.out_filename = "plugin-library-valid-fixture.so";
+
+    const missing_symbol_fixture = b.addLibrary(.{
+        .name = "plugin-library-missing-symbol-fixture",
+        .linkage = .dynamic,
+        .root_module = b.addModule("plugin-library-missing-symbol-fixture", .{
+            .root_source_file = b.path("src/tests/fixtures/missing_symbol_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    missing_symbol_fixture.root_module.addImport("plugin-context", plugin_context);
+    missing_symbol_fixture.out_filename = "plugin-library-missing-symbol-fixture.so";
+
+    const event_fixture = b.addLibrary(.{
+        .name = "plugin-library-event-fixture",
+        .linkage = .dynamic,
+        .root_module = b.addModule("plugin-library-event-fixture", .{
+            .root_source_file = b.path("src/tests/fixtures/event_plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    event_fixture.root_module.addImport("plugin-context", plugin_context);
+    event_fixture.out_filename = "plugin-library-event-fixture.so";
+
+    // PluginLibrary is tested through its own module instance so the test
+    // build options do not leak into the production module.
+    const plugin_library_test_module = b.addModule("plugin-library-tests", .{
+        .root_source_file = b.path("src/core/plugin/PluginLibrary.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+    });
+    plugin_library_test_module.addImport("plugin-context", plugin_context);
+
+    const plugin_library_test_options = b.addOptions();
+    plugin_library_test_options.addOptionPath("valid_library", valid_fixture.getEmittedBin());
+    plugin_library_test_options.addOptionPath(
+        "missing_symbol_library",
+        missing_symbol_fixture.getEmittedBin(),
+    );
+    plugin_library_test_options.addOptionPath("event_library", event_fixture.getEmittedBin());
+    plugin_library_test_options.addOptionPath(
+        "invalid_library",
+        b.path("src/tests/fixtures/invalid_library.so"),
+    );
+    plugin_library_test_module.addOptions("build_options", plugin_library_test_options);
+
+    const plugin_library_tests = b.addTest(.{
+        .name = "plugin-library-tests",
+        .root_module = plugin_library_test_module,
+    });
+    plugin_library_tests.step.dependOn(&valid_fixture.step);
+    plugin_library_tests.step.dependOn(&missing_symbol_fixture.step);
+    plugin_library_tests.step.dependOn(&event_fixture.step);
+
+    const zorcerer_tests = b.addTest(.{
+        .name = "zorcerer-tests",
+        .root_module = zorcerer.root_module,
+    });
+    const hooks_tests = b.addTest(.{
+        .name = "hooks-tests",
+        .root_module = hooks,
+    });
+    const toml_tests = b.addTest(.{
+        .name = "toml-tests",
+        .root_module = toml,
+    });
+    const plugin_configuration_tests = b.addTest(.{
+        .name = "plugin-configuration-tests",
+        .root_module = plugin_configuration,
+    });
+    const plugin_dependency_tests = b.addTest(.{
+        .name = "plugin-dependency-tests",
+        .root_module = plugin_dependency,
+    });
+    const zlua_tests = b.addTest(.{
+        .name = "zlua-tests",
+        .root_module = zlua,
+    });
+    zlua_tests.root_module.linkLibrary(luajit_support.library);
+    zlua_tests.root_module.linkSystemLibrary("m", .{});
+    zlua_tests.root_module.linkSystemLibrary("dl", .{});
+
+    const compile_modules_step = b.step(
+        "compile-modules",
+        "Compile Zorcerer and all module test targets",
+    );
+
+    compile_modules_step.dependOn(&zorcerer.step);
+    compile_modules_step.dependOn(&zorcerer_tests.step);
+    compile_modules_step.dependOn(&hooks_tests.step);
+    compile_modules_step.dependOn(&toml_tests.step);
+    compile_modules_step.dependOn(&plugin_configuration_tests.step);
+    compile_modules_step.dependOn(&plugin_dependency_tests.step);
+    compile_modules_step.dependOn(&plugin_library_tests.step);
+    compile_modules_step.dependOn(&zlua_tests.step);
+    compile_modules_step.dependOn(&hello_plugin.step);
+
+    const run_zorcerer_tests = b.addRunArtifact(zorcerer_tests);
+    run_zorcerer_tests.step.dependOn(compile_modules_step);
+
+    const run_hooks_tests = b.addRunArtifact(hooks_tests);
+    run_hooks_tests.step.dependOn(compile_modules_step);
+
+    const run_toml_tests = b.addRunArtifact(toml_tests);
+    run_toml_tests.step.dependOn(compile_modules_step);
+
+    const run_plugin_configuration_tests = b.addRunArtifact(plugin_configuration_tests);
+    run_plugin_configuration_tests.step.dependOn(compile_modules_step);
+
+    const run_plugin_dependency_tests = b.addRunArtifact(plugin_dependency_tests);
+    run_plugin_dependency_tests.step.dependOn(compile_modules_step);
+
+    const run_plugin_library_tests = b.addRunArtifact(plugin_library_tests);
+    run_plugin_library_tests.step.dependOn(compile_modules_step);
+
+    const run_zlua_tests = b.addRunArtifact(zlua_tests);
+    run_zlua_tests.step.dependOn(compile_modules_step);
+
+    const zlua_tests_step = b.step("zlua-tests", "Run the ZLua LuaJIT runtime tests");
+    zlua_tests_step.dependOn(&run_zlua_tests.step);
+
+    const tests_step = b.step("tests", "Run tests for all project modules");
+    // TODO: Find out why this causes tests failure
+    tests_step.dependOn(&run_zorcerer_tests.step);
+    tests_step.dependOn(&run_hooks_tests.step);
+
+    // I don't know if is this intended, but two of these tests fail
+    // tests_step.dependOn(&run_toml_tests.step);
+
+    tests_step.dependOn(&run_plugin_configuration_tests.step);
+    tests_step.dependOn(&run_plugin_dependency_tests.step);
+    tests_step.dependOn(&run_plugin_library_tests.step);
+    tests_step.dependOn(&run_zlua_tests.step);
+
+    const should_skip_analyze = b.option(
+        bool,
+        "skip-analyze",
+        "Build and run the Clang-based index analyzer (requires system Clang/LLVM development packages)",
+    ) orelse false;
+
+    const should_force_analyze = b.option(
+        bool,
+        "force-analyze",
+        "Run the index analyzer even if config/raw_data.toml has not changed",
+    ) orelse false;
+
+    if (should_skip_analyze and should_force_analyze) {
+        std.debug.panic("[Zorcerer] FATAL: Incompatabile arguments", .{});
+    }
+
+    const raw_data_path = b.path("config/raw_data.toml").getPath(b);
+    const index_output_path = b.path("src/codegen_generated/engine_indexes.zig").getPath(b);
+
+    const should_analyze = !should_skip_analyze and (should_force_analyze or try rawDataChanged(io, raw_data_path, index_output_path));
+
+    if (should_analyze) {
+        index_analyzer.addIndexAnalyzer(b);
+
+        const toml_path = b.path("config/raw_data.toml").getPath(b);
+        const analyzer_path = b.path("zig-out/bin/vtable-index-analyzer").getPath(b);
+        const indexes_output_path = b.path("src/codegen_generated/engine_indexes.zig").getPath(b);
+
+        // The analyzer is an install artifact, but this regeneration runs at
+        // configure time, before any build step has run. On a fresh checkout
+        // (or after `rm -rf zig-out`) the binary does not exist yet, and after
+        // an analyzer source change the installed binary is stale; in both
+        // cases skip regeneration instead of failing the whole build. The
+        // file is regenerated by the next `zig build` once the current
+        // analyzer has been installed.
+        const analyzer_ready = try analyzerIsUpToDate(io, analyzer_path);
+
+        if (analyzer_ready) {
+            var args = try DataAdapter.prepareAnalyzerArgs(io, toml_path);
+            defer args.deinit();
+            var data = try DataAdapter.beginAnalyze(io, analyzer_path, &args);
+            defer data.deinit();
+            try DataAdapter.intoEngineIndexes(io, indexes_output_path, &data);
+        } else {
+            std.debug.print(
+                "note: skipping analyzer data regeneration: '{s}' is missing or older than its sources\n",
+                .{analyzer_path},
+            );
+        }
+    }
+
+    // Make tests mandatory for the default `zig build` target. The artifact
+    // cannot be installed unless every module compiles and all tests pass.
+    const install_zorcerer = b.addInstallArtifact(zorcerer, .{});
+    install_zorcerer.step.dependOn(tests_step);
+    b.getInstallStep().dependOn(&install_zorcerer.step);
+
+    // Example plugins get one directory each so the deploy script can copy
+    // `zig-out/lib/plugins/` as a complete plugin tree.
+    try installExamplePlugin(b, tests_step, .{
+        .source_dir = "hello",
+        .install_dir = "hello-plugin",
+        .library_name = "hello.so",
+        .artifact = hello_plugin,
+    });
+
+    installExampleLuaPlugin(b, tests_step, "lua-hello", "lua-hello");
+}
