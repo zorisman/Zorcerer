@@ -83,6 +83,12 @@ pub const core = struct {
     pub const Vsp = @import("core/engine/Vsp.zig");
 };
 
+pub const ssdk = struct {
+    pub const Iface = @import("ssdk/Iface.zig");
+    pub const PluginStates = @import("ssdk/PluginStates.zig");
+    pub const ClientCommand = @import("ssdk/ClientCommand.zig");
+};
+
 const tests = struct {
     const ipc_tests = @import("tests/ipc_tests.zig");
     const entrypoint_tests = @import("tests/entrypoint_tests.zig");
