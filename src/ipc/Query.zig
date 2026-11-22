@@ -51,6 +51,16 @@ pub const Query = enum {
         }
     };
 
+    /// Errors a query can report to the JSON-RPC listener.
+    pub const QueryError = error{
+        /// No `IVEngineServer` binding is available.
+        EngineUnavailable,
+        /// No `ICvar` binding is available.
+        CvarUnavailable,
+        /// A cvar name does not fit the engine's zero-terminated buffer.
+        NameTooLong,
+    };
+
     /// Returns the JSON-RPC method name for `query`.
     fn queryMethod(query: Query) [:0]const u8 {
         return switch (query) {
