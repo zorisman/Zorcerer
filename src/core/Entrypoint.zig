@@ -86,23 +86,18 @@ const Identifiers = ipc.IdentifierRegistry.Identifiers;
 const VTableHooks = @import("hooks").VTableHook;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
+const ssdk = root.ssdk;
+const Vsp = ssdk.Vsp;
+const VspHost = ssdk.VspHost;
 const Manager = @import("plugin/PluginManager.zig");
 const Log = root.io.Log;
 const abi = root.abi;
 const fork = root.ipc.ForkProcess;
 const JsonRpc = root.ipc.JsonRpc;
-const GameQueries = @import("GameQueries.zig");
+const GameQueries = root.ipc.query_types.GameQueries;
 const EngineCommands = root.core.EngineCommands;
 const EngineClients = root.core.EngineClients;
 const EngineFilesystem = root.core.EngineFilesystem;
-const Vsp = @import("engine/Vsp.zig");
-
-/// An IServerPluginCallbacks instance is just a vptr as far as the engine
-/// is concerned - no RTTI header to worry about, since nothing does
-/// dynamic_cast/typeid on a plugin interface the engine loaded generically.
-const PluginObject = extern struct {
-    vptr: [*]const Vsp.Slot,
-};
 
 /// VSP callbacks this Entrypoint implements. `Vsp.VTable` owns the slot
 /// order; this instance only selects the concrete functions.
@@ -117,15 +112,6 @@ const plugin_vtable = Vsp.VTable{
     .levelShutdown = levelShutdown,
     .clientCommand = clientCommand,
 };
-
-/// Stable storage for the slot array generated from `plugin_vtable`. It must
-/// outlive the engine's use of the plugin instance, so it lives in a global
-/// rather than on `CreateInterface`'s stack. `CreateInterface` fills it
-/// before publishing `plugin_instance` to the engine.
-var source_vtable: [Vsp.VTable.slot_count]Vsp.Slot = undefined;
-
-var plugin_instance = PluginObject{ .vptr = &source_vtable };
-var engine: ?*anyopaque = null;
 
 /// Engine-side state for the read-only game queries served to the plugin
 /// manager. Filled in `load()` and cleared in `unload()`.
@@ -275,56 +261,20 @@ fn load(
     _ = this;
     _ = game_server_factory;
 
-    // Extracting the Source engine's console logging function, in three
-    // steps:
-    //   1. Get the engine interface itself out of the engine: probe the
-    //      engine module's CreateInterface factory with the IVEngineServer
-    //      version strings the codegen knows (newest first) and remember
-    //      the string that actually answered.
-    //   2. Receive the LogPrint pointer out of that interface via
-    //      logPrintOf(), which picks the virtual method table slot the
-    //      codegen recorded under IVEngineServer.log_print.
-    //   3. Capture both in the Log module as its Source SDK logging sink,
-    //      before any load decision is made, so even the refusal messages
-    //      below reach the server console. The same print function is
-    //      handed to the plugin manager further down.
-    //
-    // Only a matching engine build is fully trustworthy: for any refused
-    // build the single log call in the refusal path may go through a slot
-    // whose meaning shifted with the engine version - the accepted
-    // trade-off for being able to report the refusal at all. Without any
-    // answered engine build there is nothing to extract the logger from
-    // and no working channel to report that fact through; the load is
-    // refused immediately.
-    var probe_version_buf: [32]u8 = undefined;
-    const engine_version: []const u8 = version: {
-        for (Vsp.engine_interface_versions) |requested_version| {
-            const engine_module_name = std.fmt.bufPrintZ(
-                &probe_version_buf,
-                "{s}",
-                .{requested_version},
-            ) catch break :version "";
-            engine = interface_factory(engine_module_name.ptr, null);
-
-            if (engine != null) {
-                break :version requested_version;
-            }
-        }
-        break :version "";
-    };
-    if (engine_version.len == 0) {
-        return false;
-    }
-
-    if (!std.mem.eql(u8, engine_version, Indexes.interfaceversion_vengineserver)) {
+    // Probe the engine interface before binding anything else. The generated
+    // slot indexes are only trustworthy for the exact build they came from;
+    // VspHost records both the answered version and whether it matches.
+    const probe = VspHost.probeEngine(interface_factory) orelse return false;
+    if (!probe.supported) {
         Log.logLine(
             "[Zorcerer] engine version mismatch: indices are for {s}, engine answered as {s} - refusing to install hooks\n",
-            .{ Indexes.interfaceversion_vengineserver, engine_version },
+            .{ Indexes.interfaceversion_vengineserver, probe.version },
         );
         return false;
     }
 
-    Log.logLine("[Zorcerer] Load() reached, engine version confirmed: {s}\n", .{engine_version});
+    Log.logLine("[Zorcerer] Load() reached, engine version confirmed: {s}\n", .{probe.version});
+    const engine = VspHost.engineInterface() orelse return false;
 
     // Game queries and command execution run here, in the engine process.
     // Resolve the cvar interface now, while the engine's factory is still
@@ -430,7 +380,7 @@ fn unload(this: *anyopaque) callconv(.c) void {
     game_queries.clear();
     engine_commands.clear();
     engine_clients.clear();
-    engine = null;
+    VspHost.clear();
     // The Log module keeps the captured sink: the engine interface stays
     // resident for the whole process lifetime, so it remains valid, and
     // plugin_load/reload re-captures it in load() anyway.
@@ -560,27 +510,19 @@ fn levelShutdown(this: *anyopaque) callconv(.c) void {
 fn clientCommand(
     this: *anyopaque,
     entity: *anyopaque,
-    args: *const Vsp.CCommand,
+    args: *const ssdk.ClientCommand,
 ) callconv(.c) c_int {
     _ = this;
-    const command = args.commandText() orelse return Vsp.plugin_continue;
+    const command = args.commandText() orelse return ssdk.PluginStates.@"continue";
 
     engine_clients.beginCommand(entity);
     sendManagerEvent(.clientCommand, command);
-    return if (engine_clients.endCommand()) Vsp.plugin_stop else Vsp.plugin_continue;
+    return if (engine_clients.endCommand())
+        ssdk.PluginStates.stop
+    else
+        ssdk.PluginStates.@"continue";
 }
 
 pub export fn CreateInterface(name: [*:0]const u8, return_code: ?*c_int) callconv(.c) ?*anyopaque {
-    const requested = std.mem.span(name);
-    for (Vsp.plugin_interface_versions) |version| {
-        if (std.mem.eql(u8, requested, version)) {
-            // Initialize before publishing the instance: the engine uses the
-            // vptr as soon as CreateInterface returns.
-            source_vtable = plugin_vtable.intoSourceVTable();
-            if (return_code) |rc| rc.* = Vsp.iface_ok;
-            return @ptrCast(&plugin_instance);
-        }
-    }
-    if (return_code) |rc| rc.* = Vsp.iface_failed;
-    return null;
+    return VspHost.createInterface(plugin_vtable, name, return_code);
 }

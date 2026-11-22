@@ -5,7 +5,7 @@
 //! is the requested raw byte count. Only the fields relevant to `op` are
 //! meaningful.
 //!
-//! The request is transported as one IPC frame (see `core/ipc/Frame.zig`)
+//! The request is transported as one IPC frame (see `ipc/Frame.zig`)
 //! with the JSON-RPC ID `Identifiers.file_request_id`; `fromResponse` reads
 //! the matching engine answer.
 

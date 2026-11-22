@@ -30,5 +30,5 @@ pub const codegen = zorcerer.codegen;
 /// Core manager, entrypoint, and service modules.
 pub const core = zorcerer.core;
 
-/// Source SDK exported symbols
+/// Source SDK ABI declarations and VSP host plumbing.
 pub const ssdk = zorcerer.ssdk;

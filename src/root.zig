@@ -7,36 +7,40 @@ const std = @import("std");
 /// `plugin-context` build module so their declarations stay identical.
 pub const abi = @import("plugin-context");
 
-/// IPC transport and message-schema modules (src/core/ipc). Each concern has
+/// IPC transport and message-schema modules (src/ipc). Each concern has
 /// exactly one owning module; files in this module re-export them so callers
 /// can use `zroot` instead of path-relative imports.
 pub const ipc = struct {
     /// Raw byte transport over the IPC socket descriptor.
-    pub const DescriptorIo = @import("core/ipc/DescriptorIo.zig");
+    pub const DescriptorIo = @import("ipc/DescriptorIo.zig");
     /// Frame encoding for the IPC channel.
-    pub const Frame = @import("core/ipc/Frame.zig");
+    pub const Frame = @import("ipc/Frame.zig");
     /// Fixed JSON-RPC request IDs shared by both endpoints.
-    pub const IdentifierRegistry = @import("core/ipc/IdentifierRegistry.zig");
+    pub const IdentifierRegistry = @import("ipc/IdentifierRegistry.zig");
     /// Parsed JSON-RPC responses.
-    pub const Response = @import("core/ipc/Response.zig");
+    pub const Response = @import("ipc/Response.zig");
     /// JSON-RPC response sending.
-    pub const Sender = @import("core/ipc/Sender.zig");
+    pub const Sender = @import("ipc/Sender.zig");
     /// Operation notifications (stderr/ready) and their requests.
-    pub const Operation = @import("core/ipc/Operation.zig");
-    pub const Request = @import("core/ipc/Request.zig");
+    pub const Operation = @import("ipc/Operation.zig");
+    pub const Request = @import("ipc/Request.zig");
     /// VSP callback event schema.
-    pub const Event = @import("core/ipc/Event.zig");
+    pub const Event = @import("ipc/Event.zig");
     /// Game-query schema and results.
-    pub const Query = @import("core/ipc/Query.zig");
-    pub const QueryResult = @import("core/ipc/QueryResult.zig");
+    pub const Query = @import("ipc/Query.zig");
+    pub const QueryResult = @import("ipc/query_types/QueryResult.zig");
+    /// Engine-side game-query handler; the wire schema lives in `Query`.
+    pub const query_types = struct {
+        pub const GameQueries = @import("ipc/query_types/GameQueries.zig");
+    };
     /// Server-command, client-print, and shutdown schemas.
-    pub const ServerCommand = @import("core/ipc/ServerCommand.zig");
-    pub const ClientPrint = @import("core/ipc/ClientPrint.zig");
-    pub const Shutdown = @import("core/ipc/Shutdown.zig");
+    pub const ServerCommand = @import("ipc/ServerCommand.zig");
+    pub const ClientPrint = @import("ipc/ClientPrint.zig");
+    pub const Shutdown = @import("ipc/Shutdown.zig");
     /// Forked child process management.
-    pub const ForkProcess = @import("core/ipc/ForkProcess.zig");
+    pub const ForkProcess = @import("ipc/ForkProcess.zig");
     /// Engine-side JSON-RPC dispatch listener.
-    pub const JsonRpc = @import("core/ipc/JsonRpc.zig");
+    pub const JsonRpc = @import("ipc/JsonRpc.zig");
 };
 
 // Force the VSP entrypoint into the library: its exported `CreateInterface`
@@ -75,23 +79,35 @@ pub const core = struct {
     pub const EngineFilesystem = @import("core/engine/EngineFilesystem.zig");
     pub const Entrypoint = @import("core/Entrypoint.zig");
     pub const FileService = @import("core/FileService.zig");
-    pub const GameQueries = @import("core/GameQueries.zig");
     pub const LuaHost = @import("core/LuaHost.zig");
     pub const NetworkService = @import("core/NetworkService.zig");
     pub const PluginManager = @import("core/plugin/PluginManager.zig");
-    pub const Vtable = @import("core/Vtable.zig");
-    pub const Vsp = @import("core/engine/Vsp.zig");
+    pub const QueryClient = @import("core/plugin/QueryClient.zig");
 };
 
+/// Source SDK ABI declarations: engine interface layouts, generated indexes,
+/// and the VSP vtable contract. Nothing here owns process or IPC state.
 pub const ssdk = struct {
-    pub const Iface = @import("ssdk/Iface.zig");
-    pub const PluginStates = @import("ssdk/PluginStates.zig");
-    pub const ClientCommand = @import("ssdk/ClientCommand.zig");
+    /// Generated interface version strings and vtable slots.
+    pub const indexes = @import("codegen_generated/engine_indexes.zig");
+    pub const Iface = @import("ssdk/types/Iface.zig").Iface;
+    pub const PluginStates = @import("ssdk/types/PluginStates.zig").PluginStates;
+    pub const ClientCommand = @import("ssdk/types/ClientCommand.zig").ClientCommand;
+    pub const ConCommandBase = @import("ssdk/types/ConCommandBase.zig").ConCommandBase;
+    pub const ConVar = @import("ssdk/types/ConVar.zig").ConVar;
+    pub const PlayerInfo = @import("ssdk/types/PlayerInfo.zig").PlayerInfo;
+    pub const Vsp = @import("ssdk/Vsp.zig");
+    pub const Vtable = @import("ssdk/Vtable.zig");
+    pub const EngineAbi = @import("ssdk/EngineAbi.zig").EngineAbi;
+    pub const CvarAbi = @import("ssdk/CvarAbi.zig").CvarAbi;
+    pub const cvar_never_as_string = @import("ssdk/CvarAbi.zig").cvar_never_as_string;
+    pub const VspHost = @import("ssdk/VspHost.zig");
 };
 
 const tests = struct {
     const ipc_tests = @import("tests/ipc_tests.zig");
     const entrypoint_tests = @import("tests/entrypoint_tests.zig");
+    const ssdk_tests = @import("tests/ssdk_tests.zig");
 };
 
 // Compile-checks and unit-tests src/analyzers/VTableResolver.zig. Nothing
@@ -116,8 +132,12 @@ test "src/core/Entrypoint.zig" {
     std.testing.refAllDecls(tests.entrypoint_tests);
 }
 
-test "src/core/ipc modules" {
+test "src/ipc modules" {
     std.testing.refAllDecls(tests.ipc_tests);
+}
+
+test "src/tests/ssdk_tests.zig" {
+    std.testing.refAllDecls(tests.ssdk_tests);
 }
 
 test "src/core/FileService.zig" {

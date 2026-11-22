@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const ClientPrint = root.ipc.ClientPrint;
-const Vtable = root.core.Vtable;
+const Vtable = root.ssdk.Vtable;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 const Log = root.io.Log;

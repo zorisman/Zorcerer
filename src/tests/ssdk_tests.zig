@@ -1,7 +1,13 @@
 const std = @import("std");
 const zroot = @import("zroot");
-const CCommand = zroot.ssdk.ClientCommand;
-const Indexes = zroot.codegen.indexes;
+const ssdk = zroot.ssdk;
+const CCommand = ssdk.ClientCommand;
+const PlayerInfo = ssdk.PlayerInfo;
+const ConVar = ssdk.ConVar;
+const Indexes = ssdk.indexes;
+const QueryResult = zroot.ipc.QueryResult;
+const QueryError = zroot.ipc.Query.Query.QueryError;
+const Queries = zroot.ipc.query_types.GameQueries.Queries;
 
 test "CCommand matches the Source SDK binary layout" {
     try std.testing.expectEqual(@as(usize, 1544), @sizeOf(CCommand));

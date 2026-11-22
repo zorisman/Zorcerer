@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const ServerCommand = root.ipc.ServerCommand;
-const Vtable = root.core.Vtable;
+const Vtable = root.ssdk.Vtable;
 const root = @import("zroot");
 const Indexes = root.codegen.indexes;
 const Log = root.io.Log;

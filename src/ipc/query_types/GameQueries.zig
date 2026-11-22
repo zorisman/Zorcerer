@@ -12,41 +12,21 @@
 //! into engine memory that outlives one query.
 
 const std = @import("std");
-const ipc = @import("zroot").ipc;
+const zroot = @import("zroot");
+const ipc = zroot.ipc;
 const Query = ipc.Query.Query;
+const QueryError = ipc.Query.Query.QueryError;
 const QueryResult = ipc.QueryResult;
-const Sender = ipc.Sender;
-const Indexes = @import("zroot").codegen.indexes;
+const ssdk = zroot.ssdk;
+const EngineAbi = ssdk.EngineAbi;
+const CvarAbi = ssdk.CvarAbi;
+const cvar_never_as_string = ssdk.cvar_never_as_string;
+const PlayerInfo = ssdk.PlayerInfo;
+const ConVar = ssdk.ConVar;
 
 /// Longest text value returned by a query. Matches `MAX_PATH`, the bound the
 /// engine documents for `GetGameDir`.
 pub const max_text_len: usize = 260;
-
-/// `FCVAR_NEVER_AS_STRING` (iconvar.h:55 [checkout]).
-const cvar_never_as_string: c_int = 1 << 12;
-
-/// The exact C ABI of the `ICvar` virtuals this module calls.
-pub const CvarAbi = struct {
-    /// `FindVar` non-const overload (icvar.h:73, slot 12).
-    find_var: *const fn (cvar: *anyopaque, name: [*:0]const u8) callconv(.c) ?*ConVar,
-
-    /// Resolves the method pointer from `interface`'s vtable.
-    ///
-    /// Precondition: `interface` is a live `ICvar` of the version named by
-    /// `Indexes.cvar_interface_version`.
-    pub fn bind(interface: *anyopaque) CvarAbi {
-        return .{
-            .find_var = @ptrCast(vtableSlot(interface, Indexes.ICvar.find_var)),
-        };
-    }
-};
-
-/// Returns the raw function pointer at `slot` in `interface`'s vtable.
-fn vtableSlot(interface: *anyopaque, comptime slot: usize) *const anyopaque {
-    const object: *const *const anyopaque = @ptrCast(@alignCast(interface));
-    const vtable: [*]const *const anyopaque = @ptrCast(@alignCast(object.*));
-    return vtable[slot];
-}
 
 /// The engine-facing side of game queries.
 ///

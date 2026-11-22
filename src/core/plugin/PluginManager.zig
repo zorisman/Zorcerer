@@ -2,8 +2,6 @@ const std = @import("std");
 const ipc = @import("zroot").ipc;
 const Frame = ipc.Frame;
 const Event = ipc.Event.Event;
-const Query = ipc.Query.Query;
-const QueryResult = ipc.QueryResult;
 const ServerCommand = ipc.ServerCommand;
 const ClientPrint = ipc.ClientPrint;
 const Shutdown = ipc.Shutdown;
@@ -17,6 +15,7 @@ const PluginLibrary = @import("plugin-library");
 const FileService = root.core.FileService;
 const NetworkService = root.core.NetworkService;
 const LuaHost = root.core.LuaHost;
+const QueryClient = root.core.QueryClient;
 const zlua = @import("zlua");
 
 /// Plugin directory relative to the process working directory.
@@ -1123,21 +1122,6 @@ pub const Manager = struct {
         dispatchEventToPlugins(self.plugins.items, event, payload);
     }
 
-    /// Sends one query over the IPC channel and returns the result document.
-    ///
-    /// The returned text is allocated with the manager's allocator and owned
-    /// by the caller. The exchange is synchronous: the parent answers while it
-    /// is already waiting for readiness or an event response.
-    ///
-    /// Errors: `error.QueryUnavailable` when no IPC channel is configured,
-    /// plus the framing, JSON, and response errors of `Query.sendQuery` and
-    /// `Query.receiveQueryResult`.
-    fn fetchQuery(self: *@This(), request: Query.QueryRequest) ![]u8 {
-        const fd = self.ipc_fd orelse return error.QueryUnavailable;
-        try Query.sendQuery(fd, request);
-        return Query.receiveQueryResult(fd, self.allocator);
-    }
-
     /// Sends one command to the engine process and waits for its acceptance.
     ///
     /// `plugin_id` is advisory attribution for the Entrypoint's audit log. The
@@ -1211,176 +1195,46 @@ pub const Manager = struct {
         if (!result.printed) return error.ClientPrintRejected;
     }
 
-    /// Translates a query failure into an ABI status.
-    fn queryStatus(err: anyerror) c_int {
-        return switch (err) {
-            error.QueryUnavailable => abi.query_unavailable,
-            else => abi.query_transport_error,
-        };
+    /// Returns a query client bound to this manager's IPC channel.
+    fn queryClient(self: *@This()) QueryClient.Client {
+        return .{ .allocator = self.allocator, .fd = self.ipc_fd };
     }
 
-    /// Executes the `server_info` query into `out`.
-    ///
-    /// Public so the Lua host adapter can answer `zostd.game.server_info()`.
+    /// Executes the `server_info` query through the manager's query client.
     pub fn queryServerInfo(self: *@This(), out: *abi.ServerInfo) c_int {
-        const text = self.fetchQuery(.{ .query = .server_info }) catch |err|
-            return queryStatus(err);
-        defer self.allocator.free(text);
-
-        var parsed = std.json.parseFromSlice(
-            QueryResult.ServerInfo,
-            self.allocator,
-            text,
-            .{},
-        ) catch return abi.query_transport_error;
-        defer parsed.deinit();
-
-        out.* = std.mem.zeroes(abi.ServerInfo);
-        out.struct_size = @sizeOf(abi.ServerInfo);
-        out.dedicated = @intFromBool(parsed.value.dedicated);
-        out.paused = @intFromBool(parsed.value.paused);
-        out.entity_count = parsed.value.entity_count;
-        out.server_version = parsed.value.server_version;
-        out.server_time = parsed.value.server_time;
-
-        var truncated = false;
-        const game_dir = storeText(&out.game_dir, parsed.value.game_dir);
-        out.game_dir_len = game_dir.len;
-        truncated = truncated or game_dir.truncated;
-
-        const map_name = storeText(&out.map_name, parsed.value.map_name);
-        out.map_name_len = map_name.len;
-        truncated = truncated or map_name.truncated;
-
-        return if (truncated) abi.query_truncated else abi.query_ok;
+        const client = self.queryClient();
+        return client.queryServerInfo(out);
     }
 
-    /// Executes the `player_info` query for `index` into `out`.
+    /// Executes the `player_info` query through the manager's query client.
     pub fn queryPlayerInfo(self: *@This(), index: c_int, out: *abi.PlayerInfo) c_int {
-        const text = self.fetchQuery(.{ .query = .player_info, .index = index }) catch |err|
-            return queryStatus(err);
-        defer self.allocator.free(text);
-
-        var parsed = std.json.parseFromSlice(
-            QueryResult.PlayerInfo,
-            self.allocator,
-            text,
-            .{},
-        ) catch return abi.query_transport_error;
-        defer parsed.deinit();
-
-        out.* = std.mem.zeroes(abi.PlayerInfo);
-        out.struct_size = @sizeOf(abi.PlayerInfo);
-        out.index = parsed.value.index;
-        out.present = @intFromBool(parsed.value.present);
-        if (!parsed.value.present) return abi.query_ok;
-
-        out.user_id = parsed.value.user_id;
-        out.friends_id = parsed.value.friends_id;
-        out.fake_player = @intFromBool(parsed.value.fake_player);
-        out.is_hltv = @intFromBool(parsed.value.is_hltv);
-
-        var truncated = false;
-        const name = storeText(&out.name, parsed.value.name);
-        out.name_len = name.len;
-        truncated = truncated or name.truncated;
-
-        const guid = storeText(&out.guid, parsed.value.guid);
-        out.guid_len = guid.len;
-        truncated = truncated or guid.truncated;
-
-        const friends_name = storeText(&out.friends_name, parsed.value.friends_name);
-        out.friends_name_len = friends_name.len;
-        truncated = truncated or friends_name.truncated;
-
-        return if (truncated) abi.query_truncated else abi.query_ok;
+        const client = self.queryClient();
+        return client.queryPlayerInfo(index, out);
     }
 
-    /// Executes the `entity_exists` query for `index` into `out`.
+    /// Executes the `entity_exists` query through the manager's query client.
     pub fn queryEntityInfo(self: *@This(), index: c_int, out: *abi.EntityInfo) c_int {
-        const text = self.fetchQuery(.{ .query = .entity_exists, .index = index }) catch |err|
-            return queryStatus(err);
-        defer self.allocator.free(text);
-
-        var parsed = std.json.parseFromSlice(
-            QueryResult.EntityInfo,
-            self.allocator,
-            text,
-            .{},
-        ) catch return abi.query_transport_error;
-        defer parsed.deinit();
-
-        out.* = std.mem.zeroes(abi.EntityInfo);
-        out.struct_size = @sizeOf(abi.EntityInfo);
-        out.exists = @intFromBool(parsed.value.exists);
-        return abi.query_ok;
+        const client = self.queryClient();
+        return client.queryEntityInfo(index, out);
     }
 
-    /// Executes the `server_cvar` query for `name` into `out`.
+    /// Executes the `server_cvar` query through the manager's query client.
     pub fn queryServerCvar(self: *@This(), name: []const u8, out: *abi.CvarValue) c_int {
-        const text = self.fetchQuery(.{ .query = .server_cvar, .name = name }) catch |err|
-            return queryStatus(err);
-        defer self.allocator.free(text);
-
-        var parsed = std.json.parseFromSlice(
-            QueryResult.CvarValue,
-            self.allocator,
-            text,
-            .{},
-        ) catch return abi.query_transport_error;
-        defer parsed.deinit();
-
-        return fillCvarValue(parsed.value, out);
+        const client = self.queryClient();
+        return client.queryServerCvar(name, out);
     }
 
-    /// Executes the `client_cvar` query for client `index` into `out`.
+    /// Executes the `client_cvar` query through the manager's query client.
     pub fn queryClientCvar(
         self: *@This(),
         index: c_int,
         name: []const u8,
         out: *abi.CvarValue,
     ) c_int {
-        const text = self.fetchQuery(.{
-            .query = .client_cvar,
-            .index = index,
-            .name = name,
-        }) catch |err| return queryStatus(err);
-        defer self.allocator.free(text);
-
-        var parsed = std.json.parseFromSlice(
-            QueryResult.CvarValue,
-            self.allocator,
-            text,
-            .{},
-        ) catch return abi.query_transport_error;
-        defer parsed.deinit();
-
-        return fillCvarValue(parsed.value, out);
+        const client = self.queryClient();
+        return client.queryClientCvar(index, name, out);
     }
 };
-
-/// Copies `source` into `destination`.
-///
-/// Returns the full source length, which callers store so a plugin can detect
-/// truncation, and whether any bytes were dropped.
-fn storeText(destination: []u8, source: []const u8) struct { len: usize, truncated: bool } {
-    const stored = @min(destination.len, source.len);
-    @memcpy(destination[0..stored], source[0..stored]);
-    return .{ .len = source.len, .truncated = source.len > destination.len };
-}
-
-/// Fills an ABI cvar result from its JSON form.
-fn fillCvarValue(value: QueryResult.CvarValue, out: *abi.CvarValue) c_int {
-    out.* = std.mem.zeroes(abi.CvarValue);
-    out.struct_size = @sizeOf(abi.CvarValue);
-    out.found = @intFromBool(value.found);
-    out.int_value = value.int_value;
-    out.float_value = value.float_value;
-
-    const text = storeText(&out.text, value.text);
-    out.text_len = text.len;
-    return if (text.truncated) abi.query_truncated else abi.query_ok;
-}
 
 /// `GameApi.server_info` implementation handed to native plugins.
 fn gameServerInfo(context: ?*anyopaque, out: *abi.ServerInfo) callconv(.c) c_int {

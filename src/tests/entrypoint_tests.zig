@@ -2,7 +2,8 @@ const std = @import("std");
 const zjr = @import("zjr");
 const root = @import("zroot");
 const Entrypoint = root.core.Entrypoint;
-const Vsp = root.core.Vsp;
+const ssdk = root.ssdk;
+const Vsp = ssdk.Vsp;
 const fork = ipc.ForkProcess;
 const ipc = root.ipc;
 const Frame = ipc.Frame;
@@ -64,7 +65,7 @@ test "CreateInterface publishes a populated VSP vtable" {
         var return_code: c_int = -1;
         const interface_ptr = Entrypoint.CreateInterface(name.ptr, &return_code) orelse
             return error.ExpectedInterface;
-        try std.testing.expectEqual(Vsp.iface_ok, return_code);
+        try std.testing.expectEqual(@as(c_int, @intFromEnum(ssdk.Iface.ok)), return_code);
 
         const object: *const PluginObject = @ptrCast(@alignCast(interface_ptr));
         for (object.vptr[0..Vsp.VTable.slot_count]) |slot| {
@@ -87,7 +88,7 @@ test "CreateInterface publishes a populated VSP vtable" {
 test "CreateInterface rejects unknown interface versions" {
     var return_code: c_int = -1;
     try std.testing.expect(Entrypoint.CreateInterface("IServerPluginCallbacks999", &return_code) == null);
-    try std.testing.expectEqual(Vsp.iface_failed, return_code);
+    try std.testing.expectEqual(@as(c_int, @intFromEnum(ssdk.Iface.failed)), return_code);
 }
 
 test "child logging is sent over IPC" {
